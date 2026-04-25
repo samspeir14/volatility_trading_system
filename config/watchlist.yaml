@@ -1,0 +1,21 @@
+tickers:
+  - {symbol: AAPL,  sector: tech}
+  - {symbol: MSFT,  sector: tech}
+  - {symbol: NVDA,  sector: tech}
+  - {symbol: AMZN,  sector: tech}
+  - {symbol: META,  sector: tech}
+  - {symbol: GOOGL, sector: tech}
+  - {symbol: AMD,   sector: tech}
+  - {symbol: JPM,   sector: financials}
+  - {symbol: GS,    sector: financials}
+  - {symbol: BAC,   sector: financials}
+  - {symbol: XOM,   sector: energy}
+  - {symbol: CVX,   sector: energy}
+  - {symbol: JNJ,   sector: healthcare}
+  - {symbol: UNH,   sector: healthcare}
+  - {symbol: TSLA,  sector: consumer}
+  - {symbol: HD,    sector: consumer}
+  - {symbol: CAT,   sector: industrials}
+  - {symbol: BA,    sector: industrials}
+  - {symbol: SPY,   sector: etf}
+  - {symbol: QQQ,   sector: etf}

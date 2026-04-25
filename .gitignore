@@ -1,0 +1,33 @@
+# Secrets and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Project artifacts
+model/artifacts/*
+!model/artifacts/.gitkeep
+data/cache/
+logs/*.log
+logs/*.log.*
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
