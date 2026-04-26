@@ -7,6 +7,8 @@ from config.settings import Settings, load_settings
 
 WATCHLIST_PATH = Path(__file__).parent / "watchlist.yaml"
 
+MARKET_INDICES: tuple[str, ...] = ("SPY", "VIX", "VIX9D", "VIX3M")
+
 
 @dataclass(frozen=True)
 class Ticker:
@@ -20,4 +22,4 @@ def load_watchlist(path: Path = WATCHLIST_PATH) -> list[Ticker]:
     return [Ticker(symbol=t["symbol"], sector=t["sector"]) for t in raw["tickers"]]
 
 
-__all__ = ["Settings", "Ticker", "load_settings", "load_watchlist"]
+__all__ = ["MARKET_INDICES", "Settings", "Ticker", "load_settings", "load_watchlist"]
