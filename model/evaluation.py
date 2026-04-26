@@ -1,5 +1,31 @@
+from typing import Iterator
+
 import numpy as np
 import pandas as pd
+
+
+def date_based_ts_split(
+    dates: pd.Series,
+    n_splits: int = 5,
+) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+    """Date-aware time-series CV. Yields (train_idx, test_idx) for `n_splits`
+    folds. Each fold: train = rows with date in earlier slice, test = rows
+    in next contiguous date slice. No date appears in both train and test."""
+    arr = np.asarray(dates.values if hasattr(dates, "values") else dates)
+    unique_dates = np.sort(np.unique(arr))
+    n_dates = len(unique_dates)
+    fold_size = n_dates // (n_splits + 1)
+    if fold_size == 0:
+        raise ValueError(f"too few dates ({n_dates}) for {n_splits} splits")
+    series = pd.Series(arr)
+    for i in range(n_splits):
+        train_end = (i + 1) * fold_size
+        test_end = min(train_end + fold_size, n_dates)
+        train_dates = set(unique_dates[:train_end])
+        test_dates = set(unique_dates[train_end:test_end])
+        train_mask = series.isin(train_dates).to_numpy()
+        test_mask = series.isin(test_dates).to_numpy()
+        yield np.where(train_mask)[0], np.where(test_mask)[0]
 
 
 def regression_metrics(actual: pd.Series, predicted: pd.Series) -> dict[str, float]:
