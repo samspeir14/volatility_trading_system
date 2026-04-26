@@ -21,8 +21,7 @@ def test_market_avg_rv():
         "GOOGL": [0.3] * 10,
     }, index=idx)
     avg = market_avg_rv(panel)
-    expected = 0.2
-    assert (avg == expected).all(), f"expected {expected}, got {avg.iloc[0]}"
+    np.testing.assert_allclose(avg.values, 0.2, atol=1e-10)
     print(f"market_avg_rv: avg = {avg.iloc[0]} (expected 0.2)")
 
 
@@ -42,10 +41,10 @@ def test_sector_avg_rv():
     }, index=idx)
     out = sector_avg_rv(panel, watchlist)
     # AAPL and MSFT both get tech avg = 0.2; JPM and GS both get financials avg = 0.6
-    assert (out["AAPL"] == 0.2).all()
-    assert (out["MSFT"] == 0.2).all()
-    assert (out["JPM"] == 0.6).all()
-    assert (out["GS"] == 0.6).all()
+    np.testing.assert_allclose(out["AAPL"].values, 0.2, atol=1e-10)
+    np.testing.assert_allclose(out["MSFT"].values, 0.2, atol=1e-10)
+    np.testing.assert_allclose(out["JPM"].values, 0.6, atol=1e-10)
+    np.testing.assert_allclose(out["GS"].values, 0.6, atol=1e-10)
     print("sector_avg_rv: tech=0.2, financials=0.6")
 
 
