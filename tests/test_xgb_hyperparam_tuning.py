@@ -1,5 +1,6 @@
 """Slow integration test: full hyperparameter tuning + walk-forward + GARCH comparison.
-Guarded by RUN_SLOW_TESTS=1 because it takes ~10-15 minutes."""
+Guarded by RUN_SLOW_TESTS=1. Runs against the full 20-ticker watchlist so XGBoost
+trains on ~10k rows (vs ~1.5k in the fast test) — the more informative comparison."""
 
 import math
 import os
@@ -9,7 +10,7 @@ from datetime import date, timedelta
 
 import pandas as pd
 
-from config import Ticker, load_settings
+from config import load_settings, load_watchlist
 from data import HistoricalStore, compute_log_returns
 from features import FeaturePipeline
 from model import (
@@ -41,12 +42,9 @@ def main() -> int:
     train_window_days = 252
     refit_every = 21
 
-    tickers = [
-        Ticker("AAPL", "tech"),
-        Ticker("MSFT", "tech"),
-        Ticker("SPY", "etf"),
-    ]
+    tickers = load_watchlist()
     symbols = [t.symbol for t in tickers]
+    print(f"running against {len(tickers)} tickers: {symbols}")
 
     store = HistoricalStore(settings.cache_db_path)
     try:
@@ -54,7 +52,11 @@ def main() -> int:
             store, tickers,
             garch_min_history=100, garch_refit_every=21,
         )
+        t0 = time.monotonic()
         feature_df = pipeline.build_features(start, end)
+        feat_elapsed = time.monotonic() - t0
+        print(f"built features: {len(feature_df)} rows × {len(feature_df.columns)} cols in {feat_elapsed:.1f}s")
+
         returns_by_symbol = {
             sym: compute_log_returns(store.get_bars(sym, start, end)["close"])
             for sym in symbols
@@ -67,10 +69,11 @@ def main() -> int:
             train_window_days=train_window_days, refit_every=refit_every,
             hyperparams=None,
         )
-        elapsed = time.monotonic() - t0
+        xgb_elapsed = time.monotonic() - t0
 
-        print(f"\nfull tuning + walk-forward: {elapsed:.1f}s")
-        assert elapsed < 900, f"FAIL: took {elapsed:.1f}s, must be <15 min"
+        print(f"\nfull tuning + walk-forward (20 tickers): {xgb_elapsed:.1f}s")
+        # 20-min gate: tuning is 50 trials × 5 folds × ~2-3s/fit on 10k rows ≈ 8-12 min
+        assert xgb_elapsed < 1200, f"FAIL: took {xgb_elapsed:.1f}s, must be <20 min"
 
         xgb_metrics = regression_metrics(xgb_results["actual"], xgb_results["predicted"])
 
