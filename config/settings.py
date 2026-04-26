@@ -1,10 +1,13 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 
 from dotenv import load_dotenv
 
 SANDBOX_BASE_URL = "https://sandbox.tradier.com/v1"
 PRODUCTION_BASE_URL = "https://api.tradier.com/v1"
+
+PROJECT_ROOT = Path(__file__).parent.parent
 
 
 @dataclass(frozen=True)
@@ -15,6 +18,13 @@ class Settings:
     env: str
     request_timeout: float = 10.0
     max_retries: int = 3
+    rate_limit_per_min: int = 150
+    scan_interval_seconds: int = 300
+    expiration_window_days: tuple[int, int] = (14, 45)
+    historical_lookback_years: int = 3
+    cache_db_path: Path = field(
+        default_factory=lambda: PROJECT_ROOT / "data" / "cache" / "market_data.db"
+    )
 
 
 def load_settings() -> Settings:

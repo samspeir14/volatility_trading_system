@@ -22,7 +22,8 @@ env/
 # Project artifacts
 model/artifacts/*
 !model/artifacts/.gitkeep
-data/cache/
+data/cache/*
+!data/cache/.gitkeep
 logs/*.log
 logs/*.log.*
 
