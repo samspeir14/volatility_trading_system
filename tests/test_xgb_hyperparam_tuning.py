@@ -1,8 +1,7 @@
-"""Slow integration test: full hyperparameter tuning + walk-forward + GARCH comparison.
-Guarded by RUN_SLOW_TESTS=1. Runs against the full 20-ticker watchlist so XGBoost
-trains on ~10k rows (vs ~1.5k in the fast test) — the more informative comparison."""
+"""Slow integration test: full hyperparameter tuning + walk-forward + GARCH comparison
+across all three prediction horizons (5, 10, 21). Guarded by RUN_SLOW_TESTS=1.
+Runs against the full 20-ticker watchlist so XGBoost trains on ~10k rows."""
 
-import math
 import os
 import sys
 import time
@@ -26,6 +25,43 @@ def _last_weekday(d: date) -> date:
     return d
 
 
+def evaluate_horizon(
+    horizon: int,
+    feature_df: pd.DataFrame,
+    returns_by_symbol: dict,
+    train_window_days: int,
+    refit_every: int,
+    symbols: list[str],
+) -> tuple[dict, dict, float]:
+    """Run XGBoost (with tuning) + GARCH walk-forward at a single horizon.
+    Returns (garch_metrics, xgb_metrics, wall_clock_seconds)."""
+    print(f"\n--- horizon={horizon} ---")
+    t0 = time.monotonic()
+    xgb_results = walk_forward_evaluate_xgboost(
+        feature_df, returns_by_symbol, horizon=horizon,
+        train_window_days=train_window_days, refit_every=refit_every,
+        hyperparams=None,  # triggers tuning at first refit
+    )
+    xgb_elapsed = time.monotonic() - t0
+    print(f"  xgboost tuning + walk-forward: {xgb_elapsed:.1f}s ({len(xgb_results)} OOS rows)")
+
+    xgb_metrics = regression_metrics(xgb_results["actual"], xgb_results["predicted"])
+
+    oos_dates = set(xgb_results.index.get_level_values("date").unique())
+    baseline = GARCHBaseline(refit_every=refit_every, min_history=100)
+    garch_pooled = []
+    for sym in symbols:
+        eval_df = baseline.walk_forward_evaluate(returns_by_symbol[sym], horizons=(horizon,))
+        eval_df = eval_df.loc[eval_df.index.isin(oos_dates)]
+        garch_pooled.append(eval_df[[f"pred_rv_{horizon}", f"actual_rv_{horizon}"]])
+    garch_df = pd.concat(garch_pooled)
+    garch_metrics = regression_metrics(
+        garch_df[f"actual_rv_{horizon}"],
+        garch_df[f"pred_rv_{horizon}"],
+    )
+    return garch_metrics, xgb_metrics, xgb_elapsed
+
+
 def main() -> int:
     if os.environ.get("RUN_SLOW_TESTS") != "1":
         print("skipping: set RUN_SLOW_TESTS=1 to enable", file=sys.stderr)
@@ -38,13 +74,13 @@ def main() -> int:
 
     end = _last_weekday(date.today())
     start = end - timedelta(days=730)
-    horizon = 21
+    horizons = (5, 10, 21)
     train_window_days = 252
     refit_every = 21
 
     tickers = load_watchlist()
     symbols = [t.symbol for t in tickers]
-    print(f"running against {len(tickers)} tickers: {symbols}")
+    print(f"running against {len(tickers)} tickers, horizons={horizons}")
 
     store = HistoricalStore(settings.cache_db_path)
     try:
@@ -62,44 +98,44 @@ def main() -> int:
             for sym in symbols
         }
 
-        # hyperparams=None triggers tune_hyperparameters once at the first refit
-        t0 = time.monotonic()
-        xgb_results = walk_forward_evaluate_xgboost(
-            feature_df, returns_by_symbol, horizon=horizon,
-            train_window_days=train_window_days, refit_every=refit_every,
-            hyperparams=None,
-        )
-        xgb_elapsed = time.monotonic() - t0
+        # Per-horizon evaluation
+        rows = []
+        total_xgb_elapsed = 0.0
+        for h in horizons:
+            garch_m, xgb_m, elapsed = evaluate_horizon(
+                h, feature_df, returns_by_symbol,
+                train_window_days, refit_every, symbols,
+            )
+            total_xgb_elapsed += elapsed
+            rows.append({"horizon": h, "model": "GARCH", **garch_m})
+            rows.append({"horizon": h, "model": "XGBoost (tuned)", **xgb_m})
 
-        print(f"\nfull tuning + walk-forward (20 tickers): {xgb_elapsed:.1f}s")
-        # 20-min gate: tuning is 50 trials × 5 folds × ~2-3s/fit on 10k rows ≈ 8-12 min
-        assert xgb_elapsed < 1200, f"FAIL: took {xgb_elapsed:.1f}s, must be <20 min"
-
-        xgb_metrics = regression_metrics(xgb_results["actual"], xgb_results["predicted"])
-
-        oos_dates = set(xgb_results.index.get_level_values("date").unique())
-        baseline = GARCHBaseline(refit_every=refit_every, min_history=100)
-        garch_pooled = []
-        for sym in symbols:
-            eval_df = baseline.walk_forward_evaluate(returns_by_symbol[sym], horizons=(horizon,))
-            eval_df = eval_df.loc[eval_df.index.isin(oos_dates)]
-            garch_pooled.append(eval_df[[f"pred_rv_{horizon}", f"actual_rv_{horizon}"]])
-        garch_df = pd.concat(garch_pooled)
-        garch_metrics = regression_metrics(
-            garch_df[f"actual_rv_{horizon}"],
-            garch_df[f"pred_rv_{horizon}"],
+        # 25-min gate: 3 horizons × ~3-4 min tuning each
+        assert total_xgb_elapsed < 1500, (
+            f"FAIL: total xgb tuning took {total_xgb_elapsed:.1f}s, must be <25 min"
         )
 
-        comparison = pd.DataFrame({
-            "GARCH": garch_metrics,
-            "XGBoost (tuned)": xgb_metrics,
-        }).T[["n", "rmse", "mae", "r2", "bias"]]
-        print("\n=== Head-to-head (tuned XGBoost vs GARCH, horizon=21) ===")
-        print(comparison.to_string())
+        # Final summary
+        summary = pd.DataFrame(rows).set_index(["horizon", "model"])[
+            ["n", "rmse", "mae", "r2", "bias"]
+        ]
+        print("\n=== Head-to-head per horizon ===")
+        print(summary.to_string())
 
-        winner = "XGBoost (tuned)" if xgb_metrics["r2"] > garch_metrics["r2"] else "GARCH"
-        print(f"\nwinner: {winner} "
-              f"(XGB R²={xgb_metrics['r2']:+.3f} vs GARCH R²={garch_metrics['r2']:+.3f})")
+        # Winner per horizon
+        print("\n=== Winners ===")
+        wins = {}
+        for h in horizons:
+            g_r2 = summary.loc[(h, "GARCH"), "r2"]
+            x_r2 = summary.loc[(h, "XGBoost (tuned)"), "r2"]
+            winner = "XGBoost" if x_r2 > g_r2 else "GARCH"
+            lift = x_r2 - g_r2
+            wins[h] = (winner, x_r2, g_r2, lift)
+            print(f"  h={h:2d}: {winner:7s}  (XGB R²={x_r2:+.3f} vs GARCH R²={g_r2:+.3f}, "
+                  f"lift={lift:+.3f})")
+
+        print(f"\ntotal xgboost tuning + walk-forward across {len(horizons)} horizons: "
+              f"{total_xgb_elapsed:.1f}s")
     finally:
         store.close()
     return 0
