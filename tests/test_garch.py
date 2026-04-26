@@ -11,8 +11,8 @@ from features.garch import PCT_SCALE, fit_garch11, garch_features_walk_forward
 def _simulate_garch(n: int, omega: float, alpha: float, beta: float, seed: int = 0) -> pd.Series:
     """Simulate a synthetic GARCH(1,1) series of decimal returns (zero mean) via arch."""
     template = arch_model(np.zeros(1), vol="Garch", p=1, q=1, mean="zero", rescale=False)
-    rng = np.random.default_rng(seed)
-    sim = template.simulate(params=[omega, alpha, beta], nobs=n, random_state=rng)
+    np.random.seed(seed)
+    sim = template.simulate(params=[omega, alpha, beta], nobs=n)
     # sim["data"] is in the same units as the params (pct² ⇒ pct returns); convert to decimal.
     return pd.Series(sim["data"].values / PCT_SCALE)
 
