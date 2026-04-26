@@ -20,8 +20,11 @@ def rsi(close: pd.Series, window: int = 14) -> pd.Series:
     delta = close.diff()
     gain = delta.clip(lower=0).rolling(window).mean()
     loss = (-delta.clip(upper=0)).rolling(window).mean()
-    rs = gain / loss.replace(0, np.nan)
-    return 100 - 100 / (1 + rs)
+    # gain/0 → inf → RSI = 100 (saturation, no drawdowns)
+    # 0/0 → NaN → RSI = NaN (undefined, e.g. constant prices)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rs = gain / loss
+    return 100.0 - 100.0 / (1.0 + rs)
 
 
 def atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> pd.Series:
