@@ -17,6 +17,8 @@ class GarchFit:
     beta: float
     next_forecast_var: float  # σ²_{T+1} in pct² units
     resid_lb_pvalue: float    # Ljung-Box p-value at lag 10
+    aic: float
+    bic: float
 
 
 def fit_garch11(returns: pd.Series) -> GarchFit:
@@ -37,6 +39,8 @@ def fit_garch11(returns: pd.Series) -> GarchFit:
         beta=float(res.params["beta[1]"]),
         next_forecast_var=fcast,
         resid_lb_pvalue=float(lb["lb_pvalue"].iloc[0]),
+        aic=float(res.aic),
+        bic=float(res.bic),
     )
 
 
