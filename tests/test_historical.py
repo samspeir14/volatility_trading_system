@@ -28,32 +28,35 @@ def test_log_returns() -> None:
 
 async def test_cache_lifecycle(db_path: Path) -> None:
     settings = load_settings()
+    # Pin "today" to the most recent weekday so the test is deterministic on weekends.
     end = date.today()
-    start = end - timedelta(days=30)
+    while end.weekday() >= 5:
+        end -= timedelta(days=1)
 
-    # 1. Empty cache → fetch populates
     async with AsyncTradierClient(settings) as client:
+        # 1. Empty cache → cold fetch populates
         store1 = HistoricalStore(db_path)
         try:
-            result = await fetch_and_cache(client, store1, ["AAPL"], lookback_years=0, today=end)
+            result = await fetch_and_cache(client, store1, ["AAPL"], lookback_years=1, today=end)
             df = result["AAPL"]
             assert not df.empty, "expected non-empty AAPL bars after first fetch"
             n_after_fetch = store1.row_count("AAPL")
-            assert n_after_fetch >= 15, f"expected ≥15 rows after 30d fetch, got {n_after_fetch}"
+            assert n_after_fetch >= 200, f"expected ≥200 rows for 1y fetch, got {n_after_fetch}"
             calls_after_fetch = client.rate_limiter.call_count
             assert calls_after_fetch >= 1, "expected ≥1 API call on cold fetch"
             print(f"cold fetch: {n_after_fetch} bars cached, {calls_after_fetch} API call(s)")
         finally:
             store1.close()
 
-        # 2. Same range, same store reopened → no new API calls
+        # 2. Re-open store with same db file → cache hit, no new API calls
         store2 = HistoricalStore(db_path)
         try:
             client.rate_limiter.reset_counter()
-            # Use same end date to avoid Tradier even being asked for a 1-day delta
-            result2 = await fetch_and_cache(client, store2, ["AAPL"], lookback_years=0, today=end)
+            result2 = await fetch_and_cache(client, store2, ["AAPL"], lookback_years=1, today=end)
             df2 = result2["AAPL"]
-            assert len(df2) == n_after_fetch, "row count changed on reopen"
+            assert len(df2) == n_after_fetch, (
+                f"row count changed on reopen: {n_after_fetch} -> {len(df2)}"
+            )
             calls_after_reopen = client.rate_limiter.call_count
             assert calls_after_reopen == 0, (
                 f"expected 0 API calls on cache hit, got {calls_after_reopen}"
