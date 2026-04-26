@@ -77,17 +77,18 @@ def test_feature_nans_preserved():
 
 
 def test_target_nan_rows_dropped():
+    """pandas std() is skipna=True, so a target window must be ENTIRELY NaN
+    to produce a NaN target. Inject a 3-wide NaN block to force one drop."""
     horizon = 3
     feature_df, returns = _make_panel(["AAPL"], n=10)
-    # Inject NaN into the middle of returns — that target window will be NaN
-    middle_date = returns["AAPL"].index[5]
-    returns["AAPL"].loc[middle_date] = np.nan
+    # Indices 4, 5, 6 all NaN → row 3's target window iloc[4:7] is fully NaN
+    returns["AAPL"].iloc[4:7] = np.nan
     X, y = build_training_matrix(feature_df, returns, horizon)
-    # The 3 rows whose target window includes the NaN return get dropped
-    # (rows at index 3, 4, 5 use returns at indices 4-6, 5-7, 6-8)
-    n_rows = len(y)
-    assert n_rows < 10 - horizon, f"expected NaN target rows dropped, got {n_rows}"
-    print(f"target_nan: {10 - horizon - n_rows} rows dropped due to NaN targets")
+    # Pre: 7 rows. Row 3 gets dropped (its target window is fully NaN).
+    assert len(y) < 7, f"expected ≥1 row dropped, got {len(y)}"
+    row_3_date = feature_df.loc["AAPL"].index[3]
+    assert ("AAPL", row_3_date) not in y.index, "row with all-NaN target window should be dropped"
+    print(f"target_nan: dropped {7 - len(y)} row(s) with fully-NaN target windows")
 
 
 def main() -> int:
