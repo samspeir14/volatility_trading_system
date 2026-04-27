@@ -297,6 +297,14 @@ class AsyncTradierClient:
             body[f"quantity[{i}]"] = str(leg["quantity"])
         return body
 
+    async def get_balances(self, account_id: str | None = None) -> dict:
+        acct = account_id or self._settings.account_id
+        data = await self._get(f"/accounts/{acct}/balances")
+        return data["balances"]
+
+    async def get_profile(self) -> dict:
+        return (await self._get("/user/profile"))["profile"]
+
     async def get_quotes(self, symbols: list[str]) -> dict[str, dict]:
         if not symbols:
             raise ValueError("symbols must be a non-empty list")
