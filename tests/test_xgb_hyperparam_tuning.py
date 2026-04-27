@@ -6,6 +6,7 @@ import os
 import sys
 import time
 from datetime import date, timedelta
+from pathlib import Path
 
 import pandas as pd
 
@@ -17,6 +18,9 @@ from model import (
     regression_metrics,
     walk_forward_evaluate_xgboost,
 )
+
+
+ARTIFACT_DIR = Path(__file__).resolve().parent.parent / "model" / "artifacts"
 
 
 def _last_weekday(d: date) -> date:
@@ -41,6 +45,7 @@ def evaluate_horizon(
         feature_df, returns_by_symbol, horizon=horizon,
         train_window_days=train_window_days, refit_every=refit_every,
         hyperparams=None,  # triggers tuning at first refit
+        artifact_dir=ARTIFACT_DIR,  # save tuned models for the live signal test
     )
     xgb_elapsed = time.monotonic() - t0
     print(f"  xgboost tuning + walk-forward: {xgb_elapsed:.1f}s ({len(xgb_results)} OOS rows)")

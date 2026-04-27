@@ -121,6 +121,82 @@ def test_composite_liquidity():
     print(f"composite_liquidity: {actual:.1f} matches manual calc")
 
 
+def test_divergence_cap_demotes_event_suspects():
+    """Synthesize a scan with one ticker carrying a 0.41 divergence (AMZN
+    earnings shape). With max_divergence=0.30 it should be demoted as
+    event-suspect even if its z-score is above threshold."""
+    from datetime import datetime
+    from data.market_data import ScanResult, TickerSnapshot
+    from model.best_predictor import BestPredictor
+    from model.garch_baseline import GARCHBaseline
+    from signals import SignalGenerator
+
+    # Build a minimal scan: 5 tickers, all DTE=10. One has wildly inflated IV.
+    today = date(2026, 4, 26)
+    expiration = date(2026, 5, 6)  # DTE=10
+    snapshots: dict[str, TickerSnapshot] = {}
+    for sym, atm_iv in [("A", 0.20), ("B", 0.22), ("C", 0.21), ("D", 0.19), ("EVENT", 0.65)]:
+        atm_call = _mk_contract(100, "call", bid=1.0, ask=1.05, vol=200, oi=1000, iv=atm_iv)
+        atm_call = OptionContract(
+            symbol=f"{sym}_C100", underlying=sym, expiration=expiration, strike=100,
+            option_type="call", bid=1.0, ask=1.05, last=1.025, volume=200,
+            open_interest=1000, delta=0.5, gamma=0.01, theta=-0.05, vega=0.2,
+            iv=atm_iv, fetched_at=datetime.now(timezone.utc),
+        )
+        atm_put = OptionContract(
+            symbol=f"{sym}_P100", underlying=sym, expiration=expiration, strike=100,
+            option_type="put", bid=0.9, ask=0.95, last=0.925, volume=200,
+            open_interest=1000, delta=-0.5, gamma=0.01, theta=-0.05, vega=0.2,
+            iv=atm_iv, fetched_at=datetime.now(timezone.utc),
+        )
+        # Add OTM wings for iron condor
+        wing_call = OptionContract(
+            symbol=f"{sym}_C110", underlying=sym, expiration=expiration, strike=110,
+            option_type="call", bid=0.20, ask=0.22, last=0.21, volume=100,
+            open_interest=500, delta=0.2, gamma=0.005, theta=-0.02, vega=0.1,
+            iv=atm_iv, fetched_at=datetime.now(timezone.utc),
+        )
+        wing_put = OptionContract(
+            symbol=f"{sym}_P90", underlying=sym, expiration=expiration, strike=90,
+            option_type="put", bid=0.20, ask=0.22, last=0.21, volume=100,
+            open_interest=500, delta=-0.2, gamma=0.005, theta=-0.02, vega=0.1,
+            iv=atm_iv, fetched_at=datetime.now(timezone.utc),
+        )
+        snapshots[sym] = TickerSnapshot(
+            symbol=sym, sector="tech",
+            underlying={"symbol": sym, "last": 100.0},
+            contracts=[atm_call, atm_put, wing_call, wing_put],
+        )
+
+    scan = ScanResult(fetched_at=datetime(2026, 4, 26, 16, 0, tzinfo=timezone.utc), snapshots=snapshots)
+
+    # Predictor that returns daily vol = 0.012 (annualized ~0.19) for every horizon
+    class _FixedPredictor:
+        def predict_forward_rv(self, returns_history, X_row=None):
+            return 0.012
+    predictors = {h: _FixedPredictor() for h in (5, 10, 21)}
+
+    feature_rows = {sym: pd.DataFrame({"a": [0.0]}, index=[date(2026, 4, 25)]) for sym in snapshots}
+    returns_by_symbol = {sym: pd.Series([0.001] * 100) for sym in snapshots}
+
+    generator = SignalGenerator(
+        predictors_by_horizon=predictors,
+        history_store=None,
+        cross_sectional_z_threshold=1.0,
+        max_divergence=0.30,
+    )
+    actionable, all_signals = generator.generate(scan, feature_rows, returns_by_symbol, top_n=10)
+
+    by_sym = {s.symbol: s for s in all_signals}
+    # EVENT has divergence ≈ 0.19 - 0.65 = -0.46 (|.46| > 0.30 cap)
+    assert "EVENT" in by_sym
+    event_sig = by_sym["EVENT"]
+    assert not event_sig.is_actionable, "EVENT should be demoted by divergence cap"
+    assert "event-suspect" in event_sig.diagnostic_notes
+    assert "EVENT" not in [s.symbol for s in actionable], "EVENT must not be in actionable"
+    print(f"divergence_cap: EVENT demoted with note '{event_sig.diagnostic_notes}'")
+
+
 # ---------- live integration ----------
 
 async def _bootstrap_predictors(
@@ -137,11 +213,13 @@ async def _bootstrap_predictors(
     predictors: dict[int, BestPredictor] = {}
 
     for horizon in (5, 10, 21):
-        # Pick most recent existing artifact, else train one
-        existing = sorted(artifact_dir.glob(f"xgb_h{horizon}_*.joblib"))
+        # Pick newest existing artifact by mtime (handles mix of bootstrap +
+        # date-named tuned files where filename sort would lie).
+        existing = list(artifact_dir.glob(f"xgb_h{horizon}_*.joblib"))
         if existing:
-            xgb = XGBoostVolPredictor.load(existing[-1])
-            print(f"  loaded h={horizon} from {existing[-1].name}")
+            newest = max(existing, key=lambda p: p.stat().st_mtime)
+            xgb = XGBoostVolPredictor.load(newest)
+            print(f"  loaded h={horizon} from {newest.name}")
         else:
             X, y = build_training_matrix(feature_df, returns_by_symbol, horizon)
             xgb = XGBoostVolPredictor(horizon=horizon, hyperparams=DEFAULT_HYPERPARAMS)
@@ -285,6 +363,7 @@ def main() -> int:
     test_find_atm_iv()
     test_find_atm_iv_returns_none_when_one_side_missing()
     test_composite_liquidity()
+    test_divergence_cap_demotes_event_suspects()
 
     settings = load_settings()
     if settings.env != "sandbox":

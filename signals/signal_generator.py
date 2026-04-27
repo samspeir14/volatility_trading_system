@@ -182,6 +182,7 @@ class SignalGenerator:
         min_open_interest: int = 50,
         max_relative_spread: float = 0.10,
         cross_sectional_z_threshold: float = 1.5,
+        max_divergence: float = 0.30,
     ):
         for h in TRAINED_HORIZONS:
             if h not in predictors_by_horizon:
@@ -192,6 +193,10 @@ class SignalGenerator:
         self._min_oi = min_open_interest
         self._max_rel_spread = max_relative_spread
         self._z_threshold = cross_sectional_z_threshold
+        # Divergences above this absolute magnitude are almost certainly event-driven
+        # (earnings, FDA, FOMC, product launch) — the model can't distinguish event
+        # premium from vol mispricing, so we demote rather than trade them.
+        self._max_divergence = max_divergence
 
     def generate(
         self,
@@ -303,7 +308,28 @@ class SignalGenerator:
 
             direction = "BUY" if c.divergence > 0 else "SELL"
 
-            # Below threshold: emit non-actionable signal for diagnostics
+            # Event-suspect: divergences above the cap are almost certainly
+            # driven by a known event (earnings, FDA, FOMC, product launch)
+            # that the market is pricing and the model structurally cannot
+            # capture. Demote rather than trade.
+            if abs(c.divergence) > self._max_divergence:
+                all_signals.append(TradeSignal(
+                    symbol=c.symbol, expiration=c.expiration, dte=c.dte,
+                    horizon_lower=c.horizon_lower, horizon_upper=c.horizon_upper,
+                    weight_lower=c.weight_lower, direction=direction,
+                    underlying_price=c.underlying_price, atm_iv=c.atm_iv,
+                    predicted_iv_equivalent=c.predicted_iv_equivalent,
+                    divergence=c.divergence, cross_sectional_z=cs_z,
+                    time_series_z=ts_z, liquidity_score=0.0, legs=[],
+                    is_actionable=False,
+                    diagnostic_notes=(
+                        f"event-suspect: |divergence|={abs(c.divergence):.3f} "
+                        f"> cap {self._max_divergence}"
+                    ),
+                ))
+                continue
+
+            # Below z threshold: emit non-actionable signal for diagnostics
             if abs(cs_z) < self._z_threshold:
                 all_signals.append(TradeSignal(
                     symbol=c.symbol, expiration=c.expiration, dte=c.dte,
