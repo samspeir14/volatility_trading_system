@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import asdict
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -209,6 +209,16 @@ class OrderLog:
             (closing_order_id, closed_at.isoformat(), exit_trigger, realized_pnl, opening_order_id),
         )
         self._conn.commit()
+
+    def closed_today_pnl(self, today: date) -> float:
+        """Sum of realized_pnl for orders whose closing trade filled on `today`."""
+        cur = self._conn.execute(
+            "SELECT COALESCE(SUM(realized_pnl), 0) FROM submitted_orders "
+            "WHERE closing_order_id IS NOT NULL "
+            "AND date(closed_at) = ?",
+            (today.isoformat(),),
+        )
+        return float(cur.fetchone()[0])
 
     def open_unclosed_positions(self) -> list[dict]:
         """Rows from submitted_orders that filled successfully and haven't been closed yet."""
