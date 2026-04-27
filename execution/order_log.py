@@ -57,6 +57,13 @@ CREATE_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_failed_fingerprint ON failed_submissions(fingerprint, submitted_at DESC);",
 ]
 
+CLOSE_COLUMNS_MIGRATIONS = [
+    ("closing_order_id", "ALTER TABLE submitted_orders ADD COLUMN closing_order_id INTEGER"),
+    ("closed_at", "ALTER TABLE submitted_orders ADD COLUMN closed_at TEXT"),
+    ("exit_trigger", "ALTER TABLE submitted_orders ADD COLUMN exit_trigger TEXT"),
+    ("realized_pnl", "ALTER TABLE submitted_orders ADD COLUMN realized_pnl REAL"),
+]
+
 
 class OrderLog:
     def __init__(self, db_path: Path):
@@ -64,8 +71,17 @@ class OrderLog:
         self._conn = sqlite3.connect(str(db_path))
         self._conn.execute(CREATE_SUBMITTED_SQL)
         self._conn.execute(CREATE_FAILED_SQL)
+        self._migrate_close_columns()
         for sql in CREATE_INDEXES_SQL:
             self._conn.execute(sql)
+        self._conn.commit()
+
+    def _migrate_close_columns(self) -> None:
+        cur = self._conn.execute("PRAGMA table_info(submitted_orders)")
+        existing = {row[1] for row in cur.fetchall()}
+        for col_name, sql in CLOSE_COLUMNS_MIGRATIONS:
+            if col_name not in existing:
+                self._conn.execute(sql)
         self._conn.commit()
 
     def close(self) -> None:
@@ -178,3 +194,34 @@ class OrderLog:
 
     def failed_count(self) -> int:
         return self._conn.execute("SELECT COUNT(*) FROM failed_submissions").fetchone()[0]
+
+    def record_close(
+        self,
+        opening_order_id: int,
+        closing_order_id: int,
+        closed_at: datetime,
+        exit_trigger: str,
+        realized_pnl: float,
+    ) -> None:
+        self._conn.execute(
+            "UPDATE submitted_orders SET closing_order_id = ?, closed_at = ?, "
+            "exit_trigger = ?, realized_pnl = ? WHERE tradier_order_id = ?",
+            (closing_order_id, closed_at.isoformat(), exit_trigger, realized_pnl, opening_order_id),
+        )
+        self._conn.commit()
+
+    def open_unclosed_positions(self) -> list[dict]:
+        """Rows from submitted_orders that filled successfully and haven't been closed yet."""
+        cur = self._conn.execute(
+            "SELECT tradier_order_id, fingerprint, submitted_at, symbol, expiration, "
+            "direction, structure, horizon_lower, horizon_upper, weight_lower, "
+            "underlying_price_at_signal, atm_iv_at_signal, predicted_iv_at_signal, "
+            "divergence_at_signal, cross_sectional_z, time_series_z, "
+            "submitted_price, legs_json, final_status, fill_price "
+            "FROM submitted_orders "
+            "WHERE final_status IN ('filled', 'partially_filled') "
+            "AND closing_order_id IS NULL "
+            "ORDER BY submitted_at DESC"
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]

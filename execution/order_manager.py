@@ -7,12 +7,16 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 from config import Settings
 from data.async_client import AsyncTradierClient, OptionContract
 from data.market_data import TickerSnapshot
 from execution.order_log import OrderLog
 from signals.signal_generator import TradeLeg, TradeSignal
+
+if TYPE_CHECKING:
+    from positions.position_tracker import OpenPosition, PositionMark
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +29,7 @@ TERMINAL_FAILED = {"rejected", "canceled", "expired"}
 
 @dataclass(frozen=True)
 class OrderResult:
-    signal: TradeSignal
+    signal: TradeSignal | None  # None for closes (which have no opening signal context here)
     status: str  # filled | partially_filled | rejected | preview_failed | duplicate | guard_blocked | timeout | error
     order_id: int | None
     submitted_price: float | None
@@ -342,3 +346,131 @@ class OrderManager:
             if status == "rejected":
                 return order.get("reason_description") or "rejected"
         return None
+
+    async def submit_close(
+        self,
+        position: "OpenPosition",
+        mark: "PositionMark",
+        exit_trigger: str,
+    ) -> OrderResult:
+        """Build closing leg list with sides inverted, price at current mid +/-
+        slippage, submit via the same multileg endpoint, poll for fill, update
+        OrderLog with closing context. Bypasses fingerprint dedup (closing has
+        a different fingerprint by construction)."""
+        now = datetime.now(timezone.utc)
+
+        guard_error = self._check_production_guard()
+        if guard_error is not None:
+            logger.error("submit_close guard_blocked: %s", guard_error)
+            return OrderResult(
+                signal=None, status="guard_blocked", order_id=None,
+                submitted_price=None, fill_price=None, error=guard_error,
+            )
+
+        # Invert sides: buy → sell_to_close, sell → buy_to_close
+        side_close_map = {"buy": "sell_to_close", "sell": "buy_to_close"}
+        api_legs: list[dict] = []
+        for leg in position.legs:
+            api_side = side_close_map.get(leg.side)
+            if api_side is None:
+                err = f"unrecognized leg side: {leg.side}"
+                return OrderResult(
+                    signal=None, status="error", order_id=None,
+                    submitted_price=None, fill_price=None, error=err,
+                )
+            api_legs.append({
+                "option_symbol": leg.contract_symbol,
+                "side": api_side,
+                "quantity": leg.quantity,
+            })
+
+        # Determine close net premium and order type
+        close_cash_per_contract = mark.close_cash_flow / 100.0
+        if close_cash_per_contract >= 0:
+            order_type = "credit"
+            price = round(close_cash_per_contract * (1 - self._slippage), 2)
+        else:
+            order_type = "debit"
+            price = round(abs(close_cash_per_contract) * (1 + self._slippage), 2)
+        if price <= 0:
+            err = f"computed close price not positive: {price}"
+            return OrderResult(
+                signal=None, status="error", order_id=None,
+                submitted_price=None, fill_price=None, error=err,
+            )
+
+        # Preview
+        preview = await self._client.preview_order(
+            account_id=self._settings.account_id,
+            legs=api_legs,
+            underlying_symbol=position.symbol,
+            order_type=order_type,
+            price=price,
+        )
+        preview_error = self._extract_error(preview)
+        if preview_error is not None:
+            logger.warning("close preview failed for order %s: %s",
+                           position.tradier_order_id, preview_error)
+            return OrderResult(
+                signal=None, status="preview_failed", order_id=None,
+                submitted_price=price, fill_price=None, error=preview_error,
+            )
+
+        # Place
+        place_resp = await self._client.place_order(
+            account_id=self._settings.account_id,
+            legs=api_legs,
+            underlying_symbol=position.symbol,
+            order_type=order_type,
+            price=price,
+        )
+        place_error = self._extract_error(place_resp)
+        order_node = place_resp.get("order") if isinstance(place_resp, dict) else None
+        if place_error is not None or order_node is None or "id" not in order_node:
+            err = place_error or f"unexpected place response: {place_resp}"
+            logger.error("close place failed for order %s: %s",
+                         position.tradier_order_id, err)
+            return OrderResult(
+                signal=None, status="error", order_id=None,
+                submitted_price=price, fill_price=None, error=err,
+            )
+        closing_order_id = int(order_node["id"])
+        logger.info("submitted CLOSE %d for opening %d (%s) trigger=%s price=%.2f type=%s",
+                    closing_order_id, position.tradier_order_id,
+                    position.symbol, exit_trigger, price, order_type)
+
+        # Poll for fill
+        terminal_status, fill_price = await self._poll_until_terminal(closing_order_id)
+        if terminal_status is None:
+            return OrderResult(
+                signal=None, status="timeout", order_id=closing_order_id,
+                submitted_price=price, fill_price=None,
+                error="close did not reach terminal state within timeout",
+            )
+
+        # Compute realized P&L using fill price if available, otherwise the limit
+        realized_pnl: float
+        if terminal_status == "filled" and fill_price is not None:
+            # For credit close: realized close cash = +fill_price * 100
+            # For debit close: realized close cash = -fill_price * 100
+            close_cash_realized = fill_price * 100 if order_type == "credit" else -fill_price * 100
+            entry_sign = -1 if position.is_long else 1
+            entry_cash = entry_sign * position.entry_premium * 100
+            realized_pnl = entry_cash + close_cash_realized
+        else:
+            realized_pnl = mark.pnl_dollars  # best estimate
+
+        if terminal_status == "filled":
+            self._log.record_close(
+                opening_order_id=position.tradier_order_id,
+                closing_order_id=closing_order_id,
+                closed_at=datetime.now(timezone.utc),
+                exit_trigger=exit_trigger,
+                realized_pnl=realized_pnl,
+            )
+
+        return OrderResult(
+            signal=None, status=terminal_status, order_id=closing_order_id,
+            submitted_price=price, fill_price=fill_price,
+            error=None if terminal_status == "filled" else f"close terminal status: {terminal_status}",
+        )
