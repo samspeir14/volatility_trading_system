@@ -169,6 +169,134 @@ class AsyncTradierClient:
 
         raise RuntimeError("unreachable: retry loop exited without return")
 
+    async def _post(self, path: str, data: dict[str, Any] | None = None) -> dict:
+        if self._session is None:
+            raise RuntimeError("AsyncTradierClient must be used as an async context manager")
+
+        url = f"{self._settings.base_url}{path}"
+        max_retries = self._settings.max_retries
+        backoff = 0.5
+
+        for attempt in range(1, max_retries + 1):
+            await self.rate_limiter.acquire()
+
+            try:
+                async with self._session.post(url, data=data) as resp:
+                    self.rate_limiter.update_from_headers(resp.headers)
+                    logger.debug("Tradier POST %s -> %d", url, resp.status)
+
+                    if resp.status == 429:
+                        expiry_ms = int(resp.headers.get("X-Ratelimit-Expiry", "0") or 0)
+                        wait = (expiry_ms - time.time() * 1000) / 1000 if expiry_ms else 5.0
+                        wait = max(1.0, wait)
+                        logger.warning("Tradier POST %s 429; sleeping %.2fs", path, wait)
+                        await asyncio.sleep(wait + 0.1)
+                        continue
+
+                    if resp.status >= 500 and attempt < max_retries:
+                        logger.warning("Tradier POST %s attempt %d/%d returned %d; retrying in %.1fs",
+                                       path, attempt, max_retries, resp.status, backoff)
+                        await asyncio.sleep(backoff)
+                        backoff *= 2
+                        continue
+
+                    body_text = await resp.text()
+                    # Try to parse JSON regardless of status — Tradier returns
+                    # structured error bodies on 400 (e.g. {"errors": {...}}).
+                    try:
+                        body = await resp.json(content_type=None)
+                    except Exception:
+                        body = None
+
+                    if not resp.ok:
+                        if body is not None:
+                            return body  # let caller inspect structured error
+                        raise TradierAPIError(resp.status, body_text, url)
+
+                    if body is None:
+                        raise TradierAPIError(resp.status, body_text, url)
+                    return body
+
+            except aiohttp.ClientConnectionError as e:
+                if attempt == max_retries:
+                    raise
+                logger.warning("Tradier POST %s attempt %d/%d connection error (%s); retrying in %.1fs",
+                               path, attempt, max_retries, e.__class__.__name__, backoff)
+                await asyncio.sleep(backoff)
+                backoff *= 2
+
+        raise RuntimeError("unreachable: retry loop exited without return")
+
+    async def preview_order(
+        self,
+        account_id: str,
+        legs: list[dict],
+        underlying_symbol: str,
+        order_type: str,           # "debit" | "credit" | "even" | "market"
+        duration: str = "day",     # "day" | "gtc"
+        price: float | None = None,
+    ) -> dict:
+        body = self._build_multileg_body(
+            legs, underlying_symbol, order_type, duration, price, preview=True,
+        )
+        return await self._post(f"/accounts/{account_id}/orders", data=body)
+
+    async def place_order(
+        self,
+        account_id: str,
+        legs: list[dict],
+        underlying_symbol: str,
+        order_type: str,
+        duration: str = "day",
+        price: float | None = None,
+    ) -> dict:
+        body = self._build_multileg_body(
+            legs, underlying_symbol, order_type, duration, price, preview=False,
+        )
+        return await self._post(f"/accounts/{account_id}/orders", data=body)
+
+    async def get_order_status(self, account_id: str, order_id: int) -> dict:
+        return await self._get(f"/accounts/{account_id}/orders/{order_id}")
+
+    async def get_positions(self, account_id: str) -> list[dict]:
+        data = await self._get(f"/accounts/{account_id}/positions")
+        positions = data.get("positions")
+        if not positions or positions == "null":
+            return []
+        raw = positions.get("position")
+        if raw is None:
+            return []
+        if isinstance(raw, dict):
+            return [raw]
+        return raw
+
+    @staticmethod
+    def _build_multileg_body(
+        legs: list[dict],
+        underlying_symbol: str,
+        order_type: str,
+        duration: str,
+        price: float | None,
+        preview: bool,
+    ) -> dict:
+        """Build a Tradier multileg order body. Each leg is a dict with
+        keys 'option_symbol', 'side', 'quantity'."""
+        body: dict[str, Any] = {
+            "class": "multileg",
+            "symbol": underlying_symbol,
+            "type": order_type,
+            "duration": duration,
+        }
+        if price is not None:
+            body["price"] = f"{price:.2f}"
+        if preview:
+            body["preview"] = "true"
+        for i, leg in enumerate(legs):
+            body[f"option_symbol[{i}]"] = leg["option_symbol"]
+            body[f"side[{i}]"] = leg["side"]
+            body[f"quantity[{i}]"] = str(leg["quantity"])
+        return body
+
     async def get_quotes(self, symbols: list[str]) -> dict[str, dict]:
         if not symbols:
             raise ValueError("symbols must be a non-empty list")

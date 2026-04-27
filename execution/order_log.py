@@ -1,0 +1,180 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from signals.signal_generator import TradeSignal
+
+
+CREATE_SUBMITTED_SQL = """
+CREATE TABLE IF NOT EXISTS submitted_orders (
+    tradier_order_id INTEGER PRIMARY KEY,
+    fingerprint TEXT NOT NULL,
+    submitted_at TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    expiration TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    structure TEXT NOT NULL,
+    horizon_lower INTEGER NOT NULL,
+    horizon_upper INTEGER NOT NULL,
+    weight_lower REAL NOT NULL,
+    underlying_price_at_signal REAL NOT NULL,
+    atm_iv_at_signal REAL NOT NULL,
+    predicted_iv_at_signal REAL NOT NULL,
+    divergence_at_signal REAL NOT NULL,
+    cross_sectional_z REAL NOT NULL,
+    time_series_z REAL,
+    submitted_price REAL NOT NULL,
+    legs_json TEXT NOT NULL,
+    final_status TEXT,
+    fill_price REAL,
+    filled_at TEXT,
+    error_message TEXT
+);
+"""
+
+CREATE_FAILED_SQL = """
+CREATE TABLE IF NOT EXISTS failed_submissions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint TEXT NOT NULL,
+    submitted_at TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    expiration TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    reason TEXT NOT NULL
+);
+"""
+
+CREATE_INDEXES_SQL = [
+    "CREATE INDEX IF NOT EXISTS idx_orders_symbol_submitted ON submitted_orders(symbol, submitted_at DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_orders_status ON submitted_orders(final_status);",
+    "CREATE INDEX IF NOT EXISTS idx_orders_fingerprint ON submitted_orders(fingerprint, submitted_at DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_failed_fingerprint ON failed_submissions(fingerprint, submitted_at DESC);",
+]
+
+
+class OrderLog:
+    def __init__(self, db_path: Path):
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(str(db_path))
+        self._conn.execute(CREATE_SUBMITTED_SQL)
+        self._conn.execute(CREATE_FAILED_SQL)
+        for sql in CREATE_INDEXES_SQL:
+            self._conn.execute(sql)
+        self._conn.commit()
+
+    def close(self) -> None:
+        self._conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+    def record_submission(
+        self,
+        signal: "TradeSignal",
+        fingerprint: str,
+        structure: str,
+        submitted_price: float,
+        order_id: int,
+        submitted_at: datetime,
+    ) -> None:
+        legs_json = json.dumps([asdict(leg) for leg in signal.legs])
+        self._conn.execute(
+            "INSERT OR REPLACE INTO submitted_orders ("
+            "tradier_order_id, fingerprint, submitted_at, symbol, expiration, "
+            "direction, structure, horizon_lower, horizon_upper, weight_lower, "
+            "underlying_price_at_signal, atm_iv_at_signal, predicted_iv_at_signal, "
+            "divergence_at_signal, cross_sectional_z, time_series_z, "
+            "submitted_price, legs_json"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                order_id, fingerprint, submitted_at.isoformat(), signal.symbol,
+                signal.expiration.isoformat(), signal.direction, structure,
+                signal.horizon_lower, signal.horizon_upper, signal.weight_lower,
+                signal.underlying_price, signal.atm_iv,
+                signal.predicted_iv_equivalent, signal.divergence,
+                signal.cross_sectional_z, signal.time_series_z,
+                submitted_price, legs_json,
+            ),
+        )
+        self._conn.commit()
+
+    def update_terminal_state(
+        self,
+        order_id: int,
+        status: str,
+        fill_price: float | None,
+        filled_at: datetime | None,
+        error: str | None = None,
+    ) -> None:
+        self._conn.execute(
+            "UPDATE submitted_orders SET final_status = ?, fill_price = ?, "
+            "filled_at = ?, error_message = ? WHERE tradier_order_id = ?",
+            (
+                status,
+                fill_price,
+                filled_at.isoformat() if filled_at else None,
+                error,
+                order_id,
+            ),
+        )
+        self._conn.commit()
+
+    def record_failure(
+        self,
+        signal: "TradeSignal",
+        fingerprint: str,
+        reason: str,
+        submitted_at: datetime,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO failed_submissions "
+            "(fingerprint, submitted_at, symbol, expiration, direction, reason) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                fingerprint, submitted_at.isoformat(),
+                signal.symbol, signal.expiration.isoformat(),
+                signal.direction, reason,
+            ),
+        )
+        self._conn.commit()
+
+    def has_recent_open_order(self, fingerprint: str, hours: int = 24) -> bool:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        cur = self._conn.execute(
+            "SELECT tradier_order_id, final_status FROM submitted_orders "
+            "WHERE fingerprint = ? AND submitted_at >= ?",
+            (fingerprint, cutoff.isoformat()),
+        )
+        rows = cur.fetchall()
+        # Considered "open" unless the order's terminal state is rejected / canceled / expired
+        TERMINAL_FAILED = {"rejected", "canceled", "expired"}
+        for _, status in rows:
+            if status is None or status not in TERMINAL_FAILED:
+                return True
+        return False
+
+    def open_orders_by_symbol(self, symbol: str) -> list[dict]:
+        cur = self._conn.execute(
+            "SELECT tradier_order_id, fingerprint, submitted_at, expiration, "
+            "direction, structure, submitted_price, final_status "
+            "FROM submitted_orders WHERE symbol = ? "
+            "ORDER BY submitted_at DESC",
+            (symbol,),
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def submitted_count(self) -> int:
+        return self._conn.execute("SELECT COUNT(*) FROM submitted_orders").fetchone()[0]
+
+    def failed_count(self) -> int:
+        return self._conn.execute("SELECT COUNT(*) FROM failed_submissions").fetchone()[0]
