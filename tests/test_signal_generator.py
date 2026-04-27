@@ -249,7 +249,7 @@ async def live_test() -> int:
             print("  (no actionable signals — showing top 5 by |z|)")
             actionable = sorted(all_signals, key=lambda s: -abs(s.cross_sectional_z))[:5]
         if actionable:
-            header = f"{'sym':5s} {'exp':10s} {'dte':>3s} {'h_lo→h_up':10s} {'w_lo':>5s}  {'dir':4s} {'pred_iv':>8s} {'atm_iv':>8s} {'div':>+8s} {'cs_z':>+6s}  legs"
+            header = f"{'sym':5s} {'exp':10s} {'dte':>3s} {'h_lo→h_up':10s} {'w_lo':>5s}  {'dir':4s} {'pred_iv':>8s} {'atm_iv':>8s} {'div':>9s} {'cs_z':>6s}  legs"
             print(header)
             print("-" * len(header))
             for s in actionable[:5]:
