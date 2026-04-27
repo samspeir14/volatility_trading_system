@@ -182,7 +182,7 @@ class SignalGenerator:
         min_open_interest: int = 50,
         max_relative_spread: float = 0.10,
         cross_sectional_z_threshold: float = 1.5,
-        max_divergence: float = 0.30,
+        max_divergence: float = 0.25,
     ):
         for h in TRAINED_HORIZONS:
             if h not in predictors_by_horizon:
