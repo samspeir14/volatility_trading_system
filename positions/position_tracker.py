@@ -98,6 +98,10 @@ class PositionTracker:
                 logger.warning("could not parse legs_json for order %s: %s",
                                row["tradier_order_id"], e)
                 continue
+            # Tradier reports credit fills as NEGATIVE price (sign carries
+            # the credit-vs-debit semantic). entry_premium is always positive
+            # in our model — the BUY/SELL direction carries the sign elsewhere.
+            raw_fill = row["fill_price"] if row["fill_price"] is not None else row["submitted_price"]
             positions.append(OpenPosition(
                 tradier_order_id=row["tradier_order_id"],
                 symbol=row["symbol"],
@@ -105,7 +109,7 @@ class PositionTracker:
                 direction=row["direction"],
                 structure=row["structure"],
                 legs=legs,
-                entry_premium=float(row["fill_price"] if row["fill_price"] is not None else row["submitted_price"]),
+                entry_premium=abs(float(raw_fill)),
                 entry_atm_iv=row["atm_iv_at_signal"],
                 entry_predicted_iv=row["predicted_iv_at_signal"],
                 entry_divergence=row["divergence_at_signal"],
