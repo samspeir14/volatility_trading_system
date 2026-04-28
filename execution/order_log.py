@@ -210,6 +210,35 @@ class OrderLog:
         )
         self._conn.commit()
 
+    def positions_opened_on(self, today: date) -> int:
+        cur = self._conn.execute(
+            "SELECT COUNT(*) FROM submitted_orders "
+            "WHERE date(submitted_at) = ? "
+            "AND final_status IN ('filled', 'partially_filled')",
+            (today.isoformat(),),
+        )
+        return int(cur.fetchone()[0])
+
+    def positions_closed_on(self, today: date) -> int:
+        cur = self._conn.execute(
+            "SELECT COUNT(*) FROM submitted_orders "
+            "WHERE closing_order_id IS NOT NULL "
+            "AND date(closed_at) = ?",
+            (today.isoformat(),),
+        )
+        return int(cur.fetchone()[0])
+
+    def exit_triggers_today(self, today: date) -> dict[str, int]:
+        cur = self._conn.execute(
+            "SELECT exit_trigger, COUNT(*) FROM submitted_orders "
+            "WHERE closing_order_id IS NOT NULL "
+            "AND date(closed_at) = ? "
+            "AND exit_trigger IS NOT NULL "
+            "GROUP BY exit_trigger",
+            (today.isoformat(),),
+        )
+        return {row[0]: int(row[1]) for row in cur.fetchall()}
+
     def closed_today_pnl(self, today: date) -> float:
         """Sum of realized_pnl for orders whose closing trade filled on `today`."""
         cur = self._conn.execute(

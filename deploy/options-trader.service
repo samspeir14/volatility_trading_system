@@ -1,0 +1,18 @@
+[Unit]
+Description=Options Volatility Arbitrage Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/options-trader
+EnvironmentFile=/home/ubuntu/options-trader/.env
+ExecStart=/home/ubuntu/options-trader/venv/bin/python -m main
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
