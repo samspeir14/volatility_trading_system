@@ -103,15 +103,29 @@ def _load_predictors(artifact_dir: Path) -> dict[int, BestPredictor]:
 
         garch = GARCHBaseline(refit_every=21, min_history=100)
         bp = BestPredictor(lgbm=lgbm_pred, xgb=xgb_pred, garch=garch, horizon=h)
-        # Apply the most recent OOS R² ranking we know about (from
-        # experiments/vol_model_lab.py 2026-04-28: lgbm > xgb > garch at every h).
+        # Per-horizon OOS R² from tests/test_model_retraining.py 2026-04-30 run
+        # (252-day train window, matching production cadence). LGBM wins at
+        # short horizons; XGB wins at h=21 in this window. GARCH was at or
+        # below zero everywhere. Routing flips with each weekly retrain.
+        latest_r2 = _LATEST_RETRAIN_R2.get(h, {})
         bp.update_from_eval(
-            lgbm_r2=0.32 if lgbm_pred is not None else float("nan"),
-            xgb_r2=0.28 if xgb_pred is not None else float("nan"),
-            garch_r2=-0.1,
+            lgbm_r2=latest_r2.get("lgbm", float("nan")) if lgbm_pred is not None else float("nan"),
+            xgb_r2=latest_r2.get("xgb", float("nan")) if xgb_pred is not None else float("nan"),
+            garch_r2=latest_r2.get("garch", -0.1),
         )
         predictors[h] = bp
     return predictors
+
+
+# OOS R² per (horizon, model) measured by the most recent retraining run.
+# Drives BestPredictor routing — update with each weekly retrain so the bot
+# picks whichever model actually wins on current data.
+_LATEST_RETRAIN_R2: dict[int, dict[str, float]] = {
+    # 2026-04-30 retrain: 20 tickers, 252-day train window, 21-day refit cadence
+    5:  {"lgbm": 0.254, "xgb": 0.235, "garch": -0.271},
+    10: {"lgbm": 0.327, "xgb": 0.293, "garch": -0.062},
+    21: {"lgbm": 0.226, "xgb": 0.285, "garch":  0.026},
+}
 
 
 class MainLoop:
