@@ -59,15 +59,48 @@ When stopped, open positions persist in the Tradier sandbox. Restart picks up wh
 
 ## 6. Weekly model retraining (cron)
 
-Re-tune LightGBM (primary) and XGBoost (fallback) hyperparameters and refresh saved artifacts every Sunday at 3am UTC. The retraining script saves artifacts for both model families so the bot has a working fallback if either fit fails.
+Re-tune LightGBM (primary) and XGBoost (fallback) hyperparameters and refresh saved artifacts every Sunday at 3am UTC. The retraining script saves artifacts for both model families plus a `latest_retrain_r2.json` metadata file that drives `BestPredictor` routing — and then restarts the bot so the new R² values take effect immediately rather than waiting for a manual restart.
+
+### 6a. NOPASSWD sudoers entry for the restart
+
+The cron runs as `ubuntu`, so it needs passwordless sudo for one specific command. Scoped tightly to a single binary + argument:
 
 ```bash
-sudo tee /etc/cron.d/options-trader-retrain <<'EOF'
-0 3 * * SUN ubuntu cd /home/ubuntu/options-trader && /home/ubuntu/options-trader/venv/bin/python -m tests.test_model_retraining >> /home/ubuntu/options-trader/logs/retrain.log 2>&1
+sudo tee /etc/sudoers.d/options-trader-restart >/dev/null <<'EOF'
+# Allow the ubuntu user to restart the options-trader systemd unit without
+# a password. Scoped to that one command so the cron-driven weekly retrain
+# can pick up new artifacts without manual intervention.
+ubuntu ALL=(root) NOPASSWD: /bin/systemctl restart options-trader
+EOF
+sudo chmod 0440 /etc/sudoers.d/options-trader-restart
+sudo visudo -c -f /etc/sudoers.d/options-trader-restart   # validate before sudo accepts it
+```
+
+### 6b. The cron file itself
+
+```bash
+sudo tee /etc/cron.d/options-trader-retrain >/dev/null <<'EOF'
+# Weekly model retraining: tunes LightGBM (primary) and XGBoost (fallback)
+# across all 3 horizons, writes new artifacts + latest_retrain_r2.json, then
+# restarts the bot so the new R² values drive routing immediately. The &&
+# chain means the restart only fires if the retrain succeeded.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+RUN_SLOW_TESTS=1
+0 3 * * SUN ubuntu cd /home/ubuntu/options-trader && /home/ubuntu/options-trader/venv/bin/python -m tests.test_model_retraining >> /home/ubuntu/options-trader/logs/retrain.log 2>&1 && sudo /bin/systemctl restart options-trader
 EOF
 ```
 
-Set `RUN_SLOW_TESTS=1` in `.env` so the test isn't skipped. The bot's `_load_predictors` priority is LightGBM → XGBoost → GARCH-only; the newest artifact by mtime per family is picked on the next Monday startup. If LightGBM training fails on a future cron, the bot continues running on the prior LightGBM artifact (or XGBoost as fallback).
+The `&&` between retraining and restart is load-bearing: if the retrain crashes (bad data, convergence issue, disk full), the bot keeps running on the old artifacts rather than restarting into a broken state.
+
+### 6c. How routing updates flow
+
+1. Cron triggers Sunday 3am UTC.
+2. `tests.test_model_retraining` writes `lgbm_h{H}_<date>.joblib` + `xgb_h{H}_<date>.joblib` + `model/artifacts/latest_retrain_r2.json` (atomic via tempfile + rename).
+3. Cron chains `sudo /bin/systemctl restart options-trader` only on retrain exit code 0.
+4. Bot startup calls `_load_routing_r2()`, reads the JSON, applies the per-horizon R² values to `BestPredictor.update_from_eval`. The `BestPredictor flip h=N: ... -> ...` WARNING in the journal shows when routing changes.
+
+If the JSON is missing, malformed, or partial, `_load_routing_r2` falls back to a conservative hardcoded table — the bot stays bootable while a retrain is pending. Watch for `latest_retrain_r2.json missing` warnings in the journal as a signal that the cron silently failed.
 
 ## 7. Troubleshooting
 
