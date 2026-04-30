@@ -7,7 +7,15 @@ import numpy as np
 
 from config import Ticker, load_settings, load_watchlist
 from data import AsyncTradierClient, HistoricalStore
-from features import FEATURE_COLUMNS, FeaturePipeline
+from features import (
+    BASELINE_FEATURE_COLUMNS,
+    DISTRIBUTION_SHAPE_COLUMNS,
+    FEATURE_COLUMNS,
+    HORIZON_FEATURE_SETS,
+    OHLC_VOL_COLUMNS,
+    RATIO_FEATURE_COLUMNS,
+    FeaturePipeline,
+)
 
 
 def _last_weekday(d: date) -> date:
@@ -45,7 +53,14 @@ async def test_small_pipeline() -> None:
         # Shape
         assert df.index.names == ["symbol", "date"], f"index names = {df.index.names}"
         assert list(df.columns) == FEATURE_COLUMNS, "column order/identity mismatch"
-        assert len(df.columns) == 28, f"expected 28 features, got {len(df.columns)}"
+        assert len(df.columns) == 45, f"expected 45 features, got {len(df.columns)}"
+        # Confirm new feature blocks all present
+        for col in OHLC_VOL_COLUMNS:
+            assert col in df.columns, f"missing OHLC vol column {col}"
+        for col in DISTRIBUTION_SHAPE_COLUMNS:
+            assert col in df.columns, f"missing distribution shape column {col}"
+        for col in RATIO_FEATURE_COLUMNS:
+            assert col in df.columns, f"missing ratio column {col}"
 
         # Per-ticker non-NaN row count after warm-up
         for sym in ("AAPL", "MSFT", "SPY"):
@@ -126,7 +141,34 @@ async def test_full_watchlist_perf() -> None:
         store.close()
 
 
+def test_horizon_feature_sets_structure() -> None:
+    """Pure unit test — no API or cache needed."""
+    assert set(HORIZON_FEATURE_SETS.keys()) == {5, 10, 21}, (
+        f"unexpected horizons {set(HORIZON_FEATURE_SETS.keys())}"
+    )
+    for h, feats in HORIZON_FEATURE_SETS.items():
+        assert len(feats) == 20, f"h={h}: expected 20 features, got {len(feats)}"
+        assert len(set(feats)) == 20, f"h={h}: duplicate feature names"
+        # Every selected feature must exist in the full FEATURE_COLUMNS set
+        unknown = [f for f in feats if f not in FEATURE_COLUMNS]
+        assert not unknown, f"h={h}: features not in FEATURE_COLUMNS: {unknown}"
+
+    # h=5 and h=10 must NOT use distribution-shape features (per spec)
+    for h in (5, 10):
+        dist_overlap = set(HORIZON_FEATURE_SETS[h]) & set(DISTRIBUTION_SHAPE_COLUMNS)
+        assert not dist_overlap, (
+            f"h={h} unexpectedly includes distribution-shape features: {dist_overlap}"
+        )
+    # h=21 must include at least one rskew or rkurt
+    h21_dist = set(HORIZON_FEATURE_SETS[21]) & set(DISTRIBUTION_SHAPE_COLUMNS)
+    assert h21_dist, "h=21 must include at least one rskew/rkurt feature"
+    print(f"horizon_feature_sets: 20-feature subsets per horizon, h=21 dist features = {sorted(h21_dist)}")
+
+
 async def main() -> int:
+    # Pure-unit tests run unconditionally
+    test_horizon_feature_sets_structure()
+
     settings = load_settings()
     if settings.env != "sandbox":
         print(f"refusing to run against env={settings.env!r}", file=sys.stderr)

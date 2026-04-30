@@ -35,6 +35,7 @@ from logs import DailySummary, DailySummaryBuilder, post_to_slack, setup_logging
 from model import (
     BestPredictor,
     GARCHBaseline,
+    LightGBMVolPredictor,
     XGBoostVolPredictor,
 )
 from positions import ExitManager, PositionTracker
@@ -74,17 +75,41 @@ def _last_weekday(d: date) -> date:
 
 
 def _load_predictors(artifact_dir: Path) -> dict[int, BestPredictor]:
+    """Load the best available predictor per horizon. Priority: LightGBM,
+    then XGBoost, then GARCH-only. The bot keeps running on the previous
+    XGBoost model if a future LightGBM cron retraining fails."""
     predictors: dict[int, BestPredictor] = {}
     for h in (5, 10, 21):
-        existing = list(artifact_dir.glob(f"xgb_h{h}_*.joblib"))
-        if not existing:
-            raise RuntimeError(f"no model artifact for h={h}; run slow tuning test first")
-        newest = max(existing, key=lambda p: p.stat().st_mtime)
-        xgb = XGBoostVolPredictor.load(newest)
+        lgbm_files = list(artifact_dir.glob(f"lgbm_h{h}_*.joblib"))
+        xgb_files = list(artifact_dir.glob(f"xgb_h{h}_*.joblib"))
+
+        lgbm_pred: LightGBMVolPredictor | None = None
+        xgb_pred: XGBoostVolPredictor | None = None
+
+        if lgbm_files:
+            newest = max(lgbm_files, key=lambda p: p.stat().st_mtime)
+            lgbm_pred = LightGBMVolPredictor.load(newest)
+            logger.info("loaded %s for h=%d", newest.name, h)
+        if xgb_files:
+            newest = max(xgb_files, key=lambda p: p.stat().st_mtime)
+            xgb_pred = XGBoostVolPredictor.load(newest)
+            logger.info("loaded %s for h=%d", newest.name, h)
+
+        if lgbm_pred is None and xgb_pred is None:
+            raise RuntimeError(
+                f"no model artifact for h={h}; "
+                f"run `python -m tests.test_model_retraining` to generate one"
+            )
+
         garch = GARCHBaseline(refit_every=21, min_history=100)
-        bp = BestPredictor(garch, xgb, horizon=h)
-        # Slow tuning result confirmed XGBoost beats GARCH at all horizons
-        bp.update_from_eval(garch_r2=-0.1, xgb_r2=0.2)
+        bp = BestPredictor(lgbm=lgbm_pred, xgb=xgb_pred, garch=garch, horizon=h)
+        # Apply the most recent OOS R² ranking we know about (from
+        # experiments/vol_model_lab.py 2026-04-28: lgbm > xgb > garch at every h).
+        bp.update_from_eval(
+            lgbm_r2=0.32 if lgbm_pred is not None else float("nan"),
+            xgb_r2=0.28 if xgb_pred is not None else float("nan"),
+            garch_r2=-0.1,
+        )
         predictors[h] = bp
     return predictors
 

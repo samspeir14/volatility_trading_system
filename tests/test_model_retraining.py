@@ -1,7 +1,11 @@
-"""Slow integration test: full hyperparameter tuning + walk-forward + GARCH comparison
-across all three prediction horizons (5, 10, 21). Guarded by RUN_SLOW_TESTS=1.
-Runs against the full 20-ticker watchlist so XGBoost trains on ~10k rows."""
+"""Slow integration test: retrains both LightGBM (primary) and XGBoost
+(fallback) across all three prediction horizons (5, 10, 21). Saves artifacts
+to model/artifacts/ for the bot's `_load_predictors` to pick up on next
+startup. Guarded by RUN_SLOW_TESTS=1.
 
+Replaces tests/test_xgb_hyperparam_tuning.py (XGBoost-only). The cron entry
+in deploy/README.md points here now.
+"""
 import os
 import sys
 import time
@@ -16,6 +20,7 @@ from features import FeaturePipeline
 from model import (
     GARCHBaseline,
     regression_metrics,
+    walk_forward_evaluate_lightgbm,
     walk_forward_evaluate_xgboost,
 )
 
@@ -36,23 +41,35 @@ def evaluate_horizon(
     train_window_days: int,
     refit_every: int,
     symbols: list[str],
-) -> tuple[dict, dict, float]:
-    """Run XGBoost (with tuning) + GARCH walk-forward at a single horizon.
-    Returns (garch_metrics, xgb_metrics, wall_clock_seconds)."""
+) -> tuple[dict, dict, dict, float, float]:
+    """Run LightGBM (with tuning) + XGBoost (with tuning) + GARCH walk-forward
+    at a single horizon. Returns (garch_metrics, lgbm_metrics, xgb_metrics,
+    lgbm_elapsed, xgb_elapsed)."""
     print(f"\n--- horizon={horizon} ---")
+
+    t0 = time.monotonic()
+    lgbm_results = walk_forward_evaluate_lightgbm(
+        feature_df, returns_by_symbol, horizon=horizon,
+        train_window_days=train_window_days, refit_every=refit_every,
+        hyperparams=None,
+        artifact_dir=ARTIFACT_DIR,
+    )
+    lgbm_elapsed = time.monotonic() - t0
+    print(f"  lightgbm tuning + walk-forward: {lgbm_elapsed:.1f}s ({len(lgbm_results)} OOS rows)")
+    lgbm_metrics = regression_metrics(lgbm_results["actual"], lgbm_results["predicted"])
+
     t0 = time.monotonic()
     xgb_results = walk_forward_evaluate_xgboost(
         feature_df, returns_by_symbol, horizon=horizon,
         train_window_days=train_window_days, refit_every=refit_every,
-        hyperparams=None,  # triggers tuning at first refit
-        artifact_dir=ARTIFACT_DIR,  # save tuned models for the live signal test
+        hyperparams=None,
+        artifact_dir=ARTIFACT_DIR,
     )
     xgb_elapsed = time.monotonic() - t0
-    print(f"  xgboost tuning + walk-forward: {xgb_elapsed:.1f}s ({len(xgb_results)} OOS rows)")
-
+    print(f"  xgboost  tuning + walk-forward: {xgb_elapsed:.1f}s ({len(xgb_results)} OOS rows)")
     xgb_metrics = regression_metrics(xgb_results["actual"], xgb_results["predicted"])
 
-    oos_dates = set(xgb_results.index.get_level_values("date").unique())
+    oos_dates = set(lgbm_results.index.get_level_values("date").unique())
     baseline = GARCHBaseline(refit_every=refit_every, min_history=100)
     garch_pooled = []
     for sym in symbols:
@@ -64,7 +81,7 @@ def evaluate_horizon(
         garch_df[f"actual_rv_{horizon}"],
         garch_df[f"pred_rv_{horizon}"],
     )
-    return garch_metrics, xgb_metrics, xgb_elapsed
+    return garch_metrics, lgbm_metrics, xgb_metrics, lgbm_elapsed, xgb_elapsed
 
 
 def main() -> int:
@@ -103,44 +120,59 @@ def main() -> int:
             for sym in symbols
         }
 
-        # Per-horizon evaluation
         rows = []
+        total_lgbm_elapsed = 0.0
         total_xgb_elapsed = 0.0
         for h in horizons:
-            garch_m, xgb_m, elapsed = evaluate_horizon(
+            garch_m, lgbm_m, xgb_m, l_elapsed, x_elapsed = evaluate_horizon(
                 h, feature_df, returns_by_symbol,
                 train_window_days, refit_every, symbols,
             )
-            total_xgb_elapsed += elapsed
+            total_lgbm_elapsed += l_elapsed
+            total_xgb_elapsed += x_elapsed
             rows.append({"horizon": h, "model": "GARCH", **garch_m})
+            rows.append({"horizon": h, "model": "LightGBM (tuned)", **lgbm_m})
             rows.append({"horizon": h, "model": "XGBoost (tuned)", **xgb_m})
 
-        # 25-min gate: 3 horizons × ~3-4 min tuning each
-        assert total_xgb_elapsed < 1500, (
-            f"FAIL: total xgb tuning took {total_xgb_elapsed:.1f}s, must be <25 min"
+        # 30-min budget: LightGBM is ~3× faster than XGBoost so even with both
+        # fits per horizon this should comfortably fit in 30 min.
+        total_elapsed = total_lgbm_elapsed + total_xgb_elapsed
+        assert total_elapsed < 1800, (
+            f"FAIL: total tuning + walk-forward took {total_elapsed:.1f}s, must be <30 min"
         )
 
-        # Final summary
         summary = pd.DataFrame(rows).set_index(["horizon", "model"])[
             ["n", "rmse", "mae", "r2", "bias"]
         ]
         print("\n=== Head-to-head per horizon ===")
         print(summary.to_string())
 
-        # Winner per horizon
-        print("\n=== Winners ===")
-        wins = {}
+        print("\n=== Winners (per horizon) ===")
         for h in horizons:
-            g_r2 = summary.loc[(h, "GARCH"), "r2"]
-            x_r2 = summary.loc[(h, "XGBoost (tuned)"), "r2"]
-            winner = "XGBoost" if x_r2 > g_r2 else "GARCH"
-            lift = x_r2 - g_r2
-            wins[h] = (winner, x_r2, g_r2, lift)
-            print(f"  h={h:2d}: {winner:7s}  (XGB R²={x_r2:+.3f} vs GARCH R²={g_r2:+.3f}, "
-                  f"lift={lift:+.3f})")
+            r2s = {
+                "GARCH": summary.loc[(h, "GARCH"), "r2"],
+                "LightGBM": summary.loc[(h, "LightGBM (tuned)"), "r2"],
+                "XGBoost": summary.loc[(h, "XGBoost (tuned)"), "r2"],
+            }
+            winner = max(r2s, key=r2s.get)
+            print(
+                f"  h={h:2d}: {winner:10s}  "
+                f"(LGBM={r2s['LightGBM']:+.3f}, XGB={r2s['XGBoost']:+.3f}, "
+                f"GARCH={r2s['GARCH']:+.3f})"
+            )
 
-        print(f"\ntotal xgboost tuning + walk-forward across {len(horizons)} horizons: "
-              f"{total_xgb_elapsed:.1f}s")
+        print(
+            f"\ntotal lightgbm: {total_lgbm_elapsed:.1f}s, "
+            f"total xgboost: {total_xgb_elapsed:.1f}s, "
+            f"combined: {total_elapsed:.1f}s"
+        )
+        # Verify we wrote both artifact families
+        for h in horizons:
+            lgbm_files = list(ARTIFACT_DIR.glob(f"lgbm_h{h}_*.joblib"))
+            xgb_files = list(ARTIFACT_DIR.glob(f"xgb_h{h}_*.joblib"))
+            assert lgbm_files, f"no LightGBM artifact written for h={h}"
+            assert xgb_files, f"no XGBoost artifact written for h={h}"
+        print("\nartifacts: LightGBM + XGBoost saved for all horizons in", ARTIFACT_DIR)
     finally:
         store.close()
     return 0

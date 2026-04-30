@@ -59,15 +59,15 @@ When stopped, open positions persist in the Tradier sandbox. Restart picks up wh
 
 ## 6. Weekly model retraining (cron)
 
-Re-tune XGBoost hyperparameters and refresh saved artifacts every Sunday at 3am UTC. The slow tuning test already saves artifacts when invoked.
+Re-tune LightGBM (primary) and XGBoost (fallback) hyperparameters and refresh saved artifacts every Sunday at 3am UTC. The retraining script saves artifacts for both model families so the bot has a working fallback if either fit fails.
 
 ```bash
 sudo tee /etc/cron.d/options-trader-retrain <<'EOF'
-0 3 * * SUN ubuntu cd /home/ubuntu/options-trader && /home/ubuntu/options-trader/venv/bin/python -m tests.test_xgb_hyperparam_tuning >> /home/ubuntu/options-trader/logs/retrain.log 2>&1
+0 3 * * SUN ubuntu cd /home/ubuntu/options-trader && /home/ubuntu/options-trader/venv/bin/python -m tests.test_model_retraining >> /home/ubuntu/options-trader/logs/retrain.log 2>&1
 EOF
 ```
 
-Set `RUN_SLOW_TESTS=1` in `.env` so the test isn't skipped. The bot's bootstrap loader picks up the newest artifact by mtime on the next Monday startup.
+Set `RUN_SLOW_TESTS=1` in `.env` so the test isn't skipped. The bot's `_load_predictors` priority is LightGBM → XGBoost → GARCH-only; the newest artifact by mtime per family is picked on the next Monday startup. If LightGBM training fails on a future cron, the bot continues running on the prior LightGBM artifact (or XGBoost as fallback).
 
 ## 7. Troubleshooting
 

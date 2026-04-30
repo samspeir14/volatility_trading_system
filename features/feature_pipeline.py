@@ -1,6 +1,7 @@
 import logging
 from datetime import date
 
+import numpy as np
 import pandas as pd
 
 from config import MARKET_INDICES, Ticker
@@ -11,12 +12,16 @@ from data import (
     fetch_and_cache,
 )
 from features.cross_ticker import (
+    RATIO_FEATURE_COLUMNS,
+    add_ratio_features,
     market_avg_rv,
     rolling_corr_with_spy,
     sector_avg_rv,
     vix_features,
 )
+from features.distribution_shape import realized_kurt, realized_skew
 from features.garch import garch_features_walk_forward
+from features.ohlc_vol import garman_klass_vol, parkinson_vol
 from features.realized_vol import (
     acf_squared_returns,
     ewma_vol,
@@ -34,7 +39,8 @@ from features.technical_indicators import (
 
 logger = logging.getLogger(__name__)
 
-FEATURE_COLUMNS = [
+# 28 baseline feature columns — what FeaturePipeline shipped with prior to LightGBM integration.
+BASELINE_FEATURE_COLUMNS: list[str] = [
     # Realized vol (12)
     "rv_5", "rv_10", "rv_21", "rv_63",
     "ewma_vol_94", "ewma_vol_97",
@@ -53,6 +59,57 @@ FEATURE_COLUMNS = [
     "vix_level", "vix9d_to_vix", "vix3m_to_vix",
     "corr_spy_21",
 ]
+
+# OHLC-based vol estimators (added 2026-04-28 with LightGBM integration)
+OHLC_VOL_COLUMNS: list[str] = [
+    "parkinson_5", "parkinson_10", "parkinson_21",
+    "gk_5", "gk_10", "gk_21",
+]
+
+# Distribution shape — only h=21 selects these in HORIZON_FEATURE_SETS, but the
+# pipeline computes them so the same matrix supports all horizons.
+DISTRIBUTION_SHAPE_COLUMNS: list[str] = [
+    "rskew_21", "rskew_63",
+    "rkurt_21", "rkurt_63",
+]
+
+# Full 45-column feature matrix produced by build_features().
+FEATURE_COLUMNS: list[str] = (
+    BASELINE_FEATURE_COLUMNS
+    + OHLC_VOL_COLUMNS
+    + DISTRIBUTION_SHAPE_COLUMNS
+    + RATIO_FEATURE_COLUMNS
+)
+
+
+# Per-horizon top-20 feature sets, derived from experiments/results/feature_importance.csv
+# (experiment 3_top20_xgb, mean-rank aggregation across walk-forward refits).
+# Frozen at integration time — do not load from CSV at runtime.
+HORIZON_FEATURE_SETS: dict[int, list[str]] = {
+    5: [
+        "parkinson_21", "gk_5", "gk_21", "vix9d_to_vix", "parkinson_5",
+        "garch_forecast_var", "market_avg_rv21", "intraday_range",
+        "rv_10_63_ratio", "vix3m_to_vix", "rv21_vs_market", "rv_63",
+        "vix_level", "ewma_vol_97", "rsi_14", "acf_sq_ret_lag5",
+        "sector_avg_rv21", "bb_width", "ewma_vol_94", "parkinson_10",
+    ],
+    10: [
+        "gk_21", "parkinson_21", "garch_forecast_var", "vix9d_to_vix",
+        "gk_10", "acf_sq_ret_lag5", "vix3m_to_vix", "gk_5",
+        "rv21_vs_market", "rv21_vs_sector", "market_avg_rv21",
+        "ewma_vol_97", "rv_63", "rsi_14", "rv_10_63_ratio", "rv_10",
+        "acf_sq_ret_lag1", "parkinson_5", "vix_vs_rv21_ann",
+        "intraday_range",
+    ],
+    21: [
+        "gk_21", "gk_10", "parkinson_21", "garch_forecast_var",
+        "market_avg_rv21", "parkinson_10", "vix9d_to_vix",
+        "rv21_vs_market", "rkurt_21", "acf_sq_ret_lag1", "vix3m_to_vix",
+        "rv_63", "acf_sq_ret_lag5", "sector_avg_rv21", "rkurt_63",
+        "rv21_vs_sector", "garch_resid_lb_pvalue", "corr_spy_21",
+        "rskew_63", "ewma_vol_97",
+    ],
+}
 
 
 class FeaturePipeline:
@@ -86,7 +143,12 @@ class FeaturePipeline:
         )
 
     def build_features(self, start: date, end: date) -> pd.DataFrame:
-        """Build the full feature matrix from cached bars. No I/O."""
+        """Build the full feature matrix from cached bars. No I/O.
+
+        Returns a MultiIndex (symbol, date) DataFrame with FEATURE_COLUMNS:
+        the 28 baseline columns + 6 OHLC vol + 4 distribution shape + 7 ratios = 45.
+        Per-horizon production models pull subsets via HORIZON_FEATURE_SETS.
+        """
         watchlist_symbols = [t.symbol for t in self._watchlist]
         all_symbols = watchlist_symbols + list(self._indices)
         bars = {sym: self._store.get_bars(sym, start, end) for sym in all_symbols}
@@ -104,7 +166,7 @@ class FeaturePipeline:
                 continue
             per_ticker[sym] = self._build_single_ticker(bars[sym], returns[sym])
 
-        # Cross-ticker features
+        # Cross-ticker features (writes into per_ticker frames in place)
         if per_ticker:
             self._add_cross_ticker_features(per_ticker, bars, returns)
 
@@ -112,6 +174,11 @@ class FeaturePipeline:
             return pd.DataFrame(columns=FEATURE_COLUMNS)
 
         result = pd.concat(per_ticker, names=["symbol", "date"])
+        # Ratios depend on cross-ticker columns (market_avg_rv21, sector_avg_rv21)
+        # being populated, so compute them after the concat on the unified frame.
+        ratios = add_ratio_features(result)
+        result = pd.concat([result, ratios], axis=1)
+        result = result.replace([np.inf, -np.inf], np.nan)
         # Reorder columns to canonical order; dropna(how="all") trims the warm-up
         result = result.reindex(columns=FEATURE_COLUMNS).dropna(how="all")
         return result
@@ -152,6 +219,20 @@ class FeaturePipeline:
         df["atr_14"] = atr(b["high"], b["low"], b["close"])
         df["atr_roc"] = df["atr_14"].pct_change()
         df["intraday_range"] = intraday_range(b["high"], b["low"], b["close"])
+
+        # OHLC-based vol (Parkinson, Garman-Klass)
+        df["parkinson_5"] = parkinson_vol(b["high"], b["low"], 5)
+        df["parkinson_10"] = parkinson_vol(b["high"], b["low"], 10)
+        df["parkinson_21"] = parkinson_vol(b["high"], b["low"], 21)
+        df["gk_5"] = garman_klass_vol(b["open"], b["high"], b["low"], b["close"], 5)
+        df["gk_10"] = garman_klass_vol(b["open"], b["high"], b["low"], b["close"], 10)
+        df["gk_21"] = garman_klass_vol(b["open"], b["high"], b["low"], b["close"], 21)
+
+        # Realized distribution shape (h=21 selector only; computed for all)
+        df["rskew_21"] = realized_skew(r, 21)
+        df["rskew_63"] = realized_skew(r, 63)
+        df["rkurt_21"] = realized_kurt(r, 21)
+        df["rkurt_63"] = realized_kurt(r, 63)
 
         return df
 
