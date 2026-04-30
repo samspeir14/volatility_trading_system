@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -74,10 +75,52 @@ def _last_weekday(d: date) -> date:
     return d
 
 
+def _load_routing_r2(artifact_dir: Path) -> dict[int, dict[str, float]]:
+    """Read per-horizon OOS R² from latest_retrain_r2.json (written by
+    tests/test_model_retraining.py). Falls back to a conservative table that
+    routes to LightGBM at short horizons and treats h=21 as a tie if the JSON
+    is missing or malformed — keeps the bot bootable while a retrain is
+    pending."""
+    fallback = {
+        5:  {"lgbm": 0.25, "xgb": 0.23, "garch": -0.27},
+        10: {"lgbm": 0.33, "xgb": 0.29, "garch": -0.06},
+        21: {"lgbm": 0.23, "xgb": 0.29, "garch":  0.03},
+    }
+    json_path = artifact_dir / "latest_retrain_r2.json"
+    if not json_path.exists():
+        logger.warning(
+            "%s missing; using fallback routing R² (run tests.test_model_retraining to refresh)",
+            json_path.name,
+        )
+        return fallback
+    try:
+        with open(json_path) as f:
+            payload = json.load(f)
+        out: dict[int, dict[str, float]] = {}
+        for h_str, r2s in payload["r2_by_horizon"].items():
+            out[int(h_str)] = {
+                "lgbm": float(r2s["lgbm"]),
+                "xgb": float(r2s["xgb"]),
+                "garch": float(r2s["garch"]),
+            }
+        # Guard against partial files: must contain all 3 horizons.
+        if {5, 10, 21} - set(out.keys()):
+            raise ValueError(f"missing horizons in {json_path.name}: {set(out.keys())}")
+        logger.info(
+            "routing R² loaded from %s (trained_at=%s)",
+            json_path.name, payload.get("trained_at", "unknown"),
+        )
+        return out
+    except Exception as e:
+        logger.error("failed to read %s (%s); using fallback routing R²", json_path.name, e)
+        return fallback
+
+
 def _load_predictors(artifact_dir: Path) -> dict[int, BestPredictor]:
     """Load the best available predictor per horizon. Priority: LightGBM,
     then XGBoost, then GARCH-only. The bot keeps running on the previous
-    XGBoost model if a future LightGBM cron retraining fails."""
+    artifact if a future cron retraining fails."""
+    routing_r2 = _load_routing_r2(artifact_dir)
     predictors: dict[int, BestPredictor] = {}
     for h in (5, 10, 21):
         lgbm_files = list(artifact_dir.glob(f"lgbm_h{h}_*.joblib"))
@@ -103,11 +146,7 @@ def _load_predictors(artifact_dir: Path) -> dict[int, BestPredictor]:
 
         garch = GARCHBaseline(refit_every=21, min_history=100)
         bp = BestPredictor(lgbm=lgbm_pred, xgb=xgb_pred, garch=garch, horizon=h)
-        # Per-horizon OOS R² from tests/test_model_retraining.py 2026-04-30 run
-        # (252-day train window, matching production cadence). LGBM wins at
-        # short horizons; XGB wins at h=21 in this window. GARCH was at or
-        # below zero everywhere. Routing flips with each weekly retrain.
-        latest_r2 = _LATEST_RETRAIN_R2.get(h, {})
+        latest_r2 = routing_r2.get(h, {})
         bp.update_from_eval(
             lgbm_r2=latest_r2.get("lgbm", float("nan")) if lgbm_pred is not None else float("nan"),
             xgb_r2=latest_r2.get("xgb", float("nan")) if xgb_pred is not None else float("nan"),
@@ -115,17 +154,6 @@ def _load_predictors(artifact_dir: Path) -> dict[int, BestPredictor]:
         )
         predictors[h] = bp
     return predictors
-
-
-# OOS R² per (horizon, model) measured by the most recent retraining run.
-# Drives BestPredictor routing — update with each weekly retrain so the bot
-# picks whichever model actually wins on current data.
-_LATEST_RETRAIN_R2: dict[int, dict[str, float]] = {
-    # 2026-04-30 retrain: 20 tickers, 252-day train window, 21-day refit cadence
-    5:  {"lgbm": 0.254, "xgb": 0.235, "garch": -0.271},
-    10: {"lgbm": 0.327, "xgb": 0.293, "garch": -0.062},
-    21: {"lgbm": 0.226, "xgb": 0.285, "garch":  0.026},
-}
 
 
 class MainLoop:

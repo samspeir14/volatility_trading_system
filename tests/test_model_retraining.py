@@ -1,15 +1,18 @@
 """Slow integration test: retrains both LightGBM (primary) and XGBoost
 (fallback) across all three prediction horizons (5, 10, 21). Saves artifacts
-to model/artifacts/ for the bot's `_load_predictors` to pick up on next
-startup. Guarded by RUN_SLOW_TESTS=1.
+to model/artifacts/ and writes per-horizon OOS R² to
+model/artifacts/latest_retrain_r2.json so main.py's _load_predictors can
+update BestPredictor routing without manual config edits. Guarded by
+RUN_SLOW_TESTS=1.
 
 Replaces tests/test_xgb_hyperparam_tuning.py (XGBoost-only). The cron entry
 in deploy/README.md points here now.
 """
+import json
 import os
 import sys
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -26,6 +29,7 @@ from model import (
 
 
 ARTIFACT_DIR = Path(__file__).resolve().parent.parent / "model" / "artifacts"
+ROUTING_R2_JSON = ARTIFACT_DIR / "latest_retrain_r2.json"
 
 
 def _last_weekday(d: date) -> date:
@@ -121,6 +125,7 @@ def main() -> int:
         }
 
         rows = []
+        r2_by_horizon: dict[int, dict[str, float]] = {}
         total_lgbm_elapsed = 0.0
         total_xgb_elapsed = 0.0
         for h in horizons:
@@ -133,6 +138,11 @@ def main() -> int:
             rows.append({"horizon": h, "model": "GARCH", **garch_m})
             rows.append({"horizon": h, "model": "LightGBM (tuned)", **lgbm_m})
             rows.append({"horizon": h, "model": "XGBoost (tuned)", **xgb_m})
+            r2_by_horizon[h] = {
+                "lgbm": float(lgbm_m["r2"]),
+                "xgb": float(xgb_m["r2"]),
+                "garch": float(garch_m["r2"]),
+            }
 
         # 30-min budget: LightGBM is ~3× faster than XGBoost so even with both
         # fits per horizon this should comfortably fit in 30 min.
@@ -173,6 +183,22 @@ def main() -> int:
             assert lgbm_files, f"no LightGBM artifact written for h={h}"
             assert xgb_files, f"no XGBoost artifact written for h={h}"
         print("\nartifacts: LightGBM + XGBoost saved for all horizons in", ARTIFACT_DIR)
+
+        # Write the routing R² table that main.py's _load_predictors consumes.
+        # Atomic write via temp file + rename so a partially-written JSON can
+        # never confuse the bot during a concurrent restart.
+        payload = {
+            "trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "train_window_days": train_window_days,
+            "refit_every": refit_every,
+            "n_tickers": len(tickers),
+            "r2_by_horizon": {str(h): r2_by_horizon[h] for h in horizons},
+        }
+        tmp_path = ROUTING_R2_JSON.with_suffix(".json.tmp")
+        with open(tmp_path, "w") as f:
+            json.dump(payload, f, indent=2)
+        tmp_path.replace(ROUTING_R2_JSON)
+        print(f"wrote routing R² metadata: {ROUTING_R2_JSON}")
     finally:
         store.close()
     return 0
