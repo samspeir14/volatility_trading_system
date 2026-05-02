@@ -461,9 +461,9 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
 
     risk_manager = RiskManager(
         watchlist=watchlist,
-        max_per_trade_loss_pct=0.01,
+        max_per_trade_loss_pct=0.02,
         max_per_ticker_exposure_pct=0.05,
-        max_per_sector_positions=3,
+        max_per_sector_positions=4,
         max_portfolio_delta_pct=0.05,
         max_portfolio_gamma_pct=0.01,
         max_portfolio_vega_pct=0.05,
