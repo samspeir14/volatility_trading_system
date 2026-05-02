@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 TRAINED_HORIZONS: tuple[int, ...] = (5, 10, 21)
 TRADING_DAYS_PER_YEAR = 252
-MIN_DTE = 3
+MIN_DTE = 4
 MAX_DTE = 45
 
 

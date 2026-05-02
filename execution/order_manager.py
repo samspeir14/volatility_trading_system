@@ -451,9 +451,11 @@ class OrderManager:
         # Compute realized P&L using fill price if available, otherwise the limit
         realized_pnl: float
         if terminal_status == "filled" and fill_price is not None:
-            # For credit close: realized close cash = +fill_price * 100
-            # For debit close: realized close cash = -fill_price * 100
-            close_cash_realized = fill_price * 100 if order_type == "credit" else -fill_price * 100
+            # Tradier returns avg_fill_price signed (credits negative — see
+            # position_tracker.py:101). abs() + order_type gives us the canonical
+            # close cash flow: + when we receive cash, - when we pay.
+            abs_fill = abs(fill_price)
+            close_cash_realized = abs_fill * 100 if order_type == "credit" else -abs_fill * 100
             entry_sign = -1 if position.is_long else 1
             entry_cash = entry_sign * position.entry_premium * 100
             realized_pnl = entry_cash + close_cash_realized

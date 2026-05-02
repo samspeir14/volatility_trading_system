@@ -55,10 +55,10 @@ def test_interpolate_horizon():
     assert (h_lo, h_up) == (10, 21)
     assert math.isclose(w_lo, 6 / 11, rel_tol=1e-9)
     # extrapolation
-    assert interpolate_horizon(3) == (5, 5, 1.0)
+    assert interpolate_horizon(4) == (5, 5, 1.0)
     assert interpolate_horizon(30) == (21, 21, 1.0)
-    # out of range
-    assert interpolate_horizon(2) is None
+    # out of range (MIN_DTE=4 to give a buffer above expiration_proximity_dte=2)
+    assert interpolate_horizon(3) is None
     assert interpolate_horizon(50) is None
     print("interpolate_horizon: OK on boundaries, interior, extrapolation, out-of-range")
 

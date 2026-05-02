@@ -1,3 +1,4 @@
+import asyncio
 import json
 import sys
 import tempfile
@@ -5,10 +6,13 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-from execution import OrderLog
+from config import Settings
+from execution import OrderLog, OrderManager
 from logs import DailySummary, DailySummaryBuilder
+from positions.position_tracker import OpenPosition, PositionMark
 from risk import DailyKillSwitch, RiskRejectionLog
 from signals import DivergenceHistory
+from signals.signal_generator import TradeLeg
 
 
 def _mk_snapshot(*, today_realized=0.0, today_unrealized=0.0, equity=100000.0,
@@ -177,11 +181,138 @@ def test_summary_rejection_categories():
     print(f"rejection_categories: {summary.risk_rejections_by_reason}")
 
 
+def _seed_open(log: OrderLog, *, order_id: int, direction: str, structure: str,
+               entry_premium: float) -> None:
+    log._conn.execute(
+        "INSERT INTO submitted_orders ("
+        "tradier_order_id, fingerprint, submitted_at, symbol, expiration, "
+        "direction, structure, horizon_lower, horizon_upper, weight_lower, "
+        "underlying_price_at_signal, atm_iv_at_signal, predicted_iv_at_signal, "
+        "divergence_at_signal, cross_sectional_z, time_series_z, "
+        "submitted_price, legs_json, final_status, fill_price"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (order_id, f"fp{order_id}", "2026-04-27T16:00:00+00:00",
+         "AAPL", "2026-05-15", direction, structure, 5, 5, 1.0,
+         100.0, 0.30, 0.40, 0.10, 2.0, None,
+         entry_premium, "[]", "filled",
+         entry_premium if direction == "BUY" else -entry_premium),
+    )
+    log._conn.commit()
+
+
+def _drive_close(log: OrderLog, pos: OpenPosition, close_cash_flow: float,
+                 fill_price: float, closing_order_id: int) -> None:
+    """Drive a close through the real OrderManager.submit_close path so the
+    realized P&L is computed by production code, not injected."""
+    fake = mock.AsyncMock()
+    fake.preview_order.return_value = {"order": {"status": "ok"}}
+    fake.place_order.return_value = {"order": {"id": closing_order_id, "status": "pending"}}
+    fake.get_order_status.return_value = {
+        "order": {"id": closing_order_id, "status": "filled", "avg_fill_price": fill_price}
+    }
+    settings = Settings(api_key="fake", account_id="V", base_url="http://x", env="sandbox")
+    mgr = OrderManager(client=fake, order_log=log, settings=settings,
+                       poll_interval_seconds=0.001, poll_timeout_seconds=1.0,
+                       slippage_buffer=0.0)
+    mark = PositionMark(
+        position=pos, current_legs=[], close_cash_flow=close_cash_flow,
+        cost_to_close=abs(close_cash_flow) if close_cash_flow < 0 else 0,
+        pnl_dollars=0.0, pnl_pct_of_entry_premium=0.0,
+        pnl_pct_of_max=float("nan"),
+        delta=0, gamma=0, theta=0, vega=0, dte=10,
+    )
+    result = asyncio.run(mgr.submit_close(position=pos, mark=mark, exit_trigger="profit_target"))
+    assert result.status == "filled", f"close failed: {result.error}"
+
+
+def test_summary_pnl_matches_equity_delta():
+    """Drive real closes through submit_close() and assert that the summary's
+    total P&L (realized + unrealized) agrees with the actual equity delta
+    within $5. This is the regression net for the realized-P&L double-count
+    bug — it would have failed when closed_today_pnl returned -$2,890 but
+    real equity moved -$74."""
+    with tempfile.TemporaryDirectory() as tmp:
+        order_log = OrderLog(Path(tmp) / "orders.db")
+        div_history = DivergenceHistory(Path(tmp) / "div.db")
+        risk_log = RiskRejectionLog(Path(tmp) / "risk.db")
+        kill_switch = DailyKillSwitch(Path(tmp) / "ks.db")
+
+        # Seed two open positions, then close both. Use the real submit_close
+        # path so the sign-flip bug would surface here.
+        _seed_open(order_log, order_id=7001, direction="BUY",
+                   structure="straddle", entry_premium=4.08)
+        _seed_open(order_log, order_id=7002, direction="SELL",
+                   structure="iron_condor", entry_premium=13.55)
+
+        long_legs = [TradeLeg(100.0, "call", "buy", 1, "C"),
+                     TradeLeg(100.0, "put", "buy", 1, "P")]
+        long_pos = OpenPosition(
+            tradier_order_id=7001, symbol="AAPL",
+            expiration=date(2026, 5, 15), direction="BUY",
+            structure="straddle", legs=long_legs, entry_premium=4.08,
+            entry_atm_iv=0.27, entry_predicted_iv=0.42, entry_divergence=0.15,
+            entry_horizon_lower=5, entry_horizon_upper=5, entry_weight_lower=1.0,
+            submitted_at=datetime(2026, 4, 27, 16, 0, tzinfo=timezone.utc),
+        )
+        ic_legs = [TradeLeg(210.0, "call", "sell", 1, "SC"),
+                   TradeLeg(210.0, "put", "sell", 1, "SP"),
+                   TradeLeg(230.0, "call", "buy", 1, "LC"),
+                   TradeLeg(190.0, "put", "buy", 1, "LP")]
+        ic_pos = OpenPosition(
+            tradier_order_id=7002, symbol="AAPL",
+            expiration=date(2026, 5, 15), direction="SELL",
+            structure="iron_condor", legs=ic_legs, entry_premium=13.55,
+            entry_atm_iv=0.40, entry_predicted_iv=0.32, entry_divergence=-0.08,
+            entry_horizon_lower=21, entry_horizon_upper=21, entry_weight_lower=1.0,
+            submitted_at=datetime(2026, 4, 27, 16, 0, tzinfo=timezone.utc),
+        )
+
+        # Long straddle: paid $4.08, sold for $2.00 (Tradier credit fill = -2.00)
+        # → realized = -$208
+        _drive_close(order_log, long_pos, close_cash_flow=200.0,
+                     fill_price=-2.00, closing_order_id=8001)
+        # Iron condor: received $13.55, bought back $5.00 → realized = +$855
+        _drive_close(order_log, ic_pos, close_cash_flow=-500.0,
+                     fill_price=5.00, closing_order_id=8002)
+
+        # The actual cash flow that hit the account: -208 + 855 = +647
+        actual_realized = 647.0
+        starting_equity = 100_000.0
+        ending_equity = starting_equity + actual_realized  # no unrealized in this scenario
+
+        # Build the snapshot the way portfolio_state.py does — pulling realized
+        # from closed_today_pnl (the real path that exercises the bug).
+        today = datetime.now(timezone.utc).date()
+        snap = mock.MagicMock()
+        snap.starting_equity_today = starting_equity
+        snap.equity = ending_equity
+        snap.today_realized_pnl = order_log.closed_today_pnl(today)
+        snap.today_unrealized_pnl = 0.0
+        snap.today_total_pnl = snap.today_realized_pnl + snap.today_unrealized_pnl
+        snap.open_positions = []
+
+        builder = DailySummaryBuilder(order_log, div_history, risk_log, kill_switch)
+        summary = builder.build(today, snap)
+
+        equity_delta = summary.ending_equity - summary.starting_equity
+        diff = abs(summary.total_pnl - equity_delta)
+        assert diff <= 5.0, (
+            f"summary P&L (${summary.total_pnl:+.2f}) diverges from equity delta "
+            f"(${equity_delta:+.2f}) by ${diff:.2f}; the realized-P&L "
+            f"double-count bug would have produced this."
+        )
+        for c in (order_log, div_history, risk_log, kill_switch):
+            c.close()
+    print(f"summary_vs_equity_delta: total_pnl={summary.total_pnl:+.2f} "
+          f"equity_delta={equity_delta:+.2f} diff={diff:.4f} ✓")
+
+
 def main() -> int:
     test_summary_with_no_activity()
     test_summary_with_filled_positions()
     test_summary_with_kill_switch()
     test_summary_rejection_categories()
+    test_summary_pnl_matches_equity_delta()
     print("all daily_summary tests passed")
     return 0
 

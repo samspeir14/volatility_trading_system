@@ -49,7 +49,7 @@ class ExitManager:
         straddle_stop_loss_pct: float = -0.50,
         iron_condor_profit_target_pct: float = 0.50,
         iron_condor_stop_loss_pct: float = -1.00,
-        expiration_proximity_dte: int = 5,
+        expiration_proximity_dte: int = 2,
         thesis_reversal_min_magnitude: float = 0.05,
     ):
         self._tracker = position_tracker
@@ -166,8 +166,8 @@ class ExitManager:
                 f"({sl_threshold / (pos.entry_premium * 100):+.0%} of entry premium)"
             )
 
-        # 3. Expiration proximity
-        if mark.dte <= self._exp_dte:
+        # 3. Expiration proximity (long straddles only — IC wings cap risk)
+        if pos.structure != "iron_condor" and mark.dte <= self._exp_dte:
             return "expiration_proximity", f"dte={mark.dte} <= {self._exp_dte}"
 
         # 4. Profit target

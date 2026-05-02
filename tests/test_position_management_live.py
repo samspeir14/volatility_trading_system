@@ -110,7 +110,7 @@ async def main_async() -> int:
                 straddle_stop_loss_pct=-0.50,
                 iron_condor_profit_target_pct=0.50,
                 iron_condor_stop_loss_pct=-1.00,
-                expiration_proximity_dte=5,
+                expiration_proximity_dte=2,
                 thesis_reversal_min_magnitude=0.05,
             )
 

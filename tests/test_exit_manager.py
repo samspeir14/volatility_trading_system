@@ -108,16 +108,46 @@ def test_long_straddle_stop_loss_at_neg_50pct():
 
 # ---------- expiration proximity ----------
 
-def test_expiration_proximity_dte_5():
-    pos = _mk_iron_condor_position()
-    mark = _mark(pos, pnl_dollars=0.0, dte=5)
-    trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=-0.08)
+def test_expiration_proximity_long_straddle_dte_2():
+    """Long straddles trigger expiration_proximity at dte<=2 (default).
+    The proximity exit applies to long straddles only — IC wings cap risk."""
+    pos = _mk_long_straddle_position()
+    mark = _mark(pos, pnl_dollars=0.0, dte=2)
+    trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=0.15)
     assert trigger == "expiration_proximity"
-    # DTE=6 doesn't trigger
-    mark = _mark(pos, pnl_dollars=0.0, dte=6)
-    trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=-0.08)
+    # DTE=3 doesn't trigger
+    mark = _mark(pos, pnl_dollars=0.0, dte=3)
+    trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=0.15)
     assert trigger is None
-    print("expiration_proximity: dte<=5 fires, dte=6 holds")
+    print("expiration_proximity (long_straddle): dte<=2 fires, dte=3 holds")
+
+
+def test_expiration_proximity_skipped_for_iron_condor():
+    """Iron condors do NOT trigger expiration_proximity — wings cap risk so
+    we let them ride to expiration unless another trigger fires."""
+    pos = _mk_iron_condor_position()
+    # dte=2 (would fire for a straddle)
+    mark = _mark(pos, pnl_dollars=0.0, dte=2)
+    trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=-0.08)
+    assert trigger is None, f"IC at dte=2 should hold, got {trigger}"
+    # dte=0 (expiration day)
+    mark = _mark(pos, pnl_dollars=0.0, dte=0)
+    trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=-0.08)
+    assert trigger is None, f"IC at dte=0 should hold, got {trigger}"
+    print("expiration_proximity (iron_condor): never fires")
+
+
+def test_min_dte_strictly_greater_than_expiration_proximity_dte():
+    """Trade window must leave a buffer between open and forced close.
+    Otherwise h=5 trades open at MIN_DTE and immediately exit on the next
+    scan via expiration_proximity (the bug this guards against)."""
+    from signals.signal_generator import MIN_DTE
+    mgr = _exit_mgr()
+    assert MIN_DTE > mgr._exp_dte, (
+        f"MIN_DTE ({MIN_DTE}) must be > expiration_proximity_dte "
+        f"({mgr._exp_dte}) so opened trades aren't immediately exit-eligible"
+    )
+    print(f"min_dte_invariant: MIN_DTE={MIN_DTE} > exp_dte={mgr._exp_dte} ✓")
 
 
 # ---------- thesis reversal ----------
@@ -206,7 +236,9 @@ def main() -> int:
     test_long_straddle_profit_target_at_100pct()
     test_iron_condor_stop_loss_at_neg_100pct()
     test_long_straddle_stop_loss_at_neg_50pct()
-    test_expiration_proximity_dte_5()
+    test_expiration_proximity_long_straddle_dte_2()
+    test_expiration_proximity_skipped_for_iron_condor()
+    test_min_dte_strictly_greater_than_expiration_proximity_dte()
     test_thesis_reversal_fires_when_sign_flips_and_magnitude_clears()
     test_thesis_overrides_stop_loss()
     test_thesis_overrides_profit_target()
