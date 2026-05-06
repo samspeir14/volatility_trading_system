@@ -26,6 +26,7 @@ import pandas as pd
 from config import load_settings, load_watchlist
 from data import (
     AsyncTradierClient,
+    EarningsCalendar,
     HistoricalStore,
     MarketData,
     compute_log_returns,
@@ -175,6 +176,8 @@ class MainLoop:
         position_tracker: PositionTracker,
         portfolio_state_builder: PortfolioStateBuilder,
         daily_summary_builder: DailySummaryBuilder,
+        earnings_calendar: EarningsCalendar | None = None,
+        watchlist_symbols: list[str] | None = None,
         slack_webhook_url: str | None = None,
         scan_interval_seconds: int = 300,
         kill_switch_threshold_pct: float = -0.03,
@@ -195,6 +198,8 @@ class MainLoop:
         self._position_tracker = position_tracker
         self._builder = portfolio_state_builder
         self._summary_builder = daily_summary_builder
+        self._earnings_calendar = earnings_calendar
+        self._watchlist_symbols = watchlist_symbols or []
         self._slack_url = slack_webhook_url
         self._scan_interval = scan_interval_seconds
         self._kill_pct = kill_switch_threshold_pct
@@ -225,6 +230,15 @@ class MainLoop:
         # 3. Snapshot
         snapshot = await self._builder.snapshot(scan)
         today = scan.fetched_at.date()
+
+        # Refresh earnings calendar (no-op if already done today)
+        if self._earnings_calendar is not None:
+            try:
+                await self._earnings_calendar.refresh_if_stale(
+                    today=today, symbols=self._watchlist_symbols or None,
+                )
+            except Exception as e:
+                logger.warning("earnings calendar refresh raised %s — failing open", e)
 
         # 4. Kill switch evaluation
         kill_active = self._kill_switch.evaluate_and_maybe_trigger(
@@ -437,6 +451,17 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
     divergence_history = DivergenceHistory(cache_dir / "divergence_history.db")
     closeables.append(divergence_history)
 
+    earnings_calendar = EarningsCalendar(
+        db_path=cache_dir / "earnings_calendar.db",
+        api_key=settings.finnhub_api_key,
+    )
+    closeables.append(earnings_calendar)
+    if not settings.finnhub_api_key:
+        logger.warning(
+            "FINNHUB_API_KEY not set — earnings filter will fail open until "
+            "the key is added to .env"
+        )
+
     watchlist = load_watchlist()
     market_data = MarketData(client, watchlist)
     feature_pipeline = FeaturePipeline(
@@ -457,6 +482,8 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
         history_store=divergence_history,
         cross_sectional_z_threshold=1.5,
         max_divergence=0.25,
+        earnings_calendar=earnings_calendar,
+        earnings_filter_enabled=settings.earnings_filter_enabled,
     )
 
     risk_manager = RiskManager(
@@ -487,6 +514,7 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
         divergence_history=divergence_history,
         risk_rejection_log=risk_rejection_log,
         kill_switch=kill_switch,
+        earnings_calendar=earnings_calendar,
     )
 
     loop = MainLoop(
@@ -506,6 +534,8 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
         position_tracker=position_tracker,
         portfolio_state_builder=portfolio_state_builder,
         daily_summary_builder=daily_summary_builder,
+        earnings_calendar=earnings_calendar,
+        watchlist_symbols=[t.symbol for t in watchlist],
         slack_webhook_url=os.environ.get("SLACK_WEBHOOK_URL"),
         scan_interval_seconds=int(os.environ.get("SCAN_INTERVAL_SECONDS", "300")),
     )

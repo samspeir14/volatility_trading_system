@@ -54,6 +54,17 @@ def format_summary(summary: DailySummary) -> str:
     else:
         lines.append("Kill switch: not activated")
 
+    if summary.earnings_straddling_positions:
+        lines.append(
+            f":warning: {len(summary.earnings_straddling_positions)} open "
+            "position(s) straddle an earnings event:"
+        )
+        for p in summary.earnings_straddling_positions:
+            lines.append(
+                f"  • {p.symbol} {p.structure} exp {p.expiration.isoformat()} "
+                f"(earnings {p.earnings_date.isoformat()})"
+            )
+
     return "\n".join(lines)
 
 

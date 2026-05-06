@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import TYPE_CHECKING
 
+from data.earnings_calendar import EarningsCalendar
 from execution.order_log import OrderLog
 from risk.kill_switch import DailyKillSwitch
 from risk.risk_rejection_log import RiskRejectionLog
@@ -14,6 +15,14 @@ if TYPE_CHECKING:
     from risk.portfolio_state import PortfolioSnapshot
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class EarningsStraddlingPosition:
+    symbol: str
+    expiration: date
+    earnings_date: date
+    structure: str
 
 
 @dataclass(frozen=True)
@@ -32,6 +41,7 @@ class DailySummary:
     risk_rejections_by_reason: dict[str, int]
     kill_switch_activated: bool
     top_exit_triggers: dict[str, int]
+    earnings_straddling_positions: list[EarningsStraddlingPosition] = field(default_factory=list)
 
     @property
     def total_pnl(self) -> float:
@@ -55,11 +65,13 @@ class DailySummaryBuilder:
         divergence_history: DivergenceHistory,
         risk_rejection_log: RiskRejectionLog,
         kill_switch: DailyKillSwitch,
+        earnings_calendar: EarningsCalendar | None = None,
     ):
         self._order_log = order_log
         self._divergence_history = divergence_history
         self._risk_rejection_log = risk_rejection_log
         self._kill_switch = kill_switch
+        self._earnings_calendar = earnings_calendar
 
     def build(self, today: date, snapshot: "PortfolioSnapshot") -> DailySummary:
         signals_total = self._signals_count_today(today)
@@ -68,6 +80,7 @@ class DailySummaryBuilder:
         exit_triggers = self._order_log.exit_triggers_today(today)
         risk_rejections = self._risk_rejection_log.count_today(today)
         rejection_reasons = self._risk_rejection_log.reasons_summary_today(today)
+        earnings_straddling = self._find_earnings_straddling_positions(today, snapshot)
 
         return DailySummary(
             date=today,
@@ -84,7 +97,47 @@ class DailySummaryBuilder:
             risk_rejections_by_reason=rejection_reasons,
             kill_switch_activated=self._kill_switch.is_active(today),
             top_exit_triggers=exit_triggers,
+            earnings_straddling_positions=earnings_straddling,
         )
+
+    def _find_earnings_straddling_positions(
+        self, today: date, snapshot: "PortfolioSnapshot"
+    ) -> list[EarningsStraddlingPosition]:
+        """Open positions whose expiration is on or after a known earnings date.
+        Surfaced for human review only — exits stay on their normal triggers."""
+        if self._earnings_calendar is None:
+            return []
+        out: list[EarningsStraddlingPosition] = []
+        for pos in snapshot.open_positions:
+            try:
+                hit = self._earnings_calendar.has_earnings_in_window(
+                    pos.symbol, today, pos.expiration,
+                )
+            except Exception as e:
+                logger.warning(
+                    "earnings lookup failed for %s: %s — skipping", pos.symbol, e
+                )
+                continue
+            if not hit:
+                continue
+            earnings_date = self._earnings_calendar.next_earnings_on_or_after(
+                pos.symbol, today,
+            )
+            if earnings_date is None:
+                continue
+            out.append(EarningsStraddlingPosition(
+                symbol=pos.symbol,
+                expiration=pos.expiration,
+                earnings_date=earnings_date,
+                structure=pos.structure,
+            ))
+            logger.info(
+                "open position %s %s exp=%s straddles earnings on %s — "
+                "surfaced in daily summary, holding to normal exit triggers",
+                pos.symbol, pos.structure, pos.expiration.isoformat(),
+                earnings_date.isoformat(),
+            )
+        return out
 
     def _signals_count_today(self, today: date) -> int:
         # divergence_history doesn't expose a count helper; query directly

@@ -25,6 +25,8 @@ class Settings:
     cache_db_path: Path = field(
         default_factory=lambda: PROJECT_ROOT / "data" / "cache" / "market_data.db"
     )
+    finnhub_api_key: str | None = None
+    earnings_filter_enabled: bool = True
 
 
 def load_settings() -> Settings:
@@ -47,9 +49,22 @@ def load_settings() -> Settings:
         SANDBOX_BASE_URL if env == "sandbox" else PRODUCTION_BASE_URL
     )
 
+    finnhub_api_key = os.environ.get("FINNHUB_API_KEY") or None
+    earnings_filter_enabled = _parse_bool(
+        os.environ.get("EARNINGS_FILTER_ENABLED"), default=True,
+    )
+
     return Settings(
         api_key=api_key,
         account_id=account_id,
         base_url=base_url.rstrip("/"),
         env=env,
+        finnhub_api_key=finnhub_api_key,
+        earnings_filter_enabled=earnings_filter_enabled,
     )
+
+
+def _parse_bool(raw: str | None, *, default: bool) -> bool:
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
