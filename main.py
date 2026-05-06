@@ -484,6 +484,7 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
         max_divergence=0.25,
         earnings_calendar=earnings_calendar,
         earnings_filter_enabled=settings.earnings_filter_enabled,
+        earnings_buffer_days=settings.earnings_buffer_days,
     )
 
     risk_manager = RiskManager(

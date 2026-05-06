@@ -4,9 +4,10 @@ Covers:
 - Cache miss before any refresh → has_earnings_in_window returns None (fail open).
 - Cache hit after seed → returns True/False per stored dates.
 - refresh_if_stale skips when last_refresh_date == today.
-- refresh_if_stale logs WARNING and fails open when API key is missing.
-- SignalGenerator demotes a signal whose ticker has earnings inside [today, expiration].
-- SignalGenerator does NOT demote when earnings fall after expiration (clean window).
+- refresh_if_stale silently skips (no per-cycle WARNING) when API key is missing.
+- SignalGenerator demotes a signal whose ticker has earnings inside [today, today+buffer].
+- SignalGenerator does NOT demote when earnings fall outside the buffer.
+- earnings_buffer_days is configurable: same earnings demoted at buffer=10, allowed at buffer=3.
 - SignalGenerator does NOT demote when no earnings data is available (fail open).
 - SignalGenerator does NOT demote when the filter is disabled via constructor flag.
 """
@@ -75,7 +76,12 @@ class _FixedPredictor:
         return self._v
 
 
-def _build_generator(*, earnings: EarningsCalendar | None, enabled: bool = True) -> SignalGenerator:
+def _build_generator(
+    *,
+    earnings: EarningsCalendar | None,
+    enabled: bool = True,
+    buffer_days: int = 7,
+) -> SignalGenerator:
     predictors = {h: _FixedPredictor() for h in (5, 10, 21)}
     return SignalGenerator(
         predictors_by_horizon=predictors,
@@ -84,6 +90,7 @@ def _build_generator(*, earnings: EarningsCalendar | None, enabled: bool = True)
         max_divergence=0.50,              # well above the synthetic divergence
         earnings_calendar=earnings,
         earnings_filter_enabled=enabled,
+        earnings_buffer_days=buffer_days,
     )
 
 
@@ -151,13 +158,14 @@ def test_refresh_silently_skips_when_api_key_missing():
 
 # ---------- SignalGenerator filter tests ----------
 
-def test_signal_demoted_when_earnings_inside_option_window():
+def test_signal_demoted_when_earnings_inside_buffer():
+    """Earnings 4 days out, default buffer 7 → demoted."""
     today = date(2026, 5, 6)
     expiration = date(2026, 5, 22)  # DTE=16
     with tempfile.TemporaryDirectory() as tmp:
         cal = EarningsCalendar(Path(tmp) / "earnings.db", api_key=None)
-        cal._seed_for_testing([("NVDA", date(2026, 5, 15))], today=today)
-        gen = _build_generator(earnings=cal)
+        cal._seed_for_testing([("NVDA", date(2026, 5, 10))], today=today)
+        gen = _build_generator(earnings=cal)  # default buffer_days=7
 
         scan = _mk_scan(today, expiration, ["NVDA"])
         feature_rows = {"NVDA": pd.DataFrame({"a": [0.0]}, index=[date(2026, 5, 5)])}
@@ -171,21 +179,24 @@ def test_signal_demoted_when_earnings_inside_option_window():
         sig = nvda_signals[0]
         assert not sig.is_actionable, "NVDA must be demoted by earnings filter"
         assert "earnings_within_window" in sig.diagnostic_notes
-        assert "2026-05-15" in sig.diagnostic_notes
+        assert "2026-05-10" in sig.diagnostic_notes
+        assert "7-day buffer" in sig.diagnostic_notes
         assert "NVDA" not in [s.symbol for s in actionable]
         cal.close()
-    print("filter_demote: NVDA earnings 5/15 within [5/6, 5/22] → demoted")
+    print("filter_demote: NVDA earnings 5/10 (4d out) within 7-day buffer → demoted")
 
 
-def test_signal_passes_when_earnings_after_expiration():
-    """Post-expiration earnings = clean window. Don't demote."""
+def test_signal_passes_when_earnings_outside_buffer_but_inside_expiration():
+    """Earnings 14 days out, default buffer 7. Under the OLD rule (earnings ≤
+    expiration) this would be demoted because 5/20 ≤ 5/22. Under the NEW rule
+    (earnings within buffer) it passes — this is the case that demonstrates
+    the rule change."""
     today = date(2026, 5, 6)
-    expiration = date(2026, 5, 22)  # DTE=16
+    expiration = date(2026, 5, 22)  # earnings 5/20 is BEFORE expiration
     with tempfile.TemporaryDirectory() as tmp:
         cal = EarningsCalendar(Path(tmp) / "earnings.db", api_key=None)
-        # Earnings on 6/15 — well after our 5/22 expiration
-        cal._seed_for_testing([("NVDA", date(2026, 6, 15))], today=today)
-        gen = _build_generator(earnings=cal)
+        cal._seed_for_testing([("NVDA", date(2026, 5, 20))], today=today)
+        gen = _build_generator(earnings=cal)  # default buffer_days=7
 
         scan = _mk_scan(today, expiration, ["NVDA"])
         feature_rows = {"NVDA": pd.DataFrame({"a": [0.0]}, index=[date(2026, 5, 5)])}
@@ -195,7 +206,37 @@ def test_signal_passes_when_earnings_after_expiration():
         sig = next(s for s in all_signals if s.symbol == "NVDA")
         assert "earnings_within_window" not in sig.diagnostic_notes
         cal.close()
-    print("filter_pass_after_exp: earnings 6/15 after expiration 5/22 → not demoted")
+    print("filter_pass_outside_buffer: earnings 5/20 (14d out) outside 7-day buffer → not demoted")
+
+
+def test_custom_buffer_days_changes_demotion():
+    """A 6-days-out earnings: demoted with buffer=10, allowed with buffer=3."""
+    today = date(2026, 5, 6)
+    expiration = date(2026, 5, 22)
+    earnings_date = date(2026, 5, 12)  # 6 days out
+    feature_rows = {"NVDA": pd.DataFrame({"a": [0.0]}, index=[date(2026, 5, 5)])}
+    returns_by_symbol = {"NVDA": pd.Series([0.001] * 100)}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cal = EarningsCalendar(Path(tmp) / "earnings.db", api_key=None)
+        cal._seed_for_testing([("NVDA", earnings_date)], today=today)
+
+        # buffer=10: 6 days out is inside → demoted
+        gen_wide = _build_generator(earnings=cal, buffer_days=10)
+        scan = _mk_scan(today, expiration, ["NVDA"])
+        _, sigs_wide = gen_wide.generate(scan, feature_rows, returns_by_symbol, top_n=10)
+        sig_wide = next(s for s in sigs_wide if s.symbol == "NVDA")
+        assert "earnings_within_window" in sig_wide.diagnostic_notes
+        assert "10-day buffer" in sig_wide.diagnostic_notes
+
+        # buffer=3: 6 days out is outside → allowed
+        gen_narrow = _build_generator(earnings=cal, buffer_days=3)
+        scan = _mk_scan(today, expiration, ["NVDA"])
+        _, sigs_narrow = gen_narrow.generate(scan, feature_rows, returns_by_symbol, top_n=10)
+        sig_narrow = next(s for s in sigs_narrow if s.symbol == "NVDA")
+        assert "earnings_within_window" not in sig_narrow.diagnostic_notes
+        cal.close()
+    print("custom_buffer: 6d-out earnings demoted at buffer=10, allowed at buffer=3")
 
 
 def test_signal_passes_when_no_earnings_data_available():
@@ -267,8 +308,9 @@ def main() -> int:
     test_seeded_cache_returns_true_for_in_window()
     test_refresh_skips_when_already_refreshed_today()
     test_refresh_silently_skips_when_api_key_missing()
-    test_signal_demoted_when_earnings_inside_option_window()
-    test_signal_passes_when_earnings_after_expiration()
+    test_signal_demoted_when_earnings_inside_buffer()
+    test_signal_passes_when_earnings_outside_buffer_but_inside_expiration()
+    test_custom_buffer_days_changes_demotion()
     test_signal_passes_when_no_earnings_data_available()
     test_filter_disabled_via_flag_skips_lookup()
     test_payload_parsing_filters_to_watchlist_and_skips_malformed()

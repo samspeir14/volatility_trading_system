@@ -27,6 +27,7 @@ class Settings:
     )
     finnhub_api_key: str | None = None
     earnings_filter_enabled: bool = True
+    earnings_buffer_days: int = 7
 
 
 def load_settings() -> Settings:
@@ -53,6 +54,9 @@ def load_settings() -> Settings:
     earnings_filter_enabled = _parse_bool(
         os.environ.get("EARNINGS_FILTER_ENABLED"), default=True,
     )
+    earnings_buffer_days = _parse_int(
+        os.environ.get("EARNINGS_BUFFER_DAYS"), default=7,
+    )
 
     return Settings(
         api_key=api_key,
@@ -61,6 +65,7 @@ def load_settings() -> Settings:
         env=env,
         finnhub_api_key=finnhub_api_key,
         earnings_filter_enabled=earnings_filter_enabled,
+        earnings_buffer_days=earnings_buffer_days,
     )
 
 
@@ -68,3 +73,12 @@ def _parse_bool(raw: str | None, *, default: bool) -> bool:
     if raw is None or raw == "":
         return default
     return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _parse_int(raw: str | None, *, default: int) -> int:
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default

@@ -4,7 +4,7 @@ import logging
 import math
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
@@ -186,6 +186,7 @@ class SignalGenerator:
         max_divergence: float = 0.25,
         earnings_calendar: EarningsCalendar | None = None,
         earnings_filter_enabled: bool = True,
+        earnings_buffer_days: int = 7,
     ):
         for h in TRAINED_HORIZONS:
             if h not in predictors_by_horizon:
@@ -202,6 +203,7 @@ class SignalGenerator:
         self._max_divergence = max_divergence
         self._earnings = earnings_calendar
         self._earnings_filter_enabled = earnings_filter_enabled
+        self._earnings_buffer_days = earnings_buffer_days
 
     def generate(
         self,
@@ -334,12 +336,12 @@ class SignalGenerator:
                 ))
                 continue
 
-            # Earnings filter: if a known earnings date falls between today and
-            # the option expiration (inclusive), demote. The 0.25 divergence cap
-            # catches obvious earnings-day IV spikes; this catches the gradual
-            # pre-earnings ramp where divergence sits at 0.18-0.24. Failing
-            # open is intentional — a flaky earnings API must not halt trading.
-            earnings_demote = self._check_earnings(c.symbol, today, c.expiration)
+            # Earnings filter: demote if a known earnings date falls within
+            # `earnings_buffer_days` of today. The 0.25 divergence cap catches
+            # obvious earnings-day IV spikes; this catches the gradual pre-
+            # earnings ramp where divergence sits at 0.18-0.24. Failing open
+            # is intentional — a flaky earnings API must not halt trading.
+            earnings_demote = self._check_earnings(c.symbol, today)
             if earnings_demote is not None:
                 earnings_date, note = earnings_demote
                 all_signals.append(TradeSignal(
@@ -394,14 +396,15 @@ class SignalGenerator:
         return actionable[:top_n], all_signals
 
     def _check_earnings(
-        self, symbol: str, today: date, expiration: date
+        self, symbol: str, today: date
     ) -> tuple[date, str] | None:
         """Return (earnings_date, diagnostic_note) if the signal should be demoted
         for earnings risk, None if it should pass. Fails open: missing calendar,
         no API key, or no data for the symbol all return None."""
         if not self._earnings_filter_enabled or self._earnings is None:
             return None
-        result = self._earnings.has_earnings_in_window(symbol, today, expiration)
+        end = today + timedelta(days=self._earnings_buffer_days)
+        result = self._earnings.has_earnings_in_window(symbol, today, end)
         if result is None:
             # No information — fail open. The calendar logs a single WARNING on
             # refresh failure; no need to spam per signal.
@@ -414,7 +417,7 @@ class SignalGenerator:
         return (
             earnings_date,
             f"earnings_within_window: {symbol} reports {earnings_date.isoformat()} "
-            f"before expiration {expiration.isoformat()}",
+            f"within {self._earnings_buffer_days}-day buffer",
         )
 
     def _build_legs(self, c: _Candidate, direction: str) -> tuple[list[TradeLeg], str]:
