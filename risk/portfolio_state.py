@@ -16,6 +16,47 @@ from risk.kill_switch import DailyKillSwitch
 logger = logging.getLogger(__name__)
 
 
+_ACCOUNT_TYPE_KEYS = ("margin", "cash", "pdt")
+
+
+def _account_sub_object(balances: dict) -> dict:
+    """Return the account-type sub-object (margin/cash/pdt) Tradier nests inside the
+    balances response. The key matches `account_type`; if that's missing, fall back
+    to whichever known sub-object is present."""
+    declared = balances.get("account_type")
+    if declared and isinstance(balances.get(declared), dict):
+        return balances[declared]
+    for key in _ACCOUNT_TYPE_KEYS:
+        sub = balances.get(key)
+        if isinstance(sub, dict):
+            return sub
+    return {}
+
+
+def _extract_option_buying_power(balances: dict) -> float:
+    sub = _account_sub_object(balances)
+    if "option_buying_power" in sub:
+        return float(sub["option_buying_power"])
+    # Cash accounts don't expose option_buying_power directly — usable funds are cash_available.
+    if "cash_available" in sub:
+        return float(sub["cash_available"])
+    if "option_buying_power" in balances:
+        return float(balances["option_buying_power"])
+    raise ValueError(
+        f"option_buying_power not found in balances response: keys={sorted(balances.keys())}"
+    )
+
+
+def _extract_margin_requirement(balances: dict) -> float:
+    # Tradier reports current_requirement at the top level for all account types.
+    if "current_requirement" in balances:
+        return float(balances["current_requirement"])
+    sub = _account_sub_object(balances)
+    if "current_requirement" in sub:
+        return float(sub["current_requirement"])
+    return 0.0
+
+
 @dataclass(frozen=True)
 class PortfolioSnapshot:
     fetched_at: datetime
@@ -60,9 +101,8 @@ class PortfolioStateBuilder:
     async def snapshot(self, scan: ScanResult) -> PortfolioSnapshot:
         balances_resp = await self._client.get_balances()
         equity = float(balances_resp.get("total_equity", 0.0))
-        margin = balances_resp.get("margin", {}) or {}
-        buying_power = float(margin.get("option_buying_power", 0.0))
-        margin_held = float(balances_resp.get("current_requirement", 0.0))
+        buying_power = _extract_option_buying_power(balances_resp)
+        margin_held = _extract_margin_requirement(balances_resp)
 
         positions = await self._tracker.list_open_positions()
         marks = self._tracker.mark_to_market(positions, scan)
