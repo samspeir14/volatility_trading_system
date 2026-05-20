@@ -63,6 +63,10 @@ def _mk_loop(*, market_state="open", kill_active_initial=False, snapshot=None,
     div_history = mock.MagicMock()
     summary_builder = mock.MagicMock()
     position_tracker = mock.MagicMock()
+    position_reconciler = mock.MagicMock()
+    position_reconciler.reconcile = mock.AsyncMock(return_value=mock.MagicMock(
+        expired_closed=[], assignment_alerts=[], skipped_premature=[],
+    ))
 
     loop = MainLoop(
         settings=mock.MagicMock(),
@@ -79,6 +83,7 @@ def _mk_loop(*, market_state="open", kill_active_initial=False, snapshot=None,
         order_manager=order_manager,
         exit_manager=exit_manager,
         position_tracker=position_tracker,
+        position_reconciler=position_reconciler,
         portfolio_state_builder=builder,
         daily_summary_builder=summary_builder,
         slack_webhook_url=None,
@@ -89,6 +94,7 @@ def _mk_loop(*, market_state="open", kill_active_initial=False, snapshot=None,
         "kill_switch": kill_switch, "sig_gen": sig_gen, "risk_manager": risk_manager,
         "order_manager": order_manager, "exit_manager": exit_manager,
         "risk_rejection_log": risk_rejection_log, "summary_builder": summary_builder,
+        "position_reconciler": position_reconciler,
     }
 
 

@@ -26,6 +26,18 @@ class EarningsStraddlingPosition:
 
 
 @dataclass(frozen=True)
+class AssignmentAlertSummary:
+    """One row per outstanding assignment alert, mirrored from
+    order_log.assignment_alerts. Persists until manually dismissed."""
+    tradier_order_id: int
+    symbol: str
+    expiration: date
+    structure: str
+    stock_quantity: float | None
+    detected_at: datetime
+
+
+@dataclass(frozen=True)
 class DailySummary:
     date: date
     starting_equity: float
@@ -42,6 +54,7 @@ class DailySummary:
     kill_switch_activated: bool
     top_exit_triggers: dict[str, int]
     earnings_straddling_positions: list[EarningsStraddlingPosition] = field(default_factory=list)
+    assignment_alerts: list[AssignmentAlertSummary] = field(default_factory=list)
 
     @property
     def total_pnl(self) -> float:
@@ -56,6 +69,27 @@ class DailySummary:
     @property
     def equity_change(self) -> float:
         return self.ending_equity - self.starting_equity
+
+
+def _check_reconciliation(summary: "DailySummary") -> None:
+    """End-of-day guard: reported P&L must match the equity change. Identity
+    is exact by construction in portfolio_state.snapshot() (realized + unrealized
+    = equity - starting_equity); a breach means starting_equity got lost,
+    Tradier equity is wonky, or realized P&L was re-broken. Threshold: $5
+    absolute drift, which is the spec — float-arithmetic noise is sub-penny."""
+    equity_delta = summary.ending_equity - summary.starting_equity
+    drift = abs(equity_delta - summary.total_pnl)
+    tolerance = 5.0
+    if drift > tolerance:
+        logger.error(
+            f"EOD reconciliation drift: equity_change=${equity_delta:+,.2f} "
+            f"total_pnl=${summary.total_pnl:+,.2f} drift=${drift:,.2f} "
+            f"tolerance=${tolerance:,.2f} "
+            f"(starting_equity=${summary.starting_equity:,.2f} "
+            f"ending_equity=${summary.ending_equity:,.2f} "
+            f"realized=${summary.realized_pnl:+,.2f} "
+            f"unrealized=${summary.unrealized_pnl:+,.2f})"
+        )
 
 
 class DailySummaryBuilder:
@@ -81,8 +115,9 @@ class DailySummaryBuilder:
         risk_rejections = self._risk_rejection_log.count_today(today)
         rejection_reasons = self._risk_rejection_log.reasons_summary_today(today)
         earnings_straddling = self._find_earnings_straddling_positions(today, snapshot)
+        assignment_alerts = self._load_assignment_alerts()
 
-        return DailySummary(
+        summary = DailySummary(
             date=today,
             starting_equity=snapshot.starting_equity_today,
             ending_equity=snapshot.equity,
@@ -98,7 +133,27 @@ class DailySummaryBuilder:
             kill_switch_activated=self._kill_switch.is_active(today),
             top_exit_triggers=exit_triggers,
             earnings_straddling_positions=earnings_straddling,
+            assignment_alerts=assignment_alerts,
         )
+        _check_reconciliation(summary)
+        return summary
+
+    def _load_assignment_alerts(self) -> list[AssignmentAlertSummary]:
+        out: list[AssignmentAlertSummary] = []
+        for row in self._order_log.assignment_alerts_active():
+            try:
+                detected = datetime.fromisoformat(row["detected_at"])
+            except (ValueError, TypeError):
+                detected = datetime.now(timezone.utc)
+            out.append(AssignmentAlertSummary(
+                tradier_order_id=row["tradier_order_id"],
+                symbol=row["symbol"],
+                expiration=date.fromisoformat(row["expiration"]),
+                structure=row["structure"],
+                stock_quantity=row["stock_quantity"],
+                detected_at=detected,
+            ))
+        return out
 
     def _find_earnings_straddling_positions(
         self, today: date, snapshot: "PortfolioSnapshot"

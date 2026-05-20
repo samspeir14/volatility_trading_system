@@ -108,10 +108,16 @@ class PortfolioStateBuilder:
         marks = self._tracker.mark_to_market(positions, scan)
 
         today = scan.fetched_at.date()
-        today_realized = self._log.closed_today_pnl(today)
-        today_unrealized = sum(m.pnl_dollars for m in marks)
-
         starting_equity = self._kill_switch.get_starting_equity(today, equity)
+        today_realized = self._log.closed_today_pnl(today)
+        # Today's P&L is the day-over-day equity delta. Cash conservation
+        # (equity = cash + position MV) makes this exact regardless of
+        # opens/closes during the day. The unrealized component is whatever
+        # of today's equity change isn't explained by today's realized closes.
+        # Previously we summed PositionMark.pnl_dollars, which is the lifetime
+        # since-entry P&L per position — that drifts slowly and doesn't track
+        # intraday mark moves.
+        today_unrealized = (equity - starting_equity) - today_realized
 
         exposure: dict[str, float] = defaultdict(float)
         sector_count: dict[str, int] = defaultdict(int)

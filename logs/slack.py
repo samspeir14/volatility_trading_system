@@ -65,6 +65,21 @@ def format_summary(summary: DailySummary) -> str:
                 f"(earnings {p.earnings_date.isoformat()})"
             )
 
+    if summary.assignment_alerts:
+        lines.append(
+            f":rotating_light: *ASSIGNMENT ALERT* — {len(summary.assignment_alerts)} "
+            "position(s) need manual intervention:"
+        )
+        for a in summary.assignment_alerts:
+            qty_str = (
+                f"{a.stock_quantity:+.0f} sh" if a.stock_quantity is not None
+                else "stock present"
+            )
+            lines.append(
+                f"  • order {a.tradier_order_id} {a.symbol} {a.structure} "
+                f"exp {a.expiration.isoformat()} → {qty_str}"
+            )
+
     return "\n".join(lines)
 
 

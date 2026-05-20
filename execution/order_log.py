@@ -50,6 +50,21 @@ CREATE TABLE IF NOT EXISTS failed_submissions (
 );
 """
 
+CREATE_ASSIGNMENT_ALERTS_SQL = """
+CREATE TABLE IF NOT EXISTS assignment_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tradier_order_id INTEGER NOT NULL,
+    symbol TEXT NOT NULL,
+    expiration TEXT NOT NULL,
+    structure TEXT NOT NULL,
+    detected_at TEXT NOT NULL,
+    stock_quantity REAL,
+    UNIQUE(tradier_order_id)
+);
+"""
+
+EXPIRATION_SENTINEL_ORDER_ID = 0  # closing_order_id used for auto-expired positions
+
 CREATE_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_orders_symbol_submitted ON submitted_orders(symbol, submitted_at DESC);",
     "CREATE INDEX IF NOT EXISTS idx_orders_status ON submitted_orders(final_status);",
@@ -71,6 +86,7 @@ class OrderLog:
         self._conn = sqlite3.connect(str(db_path))
         self._conn.execute(CREATE_SUBMITTED_SQL)
         self._conn.execute(CREATE_FAILED_SQL)
+        self._conn.execute(CREATE_ASSIGNMENT_ALERTS_SQL)
         self._migrate_close_columns()
         for sql in CREATE_INDEXES_SQL:
             self._conn.execute(sql)
@@ -209,6 +225,54 @@ class OrderLog:
             (closing_order_id, closed_at.isoformat(), exit_trigger, realized_pnl, opening_order_id),
         )
         self._conn.commit()
+
+    def record_expiration(
+        self,
+        opening_order_id: int,
+        expired_at: datetime,
+        realized_pnl: float,
+        exit_trigger: str = "expired_worthless",
+    ) -> None:
+        """Mark a position closed by expiration (no closing trade). Uses the
+        sentinel closing_order_id=0 so open_unclosed_positions excludes it
+        and closed_today_pnl picks up the realized leg."""
+        self._conn.execute(
+            "UPDATE submitted_orders SET closing_order_id = ?, closed_at = ?, "
+            "exit_trigger = ?, realized_pnl = ? WHERE tradier_order_id = ?",
+            (EXPIRATION_SENTINEL_ORDER_ID, expired_at.isoformat(),
+             exit_trigger, realized_pnl, opening_order_id),
+        )
+        self._conn.commit()
+
+    def record_assignment_alert(
+        self,
+        tradier_order_id: int,
+        symbol: str,
+        expiration: date,
+        structure: str,
+        detected_at: datetime,
+        stock_quantity: float | None = None,
+    ) -> None:
+        """Idempotent — duplicate inserts for the same order are ignored."""
+        self._conn.execute(
+            "INSERT OR IGNORE INTO assignment_alerts "
+            "(tradier_order_id, symbol, expiration, structure, detected_at, stock_quantity) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (tradier_order_id, symbol, expiration.isoformat(), structure,
+             detected_at.isoformat(), stock_quantity),
+        )
+        self._conn.commit()
+
+    def assignment_alerts_active(self) -> list[dict]:
+        """All recorded assignment alerts. Once acknowledged manually, the
+        operator can DELETE the row to dismiss it."""
+        cur = self._conn.execute(
+            "SELECT tradier_order_id, symbol, expiration, structure, "
+            "detected_at, stock_quantity FROM assignment_alerts "
+            "ORDER BY detected_at DESC"
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
 
     def positions_opened_on(self, today: date) -> int:
         cur = self._conn.execute(

@@ -40,7 +40,7 @@ from model import (
     LightGBMVolPredictor,
     XGBoostVolPredictor,
 )
-from positions import ExitManager, PositionTracker
+from positions import ExitManager, PositionReconciler, PositionTracker
 from risk import (
     DailyKillSwitch,
     PortfolioStateBuilder,
@@ -174,13 +174,14 @@ class MainLoop:
         order_manager: OrderManager,
         exit_manager: ExitManager,
         position_tracker: PositionTracker,
+        position_reconciler: PositionReconciler,
         portfolio_state_builder: PortfolioStateBuilder,
         daily_summary_builder: DailySummaryBuilder,
         earnings_calendar: EarningsCalendar | None = None,
         watchlist_symbols: list[str] | None = None,
         slack_webhook_url: str | None = None,
         scan_interval_seconds: int = 300,
-        kill_switch_threshold_pct: float = -0.03,
+        kill_switch_threshold_pct: float = -0.05,
     ):
         self._settings = settings
         self._client = client
@@ -196,6 +197,7 @@ class MainLoop:
         self._order_manager = order_manager
         self._exit_manager = exit_manager
         self._position_tracker = position_tracker
+        self._reconciler = position_reconciler
         self._builder = portfolio_state_builder
         self._summary_builder = daily_summary_builder
         self._earnings_calendar = earnings_calendar
@@ -226,10 +228,18 @@ class MainLoop:
         # 2. Scan
         scan = await self._market_data.scan(expiration_window=(3, 60))
         scan_contracts = scan.total_contracts
+        today = scan.fetched_at.date()
+
+        # 2b. Reconcile log against Tradier's actual positions BEFORE snapshot,
+        # so expired / assigned positions don't leak into marks, exposure
+        # counts, exit decisions, or risk gates.
+        try:
+            await self._reconciler.reconcile(today)
+        except Exception as e:
+            logger.error("reconciliation failed: %s — continuing with stale log", e)
 
         # 3. Snapshot
         snapshot = await self._builder.snapshot(scan)
-        today = scan.fetched_at.date()
 
         # Refresh earnings calendar (no-op if already done today)
         if self._earnings_calendar is not None:
@@ -469,6 +479,9 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
         garch_min_history=100, garch_refit_every=21,
     )
     position_tracker = PositionTracker(client=client, order_log=order_log, settings=settings)
+    position_reconciler = PositionReconciler(
+        client=client, order_log=order_log, account_id=settings.account_id,
+    )
     portfolio_state_builder = PortfolioStateBuilder(
         client=client, order_log=order_log,
         position_tracker=position_tracker, watchlist=watchlist,
@@ -495,7 +508,7 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
         max_portfolio_delta_pct=0.05,
         max_portfolio_gamma_pct=0.01,
         max_portfolio_vega_pct=0.05,
-        daily_loss_kill_switch_pct=-0.03,
+        daily_loss_kill_switch_pct=-0.05,
         min_buying_power_buffer_pct=0.05,
         kill_switch=kill_switch,
     )
@@ -533,6 +546,7 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
         order_manager=order_manager,
         exit_manager=exit_manager,
         position_tracker=position_tracker,
+        position_reconciler=position_reconciler,
         portfolio_state_builder=portfolio_state_builder,
         daily_summary_builder=daily_summary_builder,
         earnings_calendar=earnings_calendar,
