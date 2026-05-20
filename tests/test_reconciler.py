@@ -8,12 +8,15 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
+from data.async_client import Bar
 from execution import OrderLog
 from positions.reconciler import (
     AssignmentAlert,
     PositionReconciler,
     TimeoutResolution,
     is_option_symbol,
+    max_loss_dollars,
+    settle_intrinsic_pnl,
     underlying_of_option,
 )
 from signals.signal_generator import TradeLeg, TradeSignal
@@ -24,6 +27,20 @@ AAPL_C150 = "AAPL250620C00150000"
 AAPL_P140 = "AAPL250620P00140000"
 AAPL_C155 = "AAPL250620C00155000"
 AAPL_P135 = "AAPL250620P00135000"
+
+
+def _bar(d: date, close: float) -> Bar:
+    return Bar(date=d, open=close, high=close, low=close, close=close, volume=1)
+
+
+def _mock_close(client, symbol_to_close: dict[str, float], expiration: date) -> None:
+    """Configure client.get_history to return a single-bar history with the
+    given close price for the expiration date, keyed by underlying symbol."""
+    async def fake_history(symbol, start, end, interval="daily"):
+        if symbol not in symbol_to_close:
+            return []
+        return [_bar(expiration, symbol_to_close[symbol])]
+    client.get_history = mock.AsyncMock(side_effect=fake_history)
 
 
 def _mk_signal(symbol: str, expiration: date, direction: str, legs: list[TradeLeg]) -> TradeSignal:
@@ -97,9 +114,8 @@ def test_underlying_of_option_strips_suffix():
 
 
 def test_reconciler_marks_expired_short_iron_condor():
-    """The headline scenario: a SELL iron condor whose expiration has passed
-    and all legs are gone from Tradier with no stock position. Should be
-    marked expired_worthless with realized = +entry_credit."""
+    """SELL iron condor expires with underlying inside both wings → all legs
+    OTM → realized = +entry_credit (full credit kept)."""
     with tempfile.TemporaryDirectory() as tmp:
         log = OrderLog(Path(tmp) / "orders.db")
         expiration = date(2026, 5, 15)
@@ -112,20 +128,18 @@ def test_reconciler_marks_expired_short_iron_condor():
         )
         assert len(log.open_unclosed_positions()) == 1
 
-        # Tradier no longer reports any of the legs, no stock position.
         client = mock.AsyncMock()
         client.get_positions.return_value = []
+        # IC has shorts at 150/140, longs at 155/135. Close at 145 → all OTM.
+        _mock_close(client, {"AAPL": 145.0}, expiration)
 
         reconciler = PositionReconciler(client=client, order_log=log, account_id="VA1")
-        # Run AFTER expiration date so reconciler will act.
         today = expiration + timedelta(days=3)
         result = asyncio.run(reconciler.reconcile(today))
 
         assert result.expired_closed == [9001], result
         assert result.assignment_alerts == []
         assert result.skipped_premature == []
-
-        # Order log should now show closed with realized = +$120.
         assert len(log.open_unclosed_positions()) == 0
         row = log._conn.execute(
             "SELECT realized_pnl, closing_order_id, exit_trigger "
@@ -133,18 +147,22 @@ def test_reconciler_marks_expired_short_iron_condor():
         ).fetchone()
         assert abs(row[0] - 120.0) < 0.01, f"expected +$120, got {row[0]}"
         assert row[1] == 0, "closing_order_id sentinel"
-        assert row[2] == "expired_worthless"
+        # Trigger is "expired" for a non-worthless settlement; +credit IS the
+        # full credit which is fine — old name "expired_worthless" reserved
+        # for long debit-at-floor outcomes specifically.
+        assert row[2] in ("expired", "expired_worthless")
 
         log.close()
-    print("reconciler: short iron condor expired worthless → +entry_credit ✓")
+    print("reconciler: short IC, all OTM → +entry_credit ✓")
 
 
-def test_reconciler_marks_expired_long_straddle():
-    """Long position expired worthless → realized = -entry_debit."""
+def test_reconciler_marks_expired_long_straddle_atm_worthless():
+    """Long straddle, underlying expires exactly at the strike → both legs
+    have zero intrinsic → realized = -entry_debit."""
     with tempfile.TemporaryDirectory() as tmp:
         log = OrderLog(Path(tmp) / "orders.db")
         expiration = date(2026, 5, 15)
-        entry_debit = 4.50  # $4.50 per share = $450 debit
+        entry_debit = 4.50  # $450 debit, strike 150
         _seed_open_order(
             log, order_id=9002, symbol="AAPL", expiration=expiration,
             direction="BUY", structure="straddle", entry_premium=entry_debit,
@@ -154,20 +172,252 @@ def test_reconciler_marks_expired_long_straddle():
 
         client = mock.AsyncMock()
         client.get_positions.return_value = []
+        _mock_close(client, {"AAPL": 150.0}, expiration)  # ATM → both legs worthless
 
         reconciler = PositionReconciler(client=client, order_log=log, account_id="VA1")
-        today = expiration + timedelta(days=1)
-        result = asyncio.run(reconciler.reconcile(today))
+        result = asyncio.run(reconciler.reconcile(expiration + timedelta(days=1)))
 
         assert result.expired_closed == [9002]
         row = log._conn.execute(
-            "SELECT realized_pnl FROM submitted_orders WHERE tradier_order_id = ?",
+            "SELECT realized_pnl, exit_trigger FROM submitted_orders WHERE tradier_order_id = ?",
             (9002,),
         ).fetchone()
         assert abs(row[0] - (-450.0)) < 0.01, f"expected -$450, got {row[0]}"
+        assert row[1] == "expired_worthless"
 
         log.close()
-    print("reconciler: long straddle expired worthless → -entry_debit ✓")
+    print("reconciler: long straddle ATM at expiration → -entry_debit (worthless) ✓")
+
+
+def test_reconciler_long_straddle_itm_call_settles_intrinsic():
+    """**Headline regression test for the prod bug.** Long straddle, underlying
+    expires $15 above the call strike → call intrinsic $15, put worthless.
+    Realized must be +intrinsic*100 - entry_debit, not the full -entry_debit."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "orders.db")
+        expiration = date(2026, 5, 15)
+        entry_debit = 4.50  # $450 debit
+        _seed_open_order(
+            log, order_id=9020, symbol="AAPL", expiration=expiration,
+            direction="BUY", structure="straddle", entry_premium=entry_debit,
+            legs=_straddle_legs(),  # both at strike 150
+            submitted_at=datetime(2026, 4, 27, 16, 0, tzinfo=timezone.utc),
+        )
+
+        client = mock.AsyncMock()
+        client.get_positions.return_value = []
+        _mock_close(client, {"AAPL": 165.0}, expiration)  # $15 above 150 strike
+
+        reconciler = PositionReconciler(client=client, order_log=log, account_id="VA1")
+        result = asyncio.run(reconciler.reconcile(expiration + timedelta(days=1)))
+
+        assert result.expired_closed == [9020]
+        row = log._conn.execute(
+            "SELECT realized_pnl, exit_trigger FROM submitted_orders WHERE tradier_order_id = ?",
+            (9020,),
+        ).fetchone()
+        # intrinsic 15 × 100 × 1 = +1500; entry debit -450 → realized = +1050
+        expected = 1500.0 - 450.0
+        assert abs(row[0] - expected) < 0.01, (
+            f"expected ${expected:+.2f} (intrinsic - debit), got ${row[0]:+.2f} — "
+            f"if this is -$450 the worthless-bug is back"
+        )
+        assert row[1] == "expired", "ITM settlement should use 'expired' trigger, not '_worthless'"
+
+        log.close()
+    print(f"reconciler: long straddle ITM (call) → realized = intrinsic − debit ✓ "
+          f"(${expected:+.2f})")
+
+
+def test_reconciler_long_straddle_itm_put_settles_intrinsic():
+    """Underlying expires below the strike → put intrinsic, call worthless."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "orders.db")
+        expiration = date(2026, 5, 15)
+        entry_debit = 8.00
+        _seed_open_order(
+            log, order_id=9021, symbol="AAPL", expiration=expiration,
+            direction="BUY", structure="straddle", entry_premium=entry_debit,
+            legs=_straddle_legs(),  # strike 150
+            submitted_at=datetime(2026, 4, 27, 16, 0, tzinfo=timezone.utc),
+        )
+
+        client = mock.AsyncMock()
+        client.get_positions.return_value = []
+        _mock_close(client, {"AAPL": 138.0}, expiration)  # $12 below 150 strike
+
+        reconciler = PositionReconciler(client=client, order_log=log, account_id="VA1")
+        result = asyncio.run(reconciler.reconcile(expiration + timedelta(days=1)))
+
+        assert result.expired_closed == [9021]
+        row = log._conn.execute(
+            "SELECT realized_pnl FROM submitted_orders WHERE tradier_order_id = ?",
+            (9021,),
+        ).fetchone()
+        # put intrinsic = 12 × 100 = $1200; debit = $800 → realized = +$400
+        assert abs(row[0] - 400.0) < 0.01, f"expected +$400, got {row[0]}"
+
+        log.close()
+    print("reconciler: long straddle ITM (put) → realized = intrinsic − debit ✓")
+
+
+def test_reconciler_short_ic_breached_short_call_long_covered():
+    """Short iron condor where underlying expires between the short call (150)
+    and long call (155) → short call ITM by $X, long call still OTM. Tradier
+    would assign the short and leave the long; if cash-settled or auto-resolved
+    without leaving stock, realized = credit − short_call_payout."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "orders.db")
+        expiration = date(2026, 5, 15)
+        entry_credit = 2.00  # $200 credit
+        _seed_open_order(
+            log, order_id=9030, symbol="AAPL", expiration=expiration,
+            direction="SELL", structure="iron_condor", entry_premium=entry_credit,
+            legs=_ic_legs(),  # shorts 150/140, longs 155/135
+            submitted_at=datetime(2026, 4, 27, 16, 0, tzinfo=timezone.utc),
+        )
+
+        client = mock.AsyncMock()
+        client.get_positions.return_value = []  # no stock left (cash-settled)
+        _mock_close(client, {"AAPL": 153.0}, expiration)  # $3 above short call
+
+        reconciler = PositionReconciler(client=client, order_log=log, account_id="VA1")
+        result = asyncio.run(reconciler.reconcile(expiration + timedelta(days=1)))
+
+        assert result.expired_closed == [9030]
+        row = log._conn.execute(
+            "SELECT realized_pnl FROM submitted_orders WHERE tradier_order_id = ?",
+            (9030,),
+        ).fetchone()
+        # credit +200, short call payout -3×100 = -300; long call OTM (close 153 < strike 155)
+        # → realized = +200 - 300 = -100
+        assert abs(row[0] - (-100.0)) < 0.01, f"expected -$100, got {row[0]}"
+
+        log.close()
+    print("reconciler: short IC, short call breached → realized = credit − payout ✓")
+
+
+def test_reconciler_short_ic_max_loss_both_call_legs_itm():
+    """Both short and long call legs ITM → capped max loss at wing distance."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "orders.db")
+        expiration = date(2026, 5, 15)
+        entry_credit = 1.20
+        _seed_open_order(
+            log, order_id=9031, symbol="AAPL", expiration=expiration,
+            direction="SELL", structure="iron_condor", entry_premium=entry_credit,
+            legs=_ic_legs(),  # 150/155 call wings, 140/135 put wings
+            submitted_at=datetime(2026, 4, 27, 16, 0, tzinfo=timezone.utc),
+        )
+
+        client = mock.AsyncMock()
+        client.get_positions.return_value = []
+        _mock_close(client, {"AAPL": 170.0}, expiration)  # way above long call
+
+        reconciler = PositionReconciler(client=client, order_log=log, account_id="VA1")
+        result = asyncio.run(reconciler.reconcile(expiration + timedelta(days=1)))
+
+        assert result.expired_closed == [9031]
+        row = log._conn.execute(
+            "SELECT realized_pnl FROM submitted_orders WHERE tradier_order_id = ?",
+            (9031,),
+        ).fetchone()
+        # short call: -20×100 = -2000; long call: +15×100 = +1500; net leg = -500
+        # credit +120; realized = -500 + 120 = -380. Max loss bound = -(5×100 - 120) = -380. ✓
+        assert abs(row[0] - (-380.0)) < 0.01, f"expected -$380, got {row[0]}"
+        floor = max_loss_dollars(json.loads(log._conn.execute(
+            "SELECT legs_json FROM submitted_orders WHERE tradier_order_id=?", (9031,)
+        ).fetchone()[0]), "SELL", entry_credit)
+        assert abs(row[0] - floor) < 0.01, "should hit defined-risk floor exactly"
+
+        log.close()
+    print("reconciler: short IC, both call legs ITM → capped max loss = wing − credit ✓")
+
+
+def test_reconciler_defers_closure_when_history_unavailable():
+    """If get_history fails / returns no bars, do NOT auto-close — defer."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "orders.db")
+        expiration = date(2026, 5, 15)
+        _seed_open_order(
+            log, order_id=9040, symbol="AAPL", expiration=expiration,
+            direction="BUY", structure="straddle", entry_premium=4.50,
+            legs=_straddle_legs(),
+            submitted_at=datetime(2026, 4, 27, 16, 0, tzinfo=timezone.utc),
+        )
+        client = mock.AsyncMock()
+        client.get_positions.return_value = []
+        client.get_history = mock.AsyncMock(side_effect=RuntimeError("Tradier 500"))
+
+        reconciler = PositionReconciler(client=client, order_log=log, account_id="VA1")
+        result = asyncio.run(reconciler.reconcile(expiration + timedelta(days=1)))
+
+        assert result.expired_closed == []
+        assert 9040 in result.skipped_premature
+        assert len(log.open_unclosed_positions()) == 1  # still open
+        log.close()
+    print("reconciler: get_history failure → defer closure, retry next cycle ✓")
+
+
+def test_reconciler_underlying_close_cached_within_one_call():
+    """Multiple positions on the same (underlying, expiration) should fetch
+    the close price only once per reconcile() call."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "orders.db")
+        expiration = date(2026, 5, 15)
+        for i, oid in enumerate((9050, 9051, 9052)):
+            _seed_open_order(
+                log, order_id=oid, symbol="AAPL", expiration=expiration,
+                direction="BUY", structure="straddle", entry_premium=4.50,
+                legs=_straddle_legs(),
+                submitted_at=datetime(2026, 4, 27, 16, 0, tzinfo=timezone.utc),
+            )
+        client = mock.AsyncMock()
+        client.get_positions.return_value = []
+        call_count = 0
+        async def counting_history(symbol, start, end, interval="daily"):
+            nonlocal call_count
+            call_count += 1
+            return [_bar(expiration, 150.0)]
+        client.get_history = mock.AsyncMock(side_effect=counting_history)
+
+        reconciler = PositionReconciler(client=client, order_log=log, account_id="VA1")
+        asyncio.run(reconciler.reconcile(expiration + timedelta(days=1)))
+
+        assert call_count == 1, f"expected 1 get_history call (cached), got {call_count}"
+        log.close()
+    print("reconciler: (symbol, exp) close-price cache holds within one cycle ✓")
+
+
+def test_settle_intrinsic_pnl_unit():
+    """Direct unit checks on the settlement helper."""
+    long_straddle = [
+        {"strike": 100.0, "option_type": "call", "side": "buy", "quantity": 1},
+        {"strike": 100.0, "option_type": "put", "side": "buy", "quantity": 1},
+    ]
+    # ATM: both 0
+    assert settle_intrinsic_pnl(long_straddle, 100.0, "BUY", 5.00) == -500.0
+    # Call $10 ITM, put OTM: +1000 - 500 = +500
+    assert settle_intrinsic_pnl(long_straddle, 110.0, "BUY", 5.00) == 500.0
+    # Put $7 ITM, call OTM: +700 - 500 = +200
+    assert settle_intrinsic_pnl(long_straddle, 93.0, "BUY", 5.00) == 200.0
+    # Quantity scaling
+    long_qty2 = [{**l, "quantity": 2} for l in long_straddle]
+    assert settle_intrinsic_pnl(long_qty2, 110.0, "BUY", 5.00) == 2000.0 - 500.0
+
+    short_ic = [
+        {"strike": 150.0, "option_type": "call", "side": "sell", "quantity": 1},
+        {"strike": 155.0, "option_type": "call", "side": "buy", "quantity": 1},
+        {"strike": 140.0, "option_type": "put", "side": "sell", "quantity": 1},
+        {"strike": 135.0, "option_type": "put", "side": "buy", "quantity": 1},
+    ]
+    # All OTM: +credit
+    assert settle_intrinsic_pnl(short_ic, 145.0, "SELL", 1.20) == 120.0
+    # Short call $3 ITM, long call OTM: 120 - 300 = -180
+    assert settle_intrinsic_pnl(short_ic, 153.0, "SELL", 1.20) == -180.0
+    # Both call legs ITM (max-loss territory): 120 - 2000 + 1500 = -380
+    assert settle_intrinsic_pnl(short_ic, 170.0, "SELL", 1.20) == -380.0
+    print("settle_intrinsic_pnl: all unit cases pass ✓")
 
 
 def test_reconciler_holds_live_position_with_legs_still_in_tradier():
@@ -461,52 +711,48 @@ def test_timeout_recovery_handles_still_pending():
 
 
 def test_timeout_recovery_chains_into_expiration_marking():
-    """End-to-end: timeout order that actually filled AND has since expired.
-    A single reconcile() call must recover the timeout, observe that Tradier
-    no longer reports the legs, and mark the position expired with the
-    correct realized P&L. This is the exact UNH 5/15 scenario from prod."""
+    """End-to-end: timeout order that filled AND expired ITM. Single
+    reconcile() call must recover the timeout, fetch underlying close,
+    settle at intrinsic value. The exact UNH 5/15 scenario from prod —
+    with UNH closing $5 below the strike, the put has intrinsic and the
+    realized is NOT a full debit loss."""
     with tempfile.TemporaryDirectory() as tmp:
         log = OrderLog(Path(tmp) / "orders.db")
-        expiration = date(2026, 5, 15)  # already passed (today below = 5/20)
+        expiration = date(2026, 5, 15)
         _seed_open_order(
             log, order_id=9105, symbol="UNH", expiration=expiration,
             direction="BUY", structure="straddle", entry_premium=14.66,
-            legs=_straddle_legs(),
+            legs=_straddle_legs(),  # strike 150
             submitted_at=datetime(2026, 5, 4, 15, 0, tzinfo=timezone.utc),
             final_status="timeout",
         )
 
         client = mock.AsyncMock()
-        # Tradier confirms the order filled at the submitted price
         client.get_order_status.return_value = {
             "order": {"id": 9105, "status": "filled", "avg_fill_price": 14.55},
         }
-        # No options for this position in current Tradier positions, no stock
         client.get_positions.return_value = []
+        # UNH expires at 145 → put 5 ITM, call worthless. Intrinsic 5*100 = 500.
+        # Realized = 500 - 1455 = -955.
+        _mock_close(client, {"UNH": 145.0}, expiration)
 
         reconciler = PositionReconciler(client=client, order_log=log, account_id="VA1")
         result = asyncio.run(reconciler.reconcile(date(2026, 5, 20)))
 
-        # Both phases ran on the same row
         assert result.timeouts_resolved[0].new_status == "filled"
         assert result.expired_closed == [9105]
-
-        # Order is now closed with the right realized P&L:
-        # Long straddle (BUY) at 14.55 paid → -1455 realized when expired worthless.
-        # Reconciler uses fill_price (now populated) per position_tracker semantics:
-        # entry_premium = abs(fill_price), realized = -entry_premium * 100 for long.
         row = log._conn.execute(
             "SELECT realized_pnl, closing_order_id, exit_trigger, final_status, fill_price "
             "FROM submitted_orders WHERE tradier_order_id = ?", (9105,),
         ).fetchone()
-        assert abs(row[0] - (-1455.0)) < 0.01, f"expected -$1455, got {row[0]}"
-        assert row[1] == 0  # expiration sentinel
-        assert row[2] == "expired_worthless"
+        assert abs(row[0] - (-955.0)) < 0.01, f"expected -$955, got {row[0]}"
+        assert row[1] == 0
+        assert row[2] == "expired"  # not "expired_worthless" — ITM settled
         assert row[3] == "filled"
         assert abs(row[4] - 14.55) < 1e-9
 
         log.close()
-    print("timeout_recovery: recovered fill → marked expired with correct realized P&L ✓")
+    print("timeout_recovery: recovered fill → settled at intrinsic, not worthless ✓")
 
 
 def test_reconciliation_surfaces_in_daily_summary():
@@ -560,8 +806,15 @@ def test_reconciliation_surfaces_in_daily_summary():
 def main() -> int:
     test_is_option_symbol_recognizes_occ_format()
     test_underlying_of_option_strips_suffix()
+    test_settle_intrinsic_pnl_unit()
     test_reconciler_marks_expired_short_iron_condor()
-    test_reconciler_marks_expired_long_straddle()
+    test_reconciler_marks_expired_long_straddle_atm_worthless()
+    test_reconciler_long_straddle_itm_call_settles_intrinsic()
+    test_reconciler_long_straddle_itm_put_settles_intrinsic()
+    test_reconciler_short_ic_breached_short_call_long_covered()
+    test_reconciler_short_ic_max_loss_both_call_legs_itm()
+    test_reconciler_defers_closure_when_history_unavailable()
+    test_reconciler_underlying_close_cached_within_one_call()
     test_reconciler_holds_live_position_with_legs_still_in_tradier()
     test_reconciler_flags_assignment_when_stock_position_appears()
     test_reconciler_idempotent_assignment_alert()

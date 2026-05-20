@@ -8,7 +8,8 @@ and the per-day P&L (cumulative position value frozen at last seen mark).
 
 This module pulls Tradier's positions each cycle and:
   - For log entries with all legs missing AND today >= expiration:
-    mark the order as expired_worthless with the appropriate realized P&L.
+    mark the order as expired with realized P&L derived from intrinsic value
+    of each leg at the underlying's closing price on expiration day.
   - For log entries with all legs missing AND today < expiration:
     log a warning and leave alone — likely a stale-cache race; safer to
     do nothing than to mark closed prematurely.
@@ -17,14 +18,23 @@ This module pulls Tradier's positions each cycle and:
     short into shares that the bot doesn't know how to manage; flagging for
     manual intervention is the only safe move.
 
-Realized P&L on worthless expiration:
-  - Long position (paid debit): realized = -entry_premium × 100
-    (the debit is a sunk cost; nothing comes back)
-  - Short position (received credit): realized = +entry_premium × 100
-    (full credit retained, no buyback needed)
+Realized P&L on expiration (computed per-leg from intrinsic value):
+  long call:  +max(0, S_close − K) × qty × 100
+  long put:   +max(0, K − S_close) × qty × 100
+  short call: −max(0, S_close − K) × qty × 100  (we paid out)
+  short put:  −max(0, K − S_close) × qty × 100
+  realized = entry_cash_flow + Σ leg_payoffs
+    (entry_cash_flow = −entry_premium·100 for BUY, +entry_premium·100 for SELL)
 
-For multi-leg structures with mixed ITM/OTM outcomes Tradier may auto-exercise
-some legs and assign others; that's the assignment-alert path, not this one.
+This handles all four cases correctly:
+  - long position OTM → all leg payoffs 0 → realized = −entry_debit (worthless)
+  - long position ITM → leg payoffs > 0 → realized = intrinsic − debit
+  - short position all OTM → realized = +entry_credit (full credit kept)
+  - short IC with one short breached but long wing covered (or both ITM and
+    auto-exercised, leaving no net stock) → realized = credit − payout
+
+If Tradier reports an actual stock position for the underlying we don't
+take this path; that's the assignment-alert branch, manual handling only.
 """
 from __future__ import annotations
 
@@ -32,7 +42,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 from data.async_client import AsyncTradierClient
@@ -55,6 +65,62 @@ def underlying_of_option(option_symbol: str) -> str:
     this is actually an option symbol."""
     m = re.match(r"^([A-Z]{1,6})\d{6}[CP]\d{8}$", option_symbol)
     return m.group(1) if m else option_symbol
+
+
+def settle_intrinsic_pnl(
+    legs: list[dict],
+    underlying_close: float,
+    direction: str,
+    entry_premium: float,
+) -> float:
+    """Realized P&L at expiration assuming each leg cash-settles to its
+    intrinsic value at `underlying_close`. Works for any combination of
+    long/short call/put legs. Returns dollars (already × 100 multiplier).
+
+    legs: list of {strike, option_type ('call'|'put'), side ('buy'|'sell'), quantity}
+    direction: 'BUY' (debit) or 'SELL' (credit) — sign of entry cash flow
+    entry_premium: positive absolute per-contract premium
+    """
+    entry_sign = -1 if direction == "BUY" else +1
+    entry_cash = entry_sign * entry_premium * 100.0
+    total_payoff = 0.0
+    for leg in legs:
+        strike = float(leg["strike"])
+        opt = leg["option_type"]
+        side = leg["side"]
+        qty = int(leg.get("quantity", 1))
+        if opt == "call":
+            intrinsic = max(0.0, underlying_close - strike)
+        elif opt == "put":
+            intrinsic = max(0.0, strike - underlying_close)
+        else:
+            raise ValueError(f"unknown option_type: {opt!r}")
+        leg_sign = +1 if side == "buy" else -1  # long collects intrinsic; short pays it
+        total_payoff += leg_sign * intrinsic * qty * 100.0
+    return entry_cash + total_payoff
+
+
+def max_loss_dollars(legs: list[dict], direction: str, entry_premium: float) -> float:
+    """Worst-case realized P&L at expiration. Used as a sanity bound on the
+    intrinsic settlement — a computed realized below this is a calculation
+    bug.
+
+    Long (BUY): −entry_premium·100 (debit is the floor).
+    Short defined-risk (SELL iron condor): −(wing_distance·100 − credit).
+    Short undefined (naked short): unbounded; returns −inf.
+    """
+    if direction == "BUY":
+        return -entry_premium * 100.0
+    # Short: look for symmetric wings to bound max loss.
+    calls = sorted([l for l in legs if l["option_type"] == "call"], key=lambda l: float(l["strike"]))
+    puts = sorted([l for l in legs if l["option_type"] == "put"], key=lambda l: float(l["strike"]))
+    if len(calls) == 2 and len(puts) == 2:
+        # iron condor: short inner + long outer wings, symmetric
+        call_wing = float(calls[1]["strike"]) - float(calls[0]["strike"])
+        put_wing = float(puts[1]["strike"]) - float(puts[0]["strike"])
+        wing = max(call_wing, put_wing)
+        return -(wing * 100.0 - entry_premium * 100.0)
+    return float("-inf")  # naked / undefined-risk — no bound
 
 
 @dataclass(frozen=True)
@@ -99,8 +165,40 @@ class PositionReconciler:
         self._client = client
         self._log = order_log
         self._account_id = account_id
+        # Underlying close-price cache, scoped per reconcile() call.
+        self._close_cache: dict[tuple[str, date], float | None] = {}
+
+    async def _underlying_close_on(self, symbol: str, expiration: date) -> float | None:
+        """Closing price of the underlying on `expiration` (or the most recent
+        trading day on/before expiration). Cached for the duration of one
+        reconcile() call. Returns None on fetch failure or empty history —
+        caller must NOT auto-close the position in that case."""
+        key = (symbol, expiration)
+        if key in self._close_cache:
+            return self._close_cache[key]
+        try:
+            # Fetch a small window so weekend/holiday expirations still resolve.
+            bars = await self._client.get_history(
+                symbol, expiration - timedelta(days=7), expiration,
+            )
+        except Exception as e:
+            logger.warning("get_history(%s, %s) failed: %s", symbol, expiration, e)
+            self._close_cache[key] = None
+            return None
+        if not isinstance(bars, list) or not bars:
+            logger.warning("get_history(%s, %s) returned no bars", symbol, expiration)
+            self._close_cache[key] = None
+            return None
+        # Prefer the exact expiration date; fall back to most recent ≤ expiration.
+        exact = next((b for b in bars if b.date == expiration), None)
+        chosen = exact or max(bars, key=lambda b: b.date)
+        self._close_cache[key] = chosen.close
+        return chosen.close
 
     async def reconcile(self, today: date) -> ReconciliationResult:
+        # Per-call close-price cache: reset every reconcile() so a price that
+        # was unavailable last cycle gets retried this cycle.
+        self._close_cache = {}
         # Phase 1: resolve any timeout-status orders by querying Tradier's
         # authoritative state. Recovered fills flow into the main pass below
         # because open_unclosed_positions() filters on final_status IN
@@ -193,24 +291,50 @@ class PositionReconciler:
                 skipped_premature.append(order_id)
                 continue
 
-            # Past expiration + no legs + no stock → expired worthless.
+            # Past expiration + no legs + no stock → settle at intrinsic value.
             raw_fill = row["fill_price"] if row["fill_price"] is not None else row["submitted_price"]
             entry_premium = abs(float(raw_fill))
-            is_long = row["direction"] == "BUY"
-            # Long: paid the debit, nothing comes back → -debit
-            # Short: kept the credit → +credit
-            realized = (-entry_premium if is_long else +entry_premium) * 100.0
+            underlying_close = await self._underlying_close_on(underlying, expiration)
+            if underlying_close is None:
+                logger.warning(
+                    "reconciler: order %s (%s exp=%s) — no underlying close price "
+                    "available, deferring closure to next cycle",
+                    order_id, underlying, expiration.isoformat(),
+                )
+                skipped_premature.append(order_id)
+                continue
 
+            realized = settle_intrinsic_pnl(
+                legs=legs, underlying_close=underlying_close,
+                direction=row["direction"], entry_premium=entry_premium,
+            )
+            # Sanity bound: a long can't lose more than the debit; a defined-risk
+            # short can't lose more than wing-distance × 100 − credit. If we
+            # compute outside that band, our intrinsic math has a bug — refuse
+            # to write a number that would silently corrupt the books.
+            floor = max_loss_dollars(legs, row["direction"], entry_premium)
+            if floor > float("-inf") and realized < floor - 0.01:
+                logger.error(
+                    "reconciler: order %s computed realized $%+.2f below max-loss "
+                    "floor $%+.2f — refusing to mark closed (intrinsic calc bug?)",
+                    order_id, realized, floor,
+                )
+                skipped_premature.append(order_id)
+                continue
+
+            trigger = "expired_worthless" if abs(realized - floor) < 0.01 and row["direction"] == "BUY" \
+                else "expired"
             self._log.record_expiration(
                 opening_order_id=order_id,
                 expired_at=now,
                 realized_pnl=realized,
+                exit_trigger=trigger,
             )
             logger.info(
-                "reconciler: order %s (%s %s %s exp=%s) marked expired_worthless "
-                "realized_pnl=$%+.2f (entry_premium=$%.2f direction=%s)",
+                "reconciler: order %s (%s %s %s exp=%s) marked %s "
+                "realized_pnl=$%+.2f (entry_premium=$%.2f S_close=$%.2f)",
                 order_id, underlying, row["structure"], row["direction"],
-                expiration.isoformat(), realized, entry_premium, row["direction"],
+                expiration.isoformat(), trigger, realized, entry_premium, underlying_close,
             )
             expired_closed.append(order_id)
 

@@ -76,7 +76,17 @@ def _check_reconciliation(summary: "DailySummary") -> None:
     is exact by construction in portfolio_state.snapshot() (realized + unrealized
     = equity - starting_equity); a breach means starting_equity got lost,
     Tradier equity is wonky, or realized P&L was re-broken. Threshold: $5
-    absolute drift, which is the spec — float-arithmetic noise is sub-penny."""
+    absolute drift, which is the spec — float-arithmetic noise is sub-penny.
+
+    NOTE: this guard verifies the *bookkeeping identity*, not per-position
+    correctness. If today_realized is wrong (e.g., an expired ITM long got
+    booked at -entry_debit when it should have been intrinsic - debit),
+    today_unrealized = equity_change - today_realized silently absorbs the
+    error and total_pnl still equals equity_change. The split between
+    realized vs unrealized is wrong but the sum reconciles, so this guard
+    stays silent. Correct per-position P&L is enforced upstream in
+    PositionReconciler.reconcile() via intrinsic settlement (see
+    positions/reconciler.py) and a max-loss floor sanity check at write time."""
     equity_delta = summary.ending_equity - summary.starting_equity
     drift = abs(equity_delta - summary.total_pnl)
     tolerance = 5.0
