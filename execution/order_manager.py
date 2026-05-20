@@ -6,13 +6,17 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 from config import Settings
 from data.async_client import AsyncTradierClient, OptionContract
 from data.market_data import TickerSnapshot
-from execution.order_log import OrderLog
+from execution.order_log import (
+    OrderLog,
+    PENDING_CLOSE_STATUS,
+    STALE_CANCELED_STATUS,
+)
 from signals.signal_generator import TradeLeg, TradeSignal
 
 if TYPE_CHECKING:
@@ -23,6 +27,8 @@ logger = logging.getLogger(__name__)
 
 MAX_QUANTITY_PER_LEG_DEFAULT = 10
 MAX_PREMIUM_PER_TRADE_DEFAULT = 5000.0
+STALE_ORDER_THRESHOLD_MINUTES_DEFAULT = 15
+MAX_CLOSE_RETRIES_DEFAULT = 3
 TERMINAL_STATES = {"filled", "partially_filled", "rejected", "canceled", "expired"}
 TERMINAL_FAILED = {"rejected", "canceled", "expired"}
 
@@ -170,6 +176,8 @@ class OrderManager:
         poll_interval_seconds: float = 2.0,
         poll_timeout_seconds: float = 30.0,
         slippage_buffer: float = 0.02,
+        stale_order_threshold_minutes: int = STALE_ORDER_THRESHOLD_MINUTES_DEFAULT,
+        max_close_retries: int = MAX_CLOSE_RETRIES_DEFAULT,
     ):
         self._client = client
         self._log = order_log
@@ -179,6 +187,8 @@ class OrderManager:
         self._poll_interval = poll_interval_seconds
         self._poll_timeout = poll_timeout_seconds
         self._slippage = slippage_buffer
+        self._stale_threshold_minutes = stale_order_threshold_minutes
+        self._max_close_retries = max_close_retries
 
     def _check_production_guard(self) -> str | None:
         """Return error string if blocked, None if OK to proceed."""
@@ -356,7 +366,12 @@ class OrderManager:
         """Build closing leg list with sides inverted, price at current mid +/-
         slippage, submit via the same multileg endpoint, poll for fill, update
         OrderLog with closing context. Bypasses fingerprint dedup (closing has
-        a different fingerprint by construction)."""
+        a different fingerprint by construction).
+
+        Records a close_attempt row at submission time. On poll timeout the
+        attempt is left status='pending' so reconcile_pending_closes() can
+        cancel it after the stale threshold elapses and let exit_manager
+        retry next cycle with a fresh limit price."""
         now = datetime.now(timezone.utc)
 
         guard_error = self._check_production_guard()
@@ -365,6 +380,52 @@ class OrderManager:
             return OrderResult(
                 signal=None, status="guard_blocked", order_id=None,
                 submitted_price=None, fill_price=None, error=guard_error,
+            )
+
+        # Don't pile up duplicate closes — if one is already in flight, defer.
+        # The stale-close-manager will cancel it next cycle if it goes stale,
+        # at which point exit_manager re-evaluates and resubmits with a fresh
+        # limit.
+        if self._log.has_pending_close(position.tradier_order_id):
+            logger.info(
+                "close already pending for opening %s (%s) — skipping submit",
+                position.tradier_order_id, position.symbol,
+            )
+            return OrderResult(
+                signal=None, status="pending_close_exists", order_id=None,
+                submitted_price=None, fill_price=None,
+                error=f"close already pending for opening {position.tradier_order_id}",
+            )
+
+        # Max retries: refuse and raise a CRITICAL alert (idempotent — the
+        # alert table is keyed on opening_order_id, so re-attempts on the same
+        # position don't spam the daily summary).
+        failed_count = self._log.failed_close_attempt_count(position.tradier_order_id)
+        if failed_count >= self._max_close_retries:
+            inserted = self._log.record_stale_close_alert(
+                opening_order_id=position.tradier_order_id,
+                symbol=position.symbol,
+                expiration=position.expiration,
+                structure=position.structure,
+                attempts=failed_count,
+                last_exit_trigger=exit_trigger,
+                detected_at=now,
+            )
+            if inserted:
+                logger.critical(
+                    "MAX CLOSE RETRIES EXCEEDED: opening %s (%s %s exp=%s) — "
+                    "%d failed close attempts (cap %d). Manual intervention required.",
+                    position.tradier_order_id, position.symbol,
+                    position.structure, position.expiration.isoformat(),
+                    failed_count, self._max_close_retries,
+                )
+            return OrderResult(
+                signal=None, status="max_retries_exceeded", order_id=None,
+                submitted_price=None, fill_price=None,
+                error=(
+                    f"max close retries ({self._max_close_retries}) exceeded "
+                    f"for opening {position.tradier_order_id}"
+                ),
             )
 
         # Invert sides: buy → sell_to_close, sell → buy_to_close
@@ -435,6 +496,15 @@ class OrderManager:
                 submitted_price=price, fill_price=None, error=err,
             )
         closing_order_id = int(order_node["id"])
+        placed_at = datetime.now(timezone.utc)
+        self._log.record_close_attempt(
+            opening_order_id=position.tradier_order_id,
+            closing_order_id=closing_order_id,
+            submitted_at=placed_at,
+            exit_trigger=exit_trigger,
+            order_type=order_type,
+            submitted_price=price,
+        )
         logger.info("submitted CLOSE %d for opening %d (%s) trigger=%s price=%.2f type=%s",
                     closing_order_id, position.tradier_order_id,
                     position.symbol, exit_trigger, price, order_type)
@@ -442,37 +512,271 @@ class OrderManager:
         # Poll for fill
         terminal_status, fill_price = await self._poll_until_terminal(closing_order_id)
         if terminal_status is None:
+            # Left pending intentionally — reconcile_pending_closes will cancel
+            # past the stale threshold and exit_manager will retry next cycle.
+            logger.info(
+                "close %d poll timed out — left as pending for stale-close "
+                "reconciler (threshold=%dmin)",
+                closing_order_id, self._stale_threshold_minutes,
+            )
             return OrderResult(
-                signal=None, status="timeout", order_id=closing_order_id,
+                signal=None, status="pending", order_id=closing_order_id,
                 submitted_price=price, fill_price=None,
-                error="close did not reach terminal state within timeout",
+                error="close did not reach terminal state within submit poll",
             )
 
-        # Compute realized P&L using fill price if available, otherwise the limit
-        realized_pnl: float
-        if terminal_status == "filled" and fill_price is not None:
-            # Tradier returns avg_fill_price signed (credits negative — see
-            # position_tracker.py:101). abs() + order_type gives us the canonical
-            # close cash flow: + when we receive cash, - when we pay.
-            abs_fill = abs(fill_price)
-            close_cash_realized = abs_fill * 100 if order_type == "credit" else -abs_fill * 100
-            entry_sign = -1 if position.is_long else 1
-            entry_cash = entry_sign * position.entry_premium * 100
-            realized_pnl = entry_cash + close_cash_realized
-        else:
-            realized_pnl = mark.pnl_dollars  # best estimate
+        terminal_at = datetime.now(timezone.utc)
 
         if terminal_status == "filled":
+            realized_pnl = self._compute_close_realized_pnl(
+                is_long=position.is_long,
+                entry_premium=position.entry_premium,
+                order_type=order_type,
+                fill_price=fill_price,
+                fallback_pnl=mark.pnl_dollars,
+            )
+            self._log.update_close_attempt(
+                closing_order_id=closing_order_id, status="filled",
+                terminal_at=terminal_at, fill_price=fill_price,
+            )
             self._log.record_close(
                 opening_order_id=position.tradier_order_id,
                 closing_order_id=closing_order_id,
-                closed_at=datetime.now(timezone.utc),
+                closed_at=terminal_at,
                 exit_trigger=exit_trigger,
                 realized_pnl=realized_pnl,
             )
+            return OrderResult(
+                signal=None, status="filled", order_id=closing_order_id,
+                submitted_price=price, fill_price=fill_price, error=None,
+            )
 
+        # Terminal failed (rejected / canceled / expired / partially_filled)
+        self._log.update_close_attempt(
+            closing_order_id=closing_order_id, status=terminal_status,
+            terminal_at=terminal_at, fill_price=fill_price,
+        )
         return OrderResult(
             signal=None, status=terminal_status, order_id=closing_order_id,
             submitted_price=price, fill_price=fill_price,
-            error=None if terminal_status == "filled" else f"close terminal status: {terminal_status}",
+            error=f"close terminal status: {terminal_status}",
         )
+
+    async def reconcile_pending_closes(self, now: datetime) -> dict[str, int]:
+        """Walk every pending close attempt: cancel ones older than the stale
+        threshold, reconcile any that filled between cycles. Should run on
+        every MainLoop cycle before signal generation.
+
+        Returns counts: {"canceled", "filled", "failed_terminal"}.
+
+        - Pending older than threshold + still non-terminal at Tradier:
+          DELETE the order, mark attempt as stale_canceled. exit_manager will
+          re-evaluate next cycle and resubmit with a fresh limit.
+        - Pending but Tradier reports filled: update attempt + record close on
+          opening order with realized P&L from the actual fill.
+        - Pending but Tradier reports rejected/canceled/expired: update attempt
+          to that status (counts toward the retry budget)."""
+        pending = self._log.pending_close_attempts()
+        if not pending:
+            return {"canceled": 0, "filled": 0, "failed_terminal": 0}
+
+        threshold = timedelta(minutes=self._stale_threshold_minutes)
+        canceled = filled = failed_terminal = 0
+
+        for row in pending:
+            closing_order_id = row["closing_order_id"]
+            opening_order_id = row["opening_order_id"]
+            try:
+                submitted_at = datetime.fromisoformat(row["submitted_at"])
+            except (TypeError, ValueError):
+                logger.warning(
+                    "bad submitted_at on close attempt %s — skipping",
+                    closing_order_id,
+                )
+                continue
+            age = now - submitted_at
+
+            try:
+                resp = await self._client.get_order_status(
+                    self._settings.account_id, closing_order_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    "get_order_status(%s) failed: %s — leaving pending",
+                    closing_order_id, e,
+                )
+                continue
+
+            order_node = resp.get("order") if isinstance(resp, dict) else None
+            if not isinstance(order_node, dict):
+                logger.warning(
+                    "malformed get_order_status response for close %s — leaving pending",
+                    closing_order_id,
+                )
+                continue
+
+            status = (order_node.get("status") or "").lower()
+
+            if status in {"filled", "partially_filled"}:
+                fill_price = self._extract_fill_price(order_node)
+                self._reconcile_between_cycle_fill(row, fill_price, now)
+                filled += 1
+                continue
+
+            if status in {"rejected", "canceled", "expired"}:
+                self._log.update_close_attempt(
+                    closing_order_id=closing_order_id, status=status,
+                    terminal_at=now, fill_price=None,
+                )
+                logger.info(
+                    "close %s for opening %s reached terminal status %s "
+                    "(was pending) — will retry next cycle",
+                    closing_order_id, opening_order_id, status,
+                )
+                failed_terminal += 1
+                continue
+
+            # Still non-terminal at Tradier — check age
+            if age <= threshold:
+                continue
+
+            try:
+                cancel_resp = await self._client.cancel_order(
+                    self._settings.account_id, closing_order_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    "cancel_order(%s) failed: %s — will retry next cycle",
+                    closing_order_id, e,
+                )
+                continue
+
+            cancel_err = self._extract_error(cancel_resp)
+            if cancel_err is not None:
+                # Race: order may have filled just before our cancel.
+                logger.warning(
+                    "cancel_order(%s) returned error %r — re-querying status",
+                    closing_order_id, cancel_err,
+                )
+                try:
+                    resp2 = await self._client.get_order_status(
+                        self._settings.account_id, closing_order_id,
+                    )
+                    node2 = resp2.get("order") if isinstance(resp2, dict) else None
+                    if isinstance(node2, dict):
+                        s2 = (node2.get("status") or "").lower()
+                        if s2 in {"filled", "partially_filled"}:
+                            fp = self._extract_fill_price(node2)
+                            self._reconcile_between_cycle_fill(row, fp, now)
+                            filled += 1
+                            continue
+                        if s2 in {"rejected", "canceled", "expired"}:
+                            self._log.update_close_attempt(
+                                closing_order_id=closing_order_id, status=s2,
+                                terminal_at=now, fill_price=None,
+                            )
+                            failed_terminal += 1
+                            continue
+                except Exception:
+                    pass
+                continue
+
+            self._log.update_close_attempt(
+                closing_order_id=closing_order_id, status=STALE_CANCELED_STATUS,
+                terminal_at=now, fill_price=None,
+            )
+            logger.info(
+                "canceled stale close %s for opening %s (age=%.0fs threshold=%dmin) "
+                "— exit_manager will retry next cycle",
+                closing_order_id, opening_order_id, age.total_seconds(),
+                self._stale_threshold_minutes,
+            )
+            canceled += 1
+
+        if canceled or filled or failed_terminal:
+            logger.info(
+                "stale-close reconcile: canceled=%d filled=%d failed_terminal=%d",
+                canceled, filled, failed_terminal,
+            )
+        return {"canceled": canceled, "filled": filled, "failed_terminal": failed_terminal}
+
+    def _reconcile_between_cycle_fill(
+        self,
+        attempt_row: dict,
+        fill_price: float | None,
+        now: datetime,
+    ) -> None:
+        """A close that was pending in our log filled at Tradier between
+        cycles. Update the close attempt + record the opening order as
+        closed, computing realized P&L from the actual fill."""
+        closing_order_id = attempt_row["closing_order_id"]
+        opening_order_id = attempt_row["opening_order_id"]
+        order_type = attempt_row["order_type"]
+        exit_trigger = attempt_row["exit_trigger"]
+
+        opening = self._log.get_submitted_order(opening_order_id)
+        if opening is None:
+            logger.error(
+                "reconcile: could not find opening order %s for close %s",
+                opening_order_id, closing_order_id,
+            )
+            return
+
+        is_long = opening["direction"] == "BUY"
+        raw_fill = (
+            opening["fill_price"] if opening["fill_price"] is not None
+            else opening["submitted_price"]
+        )
+        entry_premium = abs(float(raw_fill))
+
+        realized_pnl = self._compute_close_realized_pnl(
+            is_long=is_long, entry_premium=entry_premium,
+            order_type=order_type, fill_price=fill_price,
+            fallback_pnl=0.0,
+        )
+
+        self._log.update_close_attempt(
+            closing_order_id=closing_order_id, status="filled",
+            terminal_at=now, fill_price=fill_price,
+        )
+        self._log.record_close(
+            opening_order_id=opening_order_id,
+            closing_order_id=closing_order_id,
+            closed_at=now,
+            exit_trigger=exit_trigger,
+            realized_pnl=realized_pnl,
+        )
+        logger.info(
+            "reconciled between-cycle close fill: closing=%s opening=%s "
+            "realized=$%+.2f trigger=%s fill_price=%s",
+            closing_order_id, opening_order_id, realized_pnl, exit_trigger,
+            f"{fill_price:.4f}" if fill_price is not None else "n/a",
+        )
+
+    @staticmethod
+    def _compute_close_realized_pnl(
+        is_long: bool,
+        entry_premium: float,
+        order_type: str,
+        fill_price: float | None,
+        fallback_pnl: float,
+    ) -> float:
+        """Realized P&L using Tradier's signed avg_fill_price + order_type.
+        Tradier returns credit fills as NEGATIVE; abs() + order_type carries
+        the canonical sign so credits add and debits subtract from realized.
+        If fill_price is missing (rare), falls back to the mark estimate."""
+        if fill_price is None:
+            return fallback_pnl
+        abs_fill = abs(fill_price)
+        close_cash_realized = abs_fill * 100 if order_type == "credit" else -abs_fill * 100
+        entry_sign = -1 if is_long else 1
+        entry_cash = entry_sign * entry_premium * 100
+        return entry_cash + close_cash_realized
+
+    @staticmethod
+    def _extract_fill_price(order_node: dict) -> float | None:
+        raw = order_node.get("avg_fill_price") or order_node.get("price")
+        try:
+            return float(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            return None

@@ -1,7 +1,12 @@
 import sys
-from datetime import date
+from datetime import date, datetime, timezone
 
-from logs import DailySummary, format_summary
+from logs import (
+    DailySummary,
+    PendingCloseSummary,
+    StaleCloseAlertSummary,
+    format_summary,
+)
 
 
 def _mk_summary(**overrides) -> DailySummary:
@@ -87,6 +92,39 @@ def test_format_summary_negative_pnl():
     print("format_summary: negative P&L renders correctly")
 
 
+def test_format_summary_stale_close_alert():
+    alert = StaleCloseAlertSummary(
+        opening_order_id=5001, symbol="XOM",
+        expiration=date(2026, 5, 30), structure="straddle",
+        attempts=3, last_exit_trigger="profit_target",
+        detected_at=datetime(2026, 5, 20, 14, 30, tzinfo=timezone.utc),
+    )
+    text = format_summary(_mk_summary(stale_close_alerts=[alert]))
+    assert ":rotating_light:" in text
+    assert "STALE CLOSE ALERT" in text
+    assert "opening 5001" in text
+    assert "XOM" in text
+    assert "3 failed attempts" in text
+    assert "profit_target" in text
+    print("format_summary: stale_close_alert rendered")
+
+
+def test_format_summary_pending_closes():
+    pending = PendingCloseSummary(
+        closing_order_id=9101, opening_order_id=5001,
+        symbol="XOM", structure="straddle",
+        exit_trigger="profit_target", submitted_price=2.50,
+        submitted_at=datetime(2026, 5, 20, 14, 0, tzinfo=timezone.utc),
+    )
+    text = format_summary(_mk_summary(pending_closes=[pending]))
+    assert "Open exits in progress" in text
+    assert "close 9101" in text
+    assert "opening 5001" in text
+    assert "$2.50" in text
+    assert "profit_target" in text
+    print("format_summary: pending_closes rendered")
+
+
 def main() -> int:
     test_format_summary_basic()
     test_format_summary_kill_switch_active()
@@ -94,6 +132,8 @@ def main() -> int:
     test_format_summary_with_exits()
     test_format_summary_zero_starting_equity()
     test_format_summary_negative_pnl()
+    test_format_summary_stale_close_alert()
+    test_format_summary_pending_closes()
     print("all slack_formatter tests passed")
     return 0
 

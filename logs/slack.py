@@ -80,6 +80,30 @@ def format_summary(summary: DailySummary) -> str:
                 f"exp {a.expiration.isoformat()} → {qty_str}"
             )
 
+    if summary.stale_close_alerts:
+        lines.append(
+            f":rotating_light: *STALE CLOSE ALERT* — {len(summary.stale_close_alerts)} "
+            "position(s) exceeded close-retry cap, need manual intervention:"
+        )
+        for s in summary.stale_close_alerts:
+            trig = s.last_exit_trigger or "n/a"
+            lines.append(
+                f"  • opening {s.opening_order_id} {s.symbol} {s.structure} "
+                f"exp {s.expiration.isoformat()} → {s.attempts} failed attempts "
+                f"(last trigger: {trig})"
+            )
+
+    if summary.pending_closes:
+        lines.append(
+            f":hourglass_flowing_sand: Open exits in progress: {len(summary.pending_closes)}"
+        )
+        for p in summary.pending_closes:
+            lines.append(
+                f"  • close {p.closing_order_id} (opening {p.opening_order_id}) "
+                f"{p.symbol} {p.structure} trigger={p.exit_trigger} "
+                f"@ ${p.submitted_price:.2f} submitted {p.submitted_at.isoformat()}"
+            )
+
     return "\n".join(lines)
 
 

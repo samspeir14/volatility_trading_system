@@ -238,6 +238,14 @@ class MainLoop:
         except Exception as e:
             logger.error("reconciliation failed: %s — continuing with stale log", e)
 
+        # 2c. Reconcile pending closes — cancel stale ones, reconcile any that
+        # filled between cycles. Runs before snapshot so freshly-reconciled
+        # closes don't leave the opening in open_marks for this cycle.
+        try:
+            await self._order_manager.reconcile_pending_closes(now)
+        except Exception as e:
+            logger.error("stale-close reconcile failed: %s — continuing", e)
+
         # 3. Snapshot
         snapshot = await self._builder.snapshot(scan)
 
@@ -515,6 +523,8 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
 
     order_manager = OrderManager(
         client=client, order_log=order_log, settings=settings,
+        stale_order_threshold_minutes=settings.stale_order_threshold_minutes,
+        max_close_retries=settings.max_close_retries,
     )
 
     exit_manager = ExitManager(

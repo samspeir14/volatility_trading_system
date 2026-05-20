@@ -63,6 +63,32 @@ CREATE TABLE IF NOT EXISTS assignment_alerts (
 );
 """
 
+CREATE_CLOSE_ATTEMPTS_SQL = """
+CREATE TABLE IF NOT EXISTS close_attempts (
+    closing_order_id INTEGER PRIMARY KEY,
+    opening_order_id INTEGER NOT NULL,
+    submitted_at TEXT NOT NULL,
+    exit_trigger TEXT NOT NULL,
+    order_type TEXT NOT NULL,
+    submitted_price REAL NOT NULL,
+    status TEXT NOT NULL,
+    terminal_at TEXT,
+    fill_price REAL
+);
+"""
+
+CREATE_STALE_CLOSE_ALERTS_SQL = """
+CREATE TABLE IF NOT EXISTS stale_close_alerts (
+    opening_order_id INTEGER PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    expiration TEXT NOT NULL,
+    structure TEXT NOT NULL,
+    attempts INTEGER NOT NULL,
+    last_exit_trigger TEXT,
+    detected_at TEXT NOT NULL
+);
+"""
+
 EXPIRATION_SENTINEL_ORDER_ID = 0  # closing_order_id used for auto-expired positions
 
 CREATE_INDEXES_SQL = [
@@ -70,7 +96,13 @@ CREATE_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_orders_status ON submitted_orders(final_status);",
     "CREATE INDEX IF NOT EXISTS idx_orders_fingerprint ON submitted_orders(fingerprint, submitted_at DESC);",
     "CREATE INDEX IF NOT EXISTS idx_failed_fingerprint ON failed_submissions(fingerprint, submitted_at DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_close_attempts_opening ON close_attempts(opening_order_id);",
+    "CREATE INDEX IF NOT EXISTS idx_close_attempts_status ON close_attempts(status);",
 ]
+
+PENDING_CLOSE_STATUS = "pending"
+STALE_CANCELED_STATUS = "stale_canceled"
+FAILED_CLOSE_STATUSES = {"stale_canceled", "canceled", "rejected", "expired"}
 
 CLOSE_COLUMNS_MIGRATIONS = [
     ("closing_order_id", "ALTER TABLE submitted_orders ADD COLUMN closing_order_id INTEGER"),
@@ -87,6 +119,8 @@ class OrderLog:
         self._conn.execute(CREATE_SUBMITTED_SQL)
         self._conn.execute(CREATE_FAILED_SQL)
         self._conn.execute(CREATE_ASSIGNMENT_ALERTS_SQL)
+        self._conn.execute(CREATE_CLOSE_ATTEMPTS_SQL)
+        self._conn.execute(CREATE_STALE_CLOSE_ALERTS_SQL)
         self._migrate_close_columns()
         for sql in CREATE_INDEXES_SQL:
             self._conn.execute(sql)
@@ -324,6 +358,130 @@ class OrderLog:
             "FROM submitted_orders "
             "WHERE final_status = 'timeout' AND closing_order_id IS NULL "
             "ORDER BY submitted_at"
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def get_submitted_order(self, order_id: int) -> dict | None:
+        """Fetch a single submitted_orders row by tradier_order_id."""
+        cur = self._conn.execute(
+            "SELECT tradier_order_id, fingerprint, submitted_at, symbol, expiration, "
+            "direction, structure, horizon_lower, horizon_upper, weight_lower, "
+            "underlying_price_at_signal, atm_iv_at_signal, predicted_iv_at_signal, "
+            "divergence_at_signal, cross_sectional_z, time_series_z, "
+            "submitted_price, legs_json, final_status, fill_price, closing_order_id, "
+            "closed_at, exit_trigger, realized_pnl "
+            "FROM submitted_orders WHERE tradier_order_id = ?",
+            (order_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        cols = [d[0] for d in cur.description]
+        return dict(zip(cols, row))
+
+    def record_close_attempt(
+        self,
+        opening_order_id: int,
+        closing_order_id: int,
+        submitted_at: datetime,
+        exit_trigger: str,
+        order_type: str,
+        submitted_price: float,
+        status: str = PENDING_CLOSE_STATUS,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO close_attempts ("
+            "closing_order_id, opening_order_id, submitted_at, exit_trigger, "
+            "order_type, submitted_price, status"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (closing_order_id, opening_order_id, submitted_at.isoformat(),
+             exit_trigger, order_type, submitted_price, status),
+        )
+        self._conn.commit()
+
+    def update_close_attempt(
+        self,
+        closing_order_id: int,
+        status: str,
+        terminal_at: datetime | None = None,
+        fill_price: float | None = None,
+    ) -> None:
+        self._conn.execute(
+            "UPDATE close_attempts SET status = ?, terminal_at = ?, fill_price = ? "
+            "WHERE closing_order_id = ?",
+            (status, terminal_at.isoformat() if terminal_at else None,
+             fill_price, closing_order_id),
+        )
+        self._conn.commit()
+
+    def has_pending_close(self, opening_order_id: int) -> bool:
+        cur = self._conn.execute(
+            "SELECT 1 FROM close_attempts WHERE opening_order_id = ? "
+            "AND status = ? LIMIT 1",
+            (opening_order_id, PENDING_CLOSE_STATUS),
+        )
+        return cur.fetchone() is not None
+
+    def pending_close_attempts(self) -> list[dict]:
+        """All close_attempts currently in 'pending' state. Stale-close-manager
+        walks this list each cycle."""
+        cur = self._conn.execute(
+            "SELECT ca.closing_order_id, ca.opening_order_id, ca.submitted_at, "
+            "ca.exit_trigger, ca.order_type, ca.submitted_price, ca.status, "
+            "so.symbol, so.expiration, so.structure, so.direction "
+            "FROM close_attempts ca "
+            "JOIN submitted_orders so ON so.tradier_order_id = ca.opening_order_id "
+            "WHERE ca.status = ? "
+            "ORDER BY ca.submitted_at",
+            (PENDING_CLOSE_STATUS,),
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def failed_close_attempt_count(self, opening_order_id: int) -> int:
+        """Number of close attempts that ended in a failed terminal state
+        (stale-canceled, canceled, rejected, expired). Pending and filled
+        attempts are NOT counted — only failed attempts count against the
+        retry budget."""
+        placeholders = ",".join("?" * len(FAILED_CLOSE_STATUSES))
+        cur = self._conn.execute(
+            f"SELECT COUNT(*) FROM close_attempts "
+            f"WHERE opening_order_id = ? AND status IN ({placeholders})",
+            (opening_order_id, *sorted(FAILED_CLOSE_STATUSES)),
+        )
+        return int(cur.fetchone()[0])
+
+    def record_stale_close_alert(
+        self,
+        opening_order_id: int,
+        symbol: str,
+        expiration: date,
+        structure: str,
+        attempts: int,
+        last_exit_trigger: str | None,
+        detected_at: datetime,
+    ) -> bool:
+        """Insert a stale-close alert. Returns True if inserted, False if a
+        row for this opening_order_id already existed (idempotent)."""
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO stale_close_alerts "
+            "(opening_order_id, symbol, expiration, structure, attempts, "
+            "last_exit_trigger, detected_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (opening_order_id, symbol, expiration.isoformat(), structure,
+             attempts, last_exit_trigger, detected_at.isoformat()),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def stale_close_alerts_active(self) -> list[dict]:
+        """All recorded stale-close alerts. Once a position is manually closed
+        or retried, the operator can DELETE the row to dismiss it."""
+        cur = self._conn.execute(
+            "SELECT opening_order_id, symbol, expiration, structure, attempts, "
+            "last_exit_trigger, detected_at FROM stale_close_alerts "
+            "ORDER BY detected_at DESC"
         )
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]

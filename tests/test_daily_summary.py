@@ -307,12 +307,69 @@ def test_summary_pnl_matches_equity_delta():
           f"equity_delta={equity_delta:+.2f} diff={diff:.4f} ✓")
 
 
+def test_summary_surfaces_stale_close_alerts_and_pending():
+    """stale_close_alerts rows + pending close_attempts should both surface
+    in the built summary so the daily Slack post catches them."""
+    with tempfile.TemporaryDirectory() as tmp:
+        order_log = OrderLog(Path(tmp) / "orders.db")
+        div_history = DivergenceHistory(Path(tmp) / "div.db")
+        risk_log = RiskRejectionLog(Path(tmp) / "risk.db")
+        kill_switch = DailyKillSwitch(Path(tmp) / "ks.db")
+
+        today = date(2026, 5, 20)
+        # Seed one stale-close alert + one open position with a pending close
+        order_log.record_stale_close_alert(
+            opening_order_id=5001, symbol="XOM",
+            expiration=date(2026, 5, 30), structure="straddle",
+            attempts=3, last_exit_trigger="profit_target",
+            detected_at=datetime(2026, 5, 20, 14, 0, tzinfo=timezone.utc),
+        )
+        # Need an opening order row for pending_close_attempts JOIN
+        order_log._conn.execute(
+            "INSERT INTO submitted_orders ("
+            "tradier_order_id, fingerprint, submitted_at, symbol, expiration, "
+            "direction, structure, horizon_lower, horizon_upper, weight_lower, "
+            "underlying_price_at_signal, atm_iv_at_signal, predicted_iv_at_signal, "
+            "divergence_at_signal, cross_sectional_z, time_series_z, "
+            "submitted_price, legs_json, final_status, fill_price"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (6001, "fp6001", "2026-05-20T14:00:00+00:00", "MSFT",
+             "2026-06-19", "BUY", "straddle", 10, 21, 0.5,
+             400.0, 0.25, 0.32, 0.07, 1.8, None,
+             4.50, "[]", "filled", 4.50),
+        )
+        order_log._conn.commit()
+        order_log.record_close_attempt(
+            opening_order_id=6001, closing_order_id=9001,
+            submitted_at=datetime(2026, 5, 20, 14, 30, tzinfo=timezone.utc),
+            exit_trigger="thesis_reversed", order_type="credit",
+            submitted_price=3.20,
+        )
+
+        builder = DailySummaryBuilder(order_log, div_history, risk_log, kill_switch)
+        snap = _mk_snapshot()
+        summary = builder.build(today, snap)
+
+        assert len(summary.stale_close_alerts) == 1
+        assert summary.stale_close_alerts[0].symbol == "XOM"
+        assert summary.stale_close_alerts[0].attempts == 3
+        assert len(summary.pending_closes) == 1
+        assert summary.pending_closes[0].closing_order_id == 9001
+        assert summary.pending_closes[0].symbol == "MSFT"
+        assert summary.pending_closes[0].exit_trigger == "thesis_reversed"
+
+        for c in (order_log, div_history, risk_log, kill_switch):
+            c.close()
+    print("daily_summary: stale_close_alerts + pending_closes surfaced ✓")
+
+
 def main() -> int:
     test_summary_with_no_activity()
     test_summary_with_filled_positions()
     test_summary_with_kill_switch()
     test_summary_rejection_categories()
     test_summary_pnl_matches_equity_delta()
+    test_summary_surfaces_stale_close_alerts_and_pending()
     print("all daily_summary tests passed")
     return 0
 

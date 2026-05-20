@@ -28,6 +28,8 @@ class Settings:
     finnhub_api_key: str | None = None
     earnings_filter_enabled: bool = True
     earnings_buffer_days: int = 7
+    stale_order_threshold_minutes: int = 15
+    max_close_retries: int = 3
 
 
 def load_settings() -> Settings:
@@ -57,6 +59,12 @@ def load_settings() -> Settings:
     earnings_buffer_days = _parse_int(
         os.environ.get("EARNINGS_BUFFER_DAYS"), default=7,
     )
+    stale_order_threshold_minutes = _parse_int(
+        os.environ.get("STALE_ORDER_THRESHOLD_MINUTES"), default=15,
+    )
+    max_close_retries = _parse_int(
+        os.environ.get("MAX_CLOSE_RETRIES"), default=3,
+    )
 
     return Settings(
         api_key=api_key,
@@ -66,6 +74,8 @@ def load_settings() -> Settings:
         finnhub_api_key=finnhub_api_key,
         earnings_filter_enabled=earnings_filter_enabled,
         earnings_buffer_days=earnings_buffer_days,
+        stale_order_threshold_minutes=stale_order_threshold_minutes,
+        max_close_retries=max_close_retries,
     )
 
 

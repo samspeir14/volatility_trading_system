@@ -47,6 +47,9 @@ def _mk_loop(*, market_state="open", kill_active_initial=False, snapshot=None,
 
     order_manager = mock.AsyncMock()
     order_manager.submit.return_value = mock.MagicMock(status="filled")
+    order_manager.reconcile_pending_closes = mock.AsyncMock(return_value={
+        "canceled": 0, "filled": 0, "failed_terminal": 0,
+    })
 
     exit_manager = mock.MagicMock()
     exit_manager.evaluate.return_value = exit_decisions or []
@@ -164,6 +167,32 @@ def test_kill_switch_active_skips_signal_generation():
     print("kill_switch_active: signal generation skipped")
 
 
+def test_run_once_calls_reconcile_pending_closes_before_snapshot():
+    """The stale-close reconciler must run on every cycle BEFORE snapshot, so
+    any between-cycle fills or canceled stale closes are reflected in the
+    snapshot used for exits + signal gen."""
+    loop, mocks = _mk_loop()
+    asyncio.run(loop.run_once())
+    mocks["order_manager"].reconcile_pending_closes.assert_called_once()
+
+    # And the call must happen before the snapshot builder runs.
+    call_order = []
+    snapshot_obj = mocks["builder"].snapshot.return_value
+    async def record_reconcile(*args, **kwargs):
+        call_order.append("reconcile")
+        return {"canceled": 0, "filled": 0, "failed_terminal": 0}
+    async def record_snapshot(*args, **kwargs):
+        call_order.append("snapshot")
+        return snapshot_obj
+    mocks["order_manager"].reconcile_pending_closes = mock.AsyncMock(side_effect=record_reconcile)
+    mocks["builder"].snapshot = mock.AsyncMock(side_effect=record_snapshot)
+    asyncio.run(loop.run_once())
+    assert call_order == ["reconcile", "snapshot"], (
+        f"expected reconcile before snapshot, got {call_order}"
+    )
+    print("run_once: reconcile_pending_closes called before snapshot")
+
+
 def test_kill_switch_active_still_runs_exits():
     """Critical: dropdown shouldn't compound by holding losers — exits must still run."""
     fake_position_mark = mock.MagicMock()
@@ -198,6 +227,7 @@ def main() -> int:
     test_approved_signal_submits_order()
     test_rejected_signal_logs_rejection_no_submit()
     test_kill_switch_active_skips_signal_generation()
+    test_run_once_calls_reconcile_pending_closes_before_snapshot()
     test_kill_switch_active_still_runs_exits()
     print("all main_loop tests passed")
     return 0

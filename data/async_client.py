@@ -258,6 +258,68 @@ class AsyncTradierClient:
     async def get_order_status(self, account_id: str, order_id: int) -> dict:
         return await self._get(f"/accounts/{account_id}/orders/{order_id}")
 
+    async def cancel_order(self, account_id: str, order_id: int) -> dict:
+        """DELETE /accounts/{id}/orders/{id}. Tradier returns {"order": {"id":..,
+        "status": "ok"}} on success or {"errors": {...}} on failure (e.g. order
+        already filled). Returns the parsed body; caller inspects for errors."""
+        return await self._delete(f"/accounts/{account_id}/orders/{order_id}")
+
+    async def _delete(self, path: str) -> dict:
+        if self._session is None:
+            raise RuntimeError("AsyncTradierClient must be used as an async context manager")
+
+        url = f"{self._settings.base_url}{path}"
+        max_retries = self._settings.max_retries
+        backoff = 0.5
+
+        for attempt in range(1, max_retries + 1):
+            await self.rate_limiter.acquire()
+
+            try:
+                async with self._session.delete(url) as resp:
+                    self.rate_limiter.update_from_headers(resp.headers)
+                    logger.debug("Tradier DELETE %s -> %d", url, resp.status)
+
+                    if resp.status == 429:
+                        expiry_ms = int(resp.headers.get("X-Ratelimit-Expiry", "0") or 0)
+                        wait = (expiry_ms - time.time() * 1000) / 1000 if expiry_ms else 5.0
+                        wait = max(1.0, wait)
+                        logger.warning("Tradier DELETE %s 429; sleeping %.2fs", path, wait)
+                        await asyncio.sleep(wait + 0.1)
+                        continue
+
+                    if resp.status >= 500 and attempt < max_retries:
+                        logger.warning("Tradier DELETE %s attempt %d/%d returned %d; retrying in %.1fs",
+                                       path, attempt, max_retries, resp.status, backoff)
+                        await asyncio.sleep(backoff)
+                        backoff *= 2
+                        continue
+
+                    body_text = await resp.text()
+                    try:
+                        body = await resp.json(content_type=None)
+                    except Exception:
+                        body = None
+
+                    if not resp.ok:
+                        if body is not None:
+                            return body  # let caller inspect structured error
+                        raise TradierAPIError(resp.status, body_text, url)
+
+                    if body is None:
+                        raise TradierAPIError(resp.status, body_text, url)
+                    return body
+
+            except aiohttp.ClientConnectionError as e:
+                if attempt == max_retries:
+                    raise
+                logger.warning("Tradier DELETE %s attempt %d/%d connection error (%s); retrying in %.1fs",
+                               path, attempt, max_retries, e.__class__.__name__, backoff)
+                await asyncio.sleep(backoff)
+                backoff *= 2
+
+        raise RuntimeError("unreachable: retry loop exited without return")
+
     async def get_positions(self, account_id: str) -> list[dict]:
         data = await self._get(f"/accounts/{account_id}/positions")
         positions = data.get("positions")
