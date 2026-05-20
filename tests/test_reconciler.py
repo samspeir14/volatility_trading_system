@@ -12,6 +12,7 @@ from execution import OrderLog
 from positions.reconciler import (
     AssignmentAlert,
     PositionReconciler,
+    TimeoutResolution,
     is_option_symbol,
     underlying_of_option,
 )
@@ -38,11 +39,15 @@ def _mk_signal(symbol: str, expiration: date, direction: str, legs: list[TradeLe
 
 def _seed_open_order(log: OrderLog, *, order_id: int, symbol: str, expiration: date,
                      direction: str, structure: str, entry_premium: float,
-                     legs: list[TradeLeg], submitted_at: datetime) -> None:
+                     legs: list[TradeLeg], submitted_at: datetime,
+                     final_status: str = "filled") -> None:
     """Insert directly — order_log.record_submission requires a TradeSignal but
-    we want to test against pre-existing log rows from prior sessions."""
+    we want to test against pre-existing log rows from prior sessions.
+    final_status='timeout' simulates an order that submitted but the polling
+    timed out before reaching a terminal state."""
     legs_json = json.dumps([asdict(leg) for leg in legs])
-    fill_price = -entry_premium if direction == "SELL" else entry_premium
+    submitted_signed = -entry_premium if direction == "SELL" else entry_premium
+    fill_price = submitted_signed if final_status == "filled" else None
     log._conn.execute(
         "INSERT INTO submitted_orders ("
         "tradier_order_id, fingerprint, submitted_at, symbol, expiration, "
@@ -54,7 +59,7 @@ def _seed_open_order(log: OrderLog, *, order_id: int, symbol: str, expiration: d
         (order_id, f"fp-{order_id}", submitted_at.isoformat(), symbol,
          expiration.isoformat(), direction, structure, 21, 21, 1.0,
          150.0, 0.30, 0.25, -0.05, -1.6, -1.2,
-         fill_price, legs_json, "filled", fill_price),
+         submitted_signed, legs_json, final_status, fill_price),
     )
     log._conn.commit()
 
@@ -321,6 +326,189 @@ def test_reconciler_handles_get_positions_failure_gracefully():
     print("reconciler: API failure → no-op, retry next cycle ✓")
 
 
+def test_timeout_recovery_marks_filled_order():
+    """The headline scenario for this fix: a timeout-status row whose Tradier
+    order actually filled. Reconciler queries get_order_status, updates the
+    log to 'filled' with the real avg_fill_price."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "orders.db")
+        expiration = date(2026, 6, 19)
+        _seed_open_order(
+            log, order_id=9101, symbol="UNH", expiration=expiration,
+            direction="BUY", structure="straddle", entry_premium=14.66,
+            legs=_straddle_legs(),
+            submitted_at=datetime(2026, 5, 4, 15, 0, tzinfo=timezone.utc),
+            final_status="timeout",
+        )
+        # Not in open_unclosed_positions yet (filtered by status)
+        assert len(log.open_unclosed_positions()) == 0
+        assert len(log.timeout_orders()) == 1
+
+        client = mock.AsyncMock()
+        client.get_positions.return_value = [
+            {"symbol": AAPL_C150, "quantity": 1, "cost_basis": 1466.0},
+            {"symbol": AAPL_P140, "quantity": 1, "cost_basis": 0.0},
+        ]
+        client.get_order_status.return_value = {
+            "order": {"id": 9101, "status": "filled", "avg_fill_price": 14.55},
+        }
+
+        reconciler = PositionReconciler(client=client, order_log=log, account_id="VA1")
+        result = asyncio.run(reconciler.reconcile(date(2026, 5, 20)))
+
+        assert len(result.timeouts_resolved) == 1
+        res = result.timeouts_resolved[0]
+        assert res.tradier_order_id == 9101
+        assert res.new_status == "filled"
+        assert abs(res.fill_price - 14.55) < 1e-9
+
+        # After recovery, the row is now in open_unclosed_positions
+        rows = log.open_unclosed_positions()
+        assert len(rows) == 1
+        assert rows[0]["tradier_order_id"] == 9101
+        assert rows[0]["final_status"] == "filled"
+        assert abs(rows[0]["fill_price"] - 14.55) < 1e-9
+        # Not expired yet — legs still in Tradier, expiration in future
+        assert result.expired_closed == []
+
+        log.close()
+    print("timeout_recovery: filled order recovered with real fill_price ✓")
+
+
+def test_timeout_recovery_marks_rejected_order():
+    """Timeout that Tradier reports as rejected — no fill price, status updated."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "orders.db")
+        _seed_open_order(
+            log, order_id=9102, symbol="UNH", expiration=date(2026, 6, 19),
+            direction="BUY", structure="straddle", entry_premium=14.66,
+            legs=_straddle_legs(),
+            submitted_at=datetime(2026, 5, 4, 15, 0, tzinfo=timezone.utc),
+            final_status="timeout",
+        )
+        client = mock.AsyncMock()
+        client.get_positions.return_value = []
+        client.get_order_status.return_value = {
+            "order": {"id": 9102, "status": "rejected", "reason_description": "no liquidity"},
+        }
+
+        reconciler = PositionReconciler(client=client, order_log=log, account_id="VA1")
+        result = asyncio.run(reconciler.reconcile(date(2026, 5, 20)))
+
+        assert len(result.timeouts_resolved) == 1
+        assert result.timeouts_resolved[0].new_status == "rejected"
+        assert result.timeouts_resolved[0].fill_price is None
+        # Rejected orders don't enter open_unclosed_positions (status filter)
+        assert len(log.open_unclosed_positions()) == 0
+        assert len(log.timeout_orders()) == 0  # no longer a timeout
+        # No expirations either
+        assert result.expired_closed == []
+
+        log.close()
+    print("timeout_recovery: rejected status persisted ✓")
+
+
+def test_timeout_recovery_handles_api_error():
+    """If get_order_status raises, leave the row as 'timeout' and retry later."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "orders.db")
+        _seed_open_order(
+            log, order_id=9103, symbol="UNH", expiration=date(2026, 6, 19),
+            direction="BUY", structure="straddle", entry_premium=14.66,
+            legs=_straddle_legs(),
+            submitted_at=datetime(2026, 5, 4, 15, 0, tzinfo=timezone.utc),
+            final_status="timeout",
+        )
+        client = mock.AsyncMock()
+        client.get_positions.return_value = []
+        client.get_order_status.side_effect = RuntimeError("Tradier 503")
+
+        reconciler = PositionReconciler(client=client, order_log=log, account_id="VA1")
+        result = asyncio.run(reconciler.reconcile(date(2026, 5, 20)))
+
+        assert len(result.timeouts_resolved) == 1
+        assert result.timeouts_resolved[0].new_status == "unknown"
+        # Row still listed as timeout
+        assert len(log.timeout_orders()) == 1
+        log.close()
+    print("timeout_recovery: API error → leave as timeout, retry next cycle ✓")
+
+
+def test_timeout_recovery_handles_still_pending():
+    """If Tradier returns a non-terminal status (open, pending), keep as timeout."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "orders.db")
+        _seed_open_order(
+            log, order_id=9104, symbol="UNH", expiration=date(2026, 6, 19),
+            direction="BUY", structure="straddle", entry_premium=14.66,
+            legs=_straddle_legs(),
+            submitted_at=datetime(2026, 5, 4, 15, 0, tzinfo=timezone.utc),
+            final_status="timeout",
+        )
+        client = mock.AsyncMock()
+        client.get_positions.return_value = []
+        client.get_order_status.return_value = {
+            "order": {"id": 9104, "status": "pending"},
+        }
+
+        reconciler = PositionReconciler(client=client, order_log=log, account_id="VA1")
+        result = asyncio.run(reconciler.reconcile(date(2026, 5, 20)))
+
+        assert result.timeouts_resolved[0].new_status == "unknown"
+        assert len(log.timeout_orders()) == 1  # untouched
+        log.close()
+    print("timeout_recovery: non-terminal status → leave as timeout ✓")
+
+
+def test_timeout_recovery_chains_into_expiration_marking():
+    """End-to-end: timeout order that actually filled AND has since expired.
+    A single reconcile() call must recover the timeout, observe that Tradier
+    no longer reports the legs, and mark the position expired with the
+    correct realized P&L. This is the exact UNH 5/15 scenario from prod."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "orders.db")
+        expiration = date(2026, 5, 15)  # already passed (today below = 5/20)
+        _seed_open_order(
+            log, order_id=9105, symbol="UNH", expiration=expiration,
+            direction="BUY", structure="straddle", entry_premium=14.66,
+            legs=_straddle_legs(),
+            submitted_at=datetime(2026, 5, 4, 15, 0, tzinfo=timezone.utc),
+            final_status="timeout",
+        )
+
+        client = mock.AsyncMock()
+        # Tradier confirms the order filled at the submitted price
+        client.get_order_status.return_value = {
+            "order": {"id": 9105, "status": "filled", "avg_fill_price": 14.55},
+        }
+        # No options for this position in current Tradier positions, no stock
+        client.get_positions.return_value = []
+
+        reconciler = PositionReconciler(client=client, order_log=log, account_id="VA1")
+        result = asyncio.run(reconciler.reconcile(date(2026, 5, 20)))
+
+        # Both phases ran on the same row
+        assert result.timeouts_resolved[0].new_status == "filled"
+        assert result.expired_closed == [9105]
+
+        # Order is now closed with the right realized P&L:
+        # Long straddle (BUY) at 14.55 paid → -1455 realized when expired worthless.
+        # Reconciler uses fill_price (now populated) per position_tracker semantics:
+        # entry_premium = abs(fill_price), realized = -entry_premium * 100 for long.
+        row = log._conn.execute(
+            "SELECT realized_pnl, closing_order_id, exit_trigger, final_status, fill_price "
+            "FROM submitted_orders WHERE tradier_order_id = ?", (9105,),
+        ).fetchone()
+        assert abs(row[0] - (-1455.0)) < 0.01, f"expected -$1455, got {row[0]}"
+        assert row[1] == 0  # expiration sentinel
+        assert row[2] == "expired_worthless"
+        assert row[3] == "filled"
+        assert abs(row[4] - 14.55) < 1e-9
+
+        log.close()
+    print("timeout_recovery: recovered fill → marked expired with correct realized P&L ✓")
+
+
 def test_reconciliation_surfaces_in_daily_summary():
     """After an assignment alert is persisted, the next daily summary must
     include it in `assignment_alerts`."""
@@ -379,6 +567,11 @@ def main() -> int:
     test_reconciler_idempotent_assignment_alert()
     test_reconciler_skips_premature_disappearance()
     test_reconciler_handles_get_positions_failure_gracefully()
+    test_timeout_recovery_marks_filled_order()
+    test_timeout_recovery_marks_rejected_order()
+    test_timeout_recovery_handles_api_error()
+    test_timeout_recovery_handles_still_pending()
+    test_timeout_recovery_chains_into_expiration_marking()
     test_reconciliation_surfaces_in_daily_summary()
     print("all reconciler tests passed")
     return 0

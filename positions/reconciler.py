@@ -67,10 +67,22 @@ class AssignmentAlert:
 
 
 @dataclass(frozen=True)
+class TimeoutResolution:
+    """One row per timeout-status order the reconciler asked Tradier about.
+    new_status='unknown' means Tradier didn't give us a usable answer (404,
+    network error, malformed response, or still non-terminal) — the log row
+    is left as 'timeout' and we'll retry next cycle."""
+    tradier_order_id: int
+    new_status: str           # filled | partially_filled | rejected | canceled | expired | unknown
+    fill_price: float | None  # populated when new_status involves a fill
+
+
+@dataclass(frozen=True)
 class ReconciliationResult:
     expired_closed: list[int]              # order IDs marked expired this cycle
     assignment_alerts: list[AssignmentAlert]  # new alerts raised this cycle
     skipped_premature: list[int]           # missing-but-not-yet-expired (warning only)
+    timeouts_resolved: list[TimeoutResolution]  # timeouts queried this cycle
 
 
 class PositionReconciler:
@@ -89,12 +101,19 @@ class PositionReconciler:
         self._account_id = account_id
 
     async def reconcile(self, today: date) -> ReconciliationResult:
+        # Phase 1: resolve any timeout-status orders by querying Tradier's
+        # authoritative state. Recovered fills flow into the main pass below
+        # because open_unclosed_positions() filters on final_status IN
+        # ('filled','partially_filled') — without this phase, expired ITM
+        # positions that never confirmed their fill stay dark forever.
+        timeouts_resolved = await self._recover_timeouts()
+
         try:
             tradier_positions = await self._client.get_positions(self._account_id)
         except Exception as e:
             logger.error("get_positions failed during reconciliation: %s — "
                          "skipping cycle to avoid spurious closures", e)
-            return ReconciliationResult([], [], [])
+            return ReconciliationResult([], [], [], timeouts_resolved)
 
         # Split Tradier-reported holdings: option leg symbols vs stock underlyings.
         tradier_option_symbols: set[str] = set()
@@ -195,13 +214,82 @@ class PositionReconciler:
             )
             expired_closed.append(order_id)
 
-        if expired_closed or new_alerts or skipped_premature:
+        if expired_closed or new_alerts or skipped_premature or timeouts_resolved:
             logger.info(
-                "reconciliation cycle: %d expired, %d new alerts, %d premature-skipped",
+                "reconciliation cycle: %d expired, %d new alerts, %d premature-skipped, "
+                "%d timeouts resolved",
                 len(expired_closed), len(new_alerts), len(skipped_premature),
+                len(timeouts_resolved),
             )
         return ReconciliationResult(
             expired_closed=expired_closed,
             assignment_alerts=new_alerts,
             skipped_premature=skipped_premature,
+            timeouts_resolved=timeouts_resolved,
         )
+
+    async def _recover_timeouts(self) -> list[TimeoutResolution]:
+        """Walk every timeout-status row, query Tradier for its real terminal
+        state, update the log. Recovered fills then move into the main
+        reconciliation pass (the expiration check below will close them out
+        if Tradier no longer reports the legs)."""
+        timeout_rows = self._log.timeout_orders()
+        if not timeout_rows:
+            return []
+        resolutions: list[TimeoutResolution] = []
+        now = datetime.now(timezone.utc)
+        for row in timeout_rows:
+            order_id = row["tradier_order_id"]
+            new_status, fill_price = await self._query_terminal_status(order_id)
+            if new_status is None:
+                resolutions.append(TimeoutResolution(order_id, "unknown", None))
+                continue
+            filled_at = now if new_status in {"filled", "partially_filled"} else None
+            self._log.update_terminal_state(
+                order_id=order_id, status=new_status, fill_price=fill_price,
+                filled_at=filled_at,
+                error=None if new_status in {"filled", "partially_filled"} else
+                      f"recovered from timeout: {new_status}",
+            )
+            logger.info(
+                "reconciler: recovered timeout order %s (%s %s exp=%s) → %s "
+                "fill_price=%s",
+                order_id, row["symbol"], row["structure"], row["expiration"],
+                new_status, f"{fill_price:.4f}" if fill_price is not None else "n/a",
+            )
+            resolutions.append(TimeoutResolution(order_id, new_status, fill_price))
+        return resolutions
+
+    async def _query_terminal_status(self, order_id: int) -> tuple[str | None, float | None]:
+        """Returns (status, fill_price). status=None means we couldn't determine
+        (404, network error, or Tradier reports a non-terminal state). Caller
+        should leave the row as 'timeout' and retry next cycle."""
+        try:
+            resp = await self._client.get_order_status(self._account_id, order_id)
+        except Exception as e:
+            logger.warning(
+                "get_order_status failed for order %s: %s — leaving as timeout",
+                order_id, e,
+            )
+            return None, None
+        order_node = resp.get("order") if isinstance(resp, dict) else None
+        if not isinstance(order_node, dict):
+            logger.warning("order %s: malformed get_order_status response, leaving as timeout",
+                           order_id)
+            return None, None
+        status = (order_node.get("status") or "").lower()
+        TERMINAL = {"filled", "partially_filled", "rejected", "canceled", "expired"}
+        if status not in TERMINAL:
+            logger.warning(
+                "order %s: Tradier reports non-terminal status %r — leaving as timeout",
+                order_id, status,
+            )
+            return None, None
+        fill_price = None
+        if status in {"filled", "partially_filled"}:
+            raw = order_node.get("avg_fill_price") or order_node.get("price")
+            try:
+                fill_price = float(raw) if raw is not None else None
+            except (TypeError, ValueError):
+                fill_price = None
+        return status, fill_price

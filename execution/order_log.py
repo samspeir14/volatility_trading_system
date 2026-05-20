@@ -313,6 +313,21 @@ class OrderLog:
         )
         return float(cur.fetchone()[0])
 
+    def timeout_orders(self) -> list[dict]:
+        """Rows with final_status='timeout' — submitted to Tradier but the
+        submission-time poll didn't reach a terminal state. They may have
+        filled / rejected / been canceled in reality; the reconciler queries
+        Tradier to find out."""
+        cur = self._conn.execute(
+            "SELECT tradier_order_id, fingerprint, submitted_at, symbol, expiration, "
+            "direction, structure, submitted_price, legs_json "
+            "FROM submitted_orders "
+            "WHERE final_status = 'timeout' AND closing_order_id IS NULL "
+            "ORDER BY submitted_at"
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
     def open_unclosed_positions(self) -> list[dict]:
         """Rows from submitted_orders that filled successfully and haven't been closed yet."""
         cur = self._conn.execute(
