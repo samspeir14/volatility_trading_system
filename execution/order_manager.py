@@ -645,8 +645,11 @@ class OrderManager:
                     self._settings.account_id, closing_order_id,
                 )
             except Exception as e:
+                # %r not %s: transient aiohttp errors (e.g. ServerDisconnectedError)
+                # have an empty str(), which would log a blank reason. repr keeps
+                # the exception type so a real failure is still diagnosable.
                 logger.warning(
-                    "cancel_order(%s) failed: %s — will retry next cycle",
+                    "cancel_order(%s) failed: %r — will retry next cycle",
                     closing_order_id, e,
                 )
                 continue
