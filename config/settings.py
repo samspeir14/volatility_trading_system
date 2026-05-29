@@ -18,7 +18,12 @@ class Settings:
     env: str
     request_timeout: float = 10.0
     max_retries: int = 3
-    rate_limit_per_min: int = 150
+    # Tradier's hard ceiling is 200 req/min. The per-cycle baseline (option-chain
+    # scan + balances + the reconciler's get_positions and per-open-order
+    # get_order_status calls added since this budget was first set at 150) grew
+    # enough to exhaust the limiter every cycle. 180 restores headroom while
+    # staying clear of the 200 ceiling.
+    rate_limit_per_min: int = 180
     scan_interval_seconds: int = 300
     expiration_window_days: tuple[int, int] = (14, 45)
     historical_lookback_years: int = 3

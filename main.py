@@ -246,6 +246,22 @@ class MainLoop:
         except Exception as e:
             logger.error("stale-close reconcile failed: %s — continuing", e)
 
+        # 2d. Pull chains for any still-open position whose expiration has aged
+        # below the scan's lower window bound. The scan only fetches (3, 60)-day
+        # expirations, so a position at DTE < 3 has no legs in the scan — it
+        # silently drops out of mark-to-market and never reaches the
+        # expiration-proximity exit. Augment the scan in place (after reconcile,
+        # so freshly-expired positions are excluded) and let the single scan
+        # object flow to snapshot, exits, and signals alike.
+        try:
+            needed = self._open_position_expirations()
+            scan = await self._market_data.fetch_missing_position_chains(
+                scan, needed, today,
+            )
+        except Exception as e:
+            logger.error("scan augmentation failed: %s — near-expiry positions "
+                         "may not mark this cycle", e)
+
         # 3. Snapshot
         snapshot = await self._builder.snapshot(scan)
 
@@ -384,6 +400,20 @@ class MainLoop:
                 post_to_slack(self._slack_url, summary)
         except Exception as e:
             logger.error("daily summary failed: %s", e)
+
+    def _open_position_expirations(self) -> dict[str, set[date]]:
+        """symbol → set of expirations for every still-open logged position.
+        Feeds scan augmentation so near-expiry legs (DTE below the scan window)
+        can still be marked. Reads the order log directly; it's the authoritative
+        open-position source and the read is a cheap local query."""
+        out: dict[str, set[date]] = {}
+        for row in self._order_log.open_unclosed_positions():
+            try:
+                exp = date.fromisoformat(row["expiration"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            out.setdefault(row["symbol"], set()).add(exp)
+        return out
 
     def _build_feature_rows(self) -> dict[str, pd.DataFrame]:
         """Build the latest feature row per symbol from the cache."""
