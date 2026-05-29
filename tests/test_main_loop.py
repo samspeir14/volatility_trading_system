@@ -23,6 +23,8 @@ def _mk_loop(*, market_state="open", kill_active_initial=False, snapshot=None,
     scan.snapshots = {}
     scan.__getitem__ = lambda self, k: scan.snapshots.get(k, mock.MagicMock())
     market_data.scan.return_value = scan
+    # Augmentation is a no-op by default: no open positions, scan unchanged.
+    market_data.fetch_missing_position_chains.return_value = scan
 
     if snapshot is None:
         snapshot = mock.MagicMock()
@@ -62,6 +64,7 @@ def _mk_loop(*, market_state="open", kill_active_initial=False, snapshot=None,
 
     store = mock.MagicMock()
     order_log = mock.MagicMock()
+    order_log.open_unclosed_positions.return_value = []
     risk_rejection_log = mock.MagicMock()
     div_history = mock.MagicMock()
     summary_builder = mock.MagicMock()
@@ -191,6 +194,35 @@ def test_run_once_calls_reconcile_pending_closes_before_snapshot():
         f"expected reconcile before snapshot, got {call_order}"
     )
     print("run_once: reconcile_pending_closes called before snapshot")
+
+
+def test_run_once_augments_scan_and_feeds_it_to_snapshot():
+    """Near-expiry positions below the scan window are pulled in by
+    fetch_missing_position_chains, and the augmented scan — not the raw one —
+    must be what snapshot/exits/signals see."""
+    loop, mocks = _mk_loop()
+
+    # open_unclosed_positions drives the expirations we ask the augmenter for.
+    mocks_order_log = loop._order_log
+    mocks_order_log.open_unclosed_positions.return_value = [
+        {"symbol": "AAPL", "expiration": "2026-04-29"},
+        {"symbol": "AAPL", "expiration": "bad-date"},  # skipped, no crash
+    ]
+
+    augmented_scan = mock.MagicMock(name="augmented_scan")
+    mocks["market_data"].fetch_missing_position_chains.return_value = augmented_scan
+
+    asyncio.run(loop.run_once())
+
+    # Augmenter was handed the per-symbol expiration sets from the order log.
+    mocks["market_data"].fetch_missing_position_chains.assert_called_once()
+    call = mocks["market_data"].fetch_missing_position_chains.call_args
+    passed_needed = call.args[1]
+    assert passed_needed == {"AAPL": {date(2026, 4, 29)}}
+
+    # Downstream consumers receive the augmented scan, not the original.
+    assert mocks["builder"].snapshot.call_args.args[0] is augmented_scan
+    print("run_once: augmented scan flows to snapshot")
 
 
 def test_kill_switch_active_still_runs_exits():
