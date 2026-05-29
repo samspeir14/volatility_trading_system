@@ -94,7 +94,7 @@ async def main_async() -> int:
             async with AsyncTradierClient(settings) as client:
                 md = MarketData(client, tickers)
                 t0 = time.monotonic()
-                scan = await md.scan(expiration_window=(3, 60))
+                scan = await md.scan(expiration_window=(3, 45))
                 scan_elapsed = time.monotonic() - t0
                 print(f"scan: {scan.total_contracts} contracts in {scan_elapsed:.1f}s")
 

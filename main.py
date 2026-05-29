@@ -51,6 +51,15 @@ from signals import DivergenceHistory, SignalGenerator
 
 logger = logging.getLogger(__name__)
 
+# Scan only the expirations that can actually produce a trade. The signal
+# generator drops any candidate outside DTE [MIN_DTE, MAX_DTE] = [4, 45]
+# (signals.signal_generator), and a position can't be opened outside that range
+# either — so fetching chains out to 60 DTE was pure waste that bloated the
+# per-cycle option-chain fan-out and exhausted the rate limiter every cycle.
+# The lower bound stays at 3 so positions at DTE 3 still mark off the scan;
+# anything below that is pulled in by fetch_missing_position_chains.
+SCAN_EXPIRATION_WINDOW = (3, 45)
+
 
 @dataclass(frozen=True)
 class CycleResult:
@@ -226,7 +235,7 @@ class MainLoop:
             return CycleResult(market_open=False, timestamp=now)
 
         # 2. Scan
-        scan = await self._market_data.scan(expiration_window=(3, 60))
+        scan = await self._market_data.scan(expiration_window=SCAN_EXPIRATION_WINDOW)
         scan_contracts = scan.total_contracts
         today = scan.fetched_at.date()
 
@@ -247,8 +256,9 @@ class MainLoop:
             logger.error("stale-close reconcile failed: %s — continuing", e)
 
         # 2d. Pull chains for any still-open position whose expiration has aged
-        # below the scan's lower window bound. The scan only fetches (3, 60)-day
-        # expirations, so a position at DTE < 3 has no legs in the scan — it
+        # below the scan's lower window bound. The scan only fetches expirations
+        # in SCAN_EXPIRATION_WINDOW, so a position at DTE < 3 has no legs in it —
+        # it
         # silently drops out of mark-to-market and never reaches the
         # expiration-proximity exit. Augment the scan in place (after reconcile,
         # so freshly-expired positions are excluded) and let the single scan
@@ -617,7 +627,7 @@ async def _run(args) -> int:
             if args.summary_only:
                 logger.info("building + posting daily summary, then exiting (--summary-only)")
                 # Need a snapshot for the summary; do a minimal scan
-                scan = await loop._market_data.scan(expiration_window=(3, 60))
+                scan = await loop._market_data.scan(expiration_window=SCAN_EXPIRATION_WINDOW)
                 snapshot = await loop._builder.snapshot(scan)
                 today = scan.fetched_at.date()
                 await loop.post_daily_summary(today, snapshot)

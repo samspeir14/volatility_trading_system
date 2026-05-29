@@ -36,7 +36,7 @@ def _market_data(get_chain_side_effect):
 
 def test_below_window_expiration_is_fetched_and_merged():
     today = date(2026, 5, 29)
-    near_exp = date(2026, 5, 30)  # DTE 1 — below a (3, 60) window
+    near_exp = date(2026, 5, 30)  # DTE 1 — below a (3, 45) window
     near_leg = _contract("AAPL260530C00150000", "AAPL", near_exp, 150.0, "call")
 
     async def fake_chain(symbol, expiration, greeks=True):
