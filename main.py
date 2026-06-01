@@ -52,12 +52,12 @@ from signals import DivergenceHistory, SignalGenerator
 logger = logging.getLogger(__name__)
 
 # Scan only the expirations that can actually produce a trade. The signal
-# generator drops any candidate outside DTE [MIN_DTE, MAX_DTE] = [4, 45]
-# (signals.signal_generator), and a position can't be opened outside that range
-# either — so fetching chains out to 60 DTE was pure waste that bloated the
-# per-cycle option-chain fan-out and exhausted the rate limiter every cycle.
-# The lower bound stays at 3 so positions at DTE 3 still mark off the scan;
-# anything below that is pulled in by fetch_missing_position_chains.
+# generator won't open a new position below DTE MIN_ENTRY_DTE (7) or above
+# MAX_DTE (45) — so fetching chains out to 60 DTE was pure waste that bloated
+# the per-cycle option-chain fan-out and exhausted the rate limiter every cycle.
+# The lower bound stays at 3 (below MIN_ENTRY_DTE) so already-open positions at
+# DTE 3 still mark off the scan; anything below that is pulled in by
+# fetch_missing_position_chains.
 SCAN_EXPIRATION_WINDOW = (3, 45)
 
 
@@ -538,6 +538,12 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
 
     predictors = _load_predictors(artifact_dir)
 
+    # Index ETFs carry a variance-risk premium (realized < implied), so buying
+    # their straddles bleeds — every SPY long straddle in the live log lost.
+    # Bar them from the BUY side; they stay eligible for the SELL/iron-condor
+    # side that harvests the premium.
+    etf_symbols = frozenset(t.symbol for t in watchlist if t.sector == "etf")
+
     signal_generator = SignalGenerator(
         predictors_by_horizon=predictors,
         history_store=divergence_history,
@@ -546,6 +552,7 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
         earnings_calendar=earnings_calendar,
         earnings_filter_enabled=settings.earnings_filter_enabled,
         earnings_buffer_days=settings.earnings_buffer_days,
+        long_straddle_excluded_symbols=etf_symbols,
     )
 
     risk_manager = RiskManager(
