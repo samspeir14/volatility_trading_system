@@ -23,6 +23,17 @@ TRADING_DAYS_PER_YEAR = 252
 MIN_DTE = 4
 MAX_DTE = 45
 
+# Lowest DTE at which a NEW position may be opened. This is deliberately higher
+# than MIN_DTE (the horizon-mapping floor used by interpolate_horizon, which the
+# exit manager also relies on to mark aged positions). A fresh straddle opened
+# near MIN_DTE gets force-closed by the expiration_proximity exit (dte <= 2)
+# within a session or two — and a weekend collapses the gap entirely (a Friday
+# DTE-4 entry is at DTE 1 the next session). Requiring >= 7 calendar days keeps
+# at least three trading sessions before the proximity exit can fire, so the
+# entry isn't an instant round-trip into bid/ask + theta. Entry-side only; it
+# does NOT gate horizon mapping for existing positions.
+MIN_ENTRY_DTE = 7
+
 
 @dataclass(frozen=True)
 class TradeLeg:
@@ -187,6 +198,7 @@ class SignalGenerator:
         earnings_calendar: EarningsCalendar | None = None,
         earnings_filter_enabled: bool = True,
         earnings_buffer_days: int = 7,
+        long_straddle_excluded_symbols: frozenset[str] | set[str] | None = None,
     ):
         for h in TRAINED_HORIZONS:
             if h not in predictors_by_horizon:
@@ -204,6 +216,11 @@ class SignalGenerator:
         self._earnings = earnings_calendar
         self._earnings_filter_enabled = earnings_filter_enabled
         self._earnings_buffer_days = earnings_buffer_days
+        # Symbols barred from the long-straddle (BUY) side. Index ETFs (SPY/QQQ)
+        # carry a structural variance-risk premium — realized vol sits below
+        # implied, so buying their premium bleeds. They stay eligible for the
+        # SELL (iron condor) side, which harvests that premium.
+        self._no_long_straddle = frozenset(long_straddle_excluded_symbols or ())
 
     def generate(
         self,
@@ -251,6 +268,12 @@ class SignalGenerator:
 
             for expiration, chain in chains_by_exp.items():
                 dte = (expiration - today).days
+                # Entry floor: too close to expiry and the position would just be
+                # force-closed by the expiration_proximity exit before its thesis
+                # can play out (see MIN_ENTRY_DTE). Skip silently — same as an
+                # out-of-window DTE — so these don't clutter the signal log.
+                if dte < MIN_ENTRY_DTE:
+                    continue
                 horizon_pair = interpolate_horizon(dte)
                 if horizon_pair is None:
                     continue
@@ -314,6 +337,26 @@ class SignalGenerator:
                 )
 
             direction = "BUY" if c.divergence > 0 else "SELL"
+
+            # Long-straddle exclusion: never buy premium on the configured
+            # symbols (index ETFs). Demote the BUY to non-actionable but keep it
+            # in all_signals so the skip is auditable. SELL signals pass through.
+            if direction == "BUY" and c.symbol in self._no_long_straddle:
+                all_signals.append(TradeSignal(
+                    symbol=c.symbol, expiration=c.expiration, dte=c.dte,
+                    horizon_lower=c.horizon_lower, horizon_upper=c.horizon_upper,
+                    weight_lower=c.weight_lower, direction=direction,
+                    underlying_price=c.underlying_price, atm_iv=c.atm_iv,
+                    predicted_iv_equivalent=c.predicted_iv_equivalent,
+                    divergence=c.divergence, cross_sectional_z=cs_z,
+                    time_series_z=ts_z, liquidity_score=0.0, legs=[],
+                    is_actionable=False,
+                    diagnostic_notes=(
+                        f"long-straddle excluded for {c.symbol} "
+                        f"(index ETF / variance-risk premium)"
+                    ),
+                ))
+                continue
 
             # Event-suspect: divergences above the cap are almost certainly
             # driven by a known event (earnings, FDA, FOMC, product launch)

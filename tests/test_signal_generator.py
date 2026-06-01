@@ -197,6 +197,110 @@ def test_divergence_cap_demotes_event_suspects():
     print(f"divergence_cap: EVENT demoted with note '{event_sig.diagnostic_notes}'")
 
 
+# ---------- entry-DTE gate + long-straddle exclusion ----------
+
+class _ConstPredictor:
+    """Returns a fixed daily RV for every horizon (annualizes to ~0.19)."""
+    def predict_forward_rv(self, returns_history, X_row=None):
+        return 0.012
+
+
+def _straddle_chain(sym, expiration, atm_iv, underlying=100.0):
+    """ATM call+put plus 1σ OTM wings for one (symbol, expiration), all liquid."""
+    def _c(strike, otype, bid, ask, delta):
+        return OptionContract(
+            symbol=f"{sym}_{otype[0].upper()}{strike:.0f}_{expiration.isoformat()}",
+            underlying=sym, expiration=expiration, strike=strike, option_type=otype,
+            bid=bid, ask=ask, last=(bid + ask) / 2, volume=200, open_interest=1000,
+            delta=delta, gamma=0.01, theta=-0.05, vega=0.2, iv=atm_iv,
+            fetched_at=datetime.now(timezone.utc),
+        )
+    return [
+        _c(100, "call", 1.0, 1.05, 0.5),
+        _c(100, "put", 0.9, 0.95, -0.5),
+        _c(110, "call", 0.20, 0.22, 0.2),   # OTM wing
+        _c(90, "put", 0.20, 0.22, -0.2),    # OTM wing
+    ]
+
+
+def test_entry_dte_gate_skips_near_expiry():
+    """A candidate below MIN_ENTRY_DTE never becomes a signal; one above does.
+    Guards the weekend-compression churn: a fresh straddle opened at DTE 4 would
+    be force-closed by the expiration_proximity exit the next session."""
+    from datetime import datetime
+    from data.market_data import ScanResult, TickerSnapshot
+    from signals import MIN_ENTRY_DTE
+
+    # scan.fetched_at below is 2026-06-01, which generate() uses as "today".
+    near = date(2026, 6, 5)    # DTE 4  (< MIN_ENTRY_DTE)
+    far = date(2026, 6, 12)    # DTE 11 (>= MIN_ENTRY_DTE)
+    contracts = _straddle_chain("X", near, 0.20) + _straddle_chain("X", far, 0.20)
+    snap = TickerSnapshot(symbol="X", sector="tech",
+                          underlying={"symbol": "X", "last": 100.0}, contracts=contracts)
+    scan = ScanResult(fetched_at=datetime(2026, 6, 1, 16, 0, tzinfo=timezone.utc),
+                      snapshots={"X": snap})
+
+    predictors = {h: _ConstPredictor() for h in (5, 10, 21)}
+    feature_rows = {"X": pd.DataFrame({"a": [0.0]}, index=[date(2026, 5, 29)])}
+    returns_by_symbol = {"X": pd.Series([0.001] * 100)}
+
+    gen = SignalGenerator(predictors_by_horizon=predictors, history_store=None,
+                          cross_sectional_z_threshold=1.0)
+    _, all_signals = gen.generate(scan, feature_rows, returns_by_symbol, top_n=10)
+
+    dtes = sorted({s.dte for s in all_signals})
+    assert all(s.dte >= MIN_ENTRY_DTE for s in all_signals), f"got DTEs {dtes}"
+    assert any(s.dte == 11 for s in all_signals), f"expected DTE-11 signal, got {dtes}"
+    assert not any(s.dte == 4 for s in all_signals), f"DTE-4 leaked through gate: {dtes}"
+    print(f"entry_dte_gate: DTE-4 skipped, DTE-11 kept (MIN_ENTRY_DTE={MIN_ENTRY_DTE})")
+
+
+def test_long_straddle_exclusion_demotes_etf_buy_only():
+    """An excluded symbol's BUY straddle is demoted; an identical non-excluded
+    symbol stays actionable. The exclusion is BUY-side only."""
+    from datetime import datetime
+    from data.market_data import ScanResult, TickerSnapshot
+
+    # scan.fetched_at below is 2026-06-01, which generate() uses as "today".
+    exp = date(2026, 6, 12)  # DTE 11
+    # SPY + CTRL are BUY outliers (low IV → predicted >> implied); fillers sit
+    # near the predicted IV so the cross-sectional z separates the outliers.
+    rows = [("SPY", 0.10, "etf"), ("CTRL", 0.10, "tech"),
+            ("A", 0.19, "tech"), ("B", 0.19, "tech"),
+            ("C", 0.19, "tech"), ("D", 0.19, "tech")]
+    snapshots = {
+        sym: TickerSnapshot(symbol=sym, sector=sector,
+                            underlying={"symbol": sym, "last": 100.0},
+                            contracts=_straddle_chain(sym, exp, iv))
+        for sym, iv, sector in rows
+    }
+    scan = ScanResult(fetched_at=datetime(2026, 6, 1, 16, 0, tzinfo=timezone.utc),
+                      snapshots=snapshots)
+
+    predictors = {h: _ConstPredictor() for h in (5, 10, 21)}
+    feature_rows = {sym: pd.DataFrame({"a": [0.0]}, index=[date(2026, 5, 29)]) for sym in snapshots}
+    returns_by_symbol = {sym: pd.Series([0.001] * 100) for sym in snapshots}
+
+    gen = SignalGenerator(predictors_by_horizon=predictors, history_store=None,
+                          cross_sectional_z_threshold=1.0,
+                          long_straddle_excluded_symbols={"SPY"})
+    actionable, all_signals = gen.generate(scan, feature_rows, returns_by_symbol, top_n=10)
+    by = {s.symbol: s for s in all_signals}
+
+    # SPY BUY is demoted purely by the exclusion (note says so), not by z.
+    assert "SPY" in by, "SPY signal missing"
+    assert by["SPY"].direction == "BUY"
+    assert not by["SPY"].is_actionable, "excluded SPY BUY should be demoted"
+    assert "excluded" in by["SPY"].diagnostic_notes
+    assert "SPY" not in [s.symbol for s in actionable]
+
+    # CTRL has the identical setup but isn't excluded → stays actionable.
+    assert by["CTRL"].direction == "BUY"
+    assert by["CTRL"].is_actionable, f"CTRL should be actionable: {by['CTRL'].diagnostic_notes}"
+    assert len(by["CTRL"].legs) == 2
+    print("long_straddle_exclusion: SPY BUY demoted, CTRL BUY actionable")
+
+
 # ---------- live integration ----------
 
 async def _bootstrap_predictors(
@@ -364,6 +468,8 @@ def main() -> int:
     test_find_atm_iv_returns_none_when_one_side_missing()
     test_composite_liquidity()
     test_divergence_cap_demotes_event_suspects()
+    test_entry_dte_gate_skips_near_expiry()
+    test_long_straddle_exclusion_demotes_etf_buy_only()
 
     settings = load_settings()
     if settings.env != "sandbox":
