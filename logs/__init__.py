@@ -4,6 +4,7 @@ from logs.daily_summary import (
     DailySummaryBuilder,
     EarningsStraddlingPosition,
     PendingCloseSummary,
+    PositionPnlGroup,
     StaleCloseAlertSummary,
 )
 from logs.logger import setup_logging
@@ -15,6 +16,7 @@ __all__ = [
     "DailySummaryBuilder",
     "EarningsStraddlingPosition",
     "PendingCloseSummary",
+    "PositionPnlGroup",
     "StaleCloseAlertSummary",
     "format_summary",
     "post_to_slack",

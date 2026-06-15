@@ -89,6 +89,17 @@ CREATE TABLE IF NOT EXISTS stale_close_alerts (
 );
 """
 
+# One row per (open position, day) holding its lifetime since-entry P&L as of
+# that day's EOD summary. Day-over-day diff yields each position's daily P&L.
+CREATE_POSITION_PNL_SNAPSHOTS_SQL = """
+CREATE TABLE IF NOT EXISTS position_pnl_snapshots (
+    opening_order_id INTEGER NOT NULL,
+    as_of_date TEXT NOT NULL,
+    lifetime_pnl REAL NOT NULL,
+    PRIMARY KEY (opening_order_id, as_of_date)
+);
+"""
+
 EXPIRATION_SENTINEL_ORDER_ID = 0  # closing_order_id used for auto-expired positions
 
 CREATE_INDEXES_SQL = [
@@ -121,6 +132,7 @@ class OrderLog:
         self._conn.execute(CREATE_ASSIGNMENT_ALERTS_SQL)
         self._conn.execute(CREATE_CLOSE_ATTEMPTS_SQL)
         self._conn.execute(CREATE_STALE_CLOSE_ALERTS_SQL)
+        self._conn.execute(CREATE_POSITION_PNL_SNAPSHOTS_SQL)
         self._migrate_close_columns()
         for sql in CREATE_INDEXES_SQL:
             self._conn.execute(sql)
@@ -494,6 +506,35 @@ class OrderLog:
         )
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def record_position_pnl_snapshot(
+        self, opening_order_id: int, as_of_date: date, lifetime_pnl: float,
+    ) -> None:
+        """Persist a position's lifetime since-entry P&L as of `as_of_date`.
+        Idempotent per (position, day) so re-running the EOD summary overwrites
+        rather than duplicates."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO position_pnl_snapshots "
+            "(opening_order_id, as_of_date, lifetime_pnl) VALUES (?, ?, ?)",
+            (opening_order_id, as_of_date.isoformat(), lifetime_pnl),
+        )
+        self._conn.commit()
+
+    def previous_position_pnl(
+        self, opening_order_id: int, before_date: date,
+    ) -> float | None:
+        """Most recent recorded lifetime P&L for this position strictly before
+        `before_date` (the prior trading day, skipping weekend/holiday gaps).
+        None if we've never recorded one — caller treats today's lifetime P&L
+        as the daily P&L (position is new since the last snapshot)."""
+        cur = self._conn.execute(
+            "SELECT lifetime_pnl FROM position_pnl_snapshots "
+            "WHERE opening_order_id = ? AND as_of_date < ? "
+            "ORDER BY as_of_date DESC LIMIT 1",
+            (opening_order_id, before_date.isoformat()),
+        )
+        row = cur.fetchone()
+        return float(row[0]) if row is not None else None
 
     def open_unclosed_positions(self) -> list[dict]:
         """Rows from submitted_orders that filled successfully and haven't been closed yet."""
