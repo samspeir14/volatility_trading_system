@@ -360,6 +360,50 @@ def test_max_retries_alert_idempotent():
     print("submit_close max_retries: idempotent alert ✓")
 
 
+def test_stale_close_alert_auto_resolves_when_position_closes():
+    """An alert must disappear once its opening order is closed by any path —
+    here expiration settled by the reconciler (sentinel closing_order_id=0).
+    Regression: near-expiry straddles that exhaust the close-retry cap and then
+    expire were re-emitting their stale alert in every daily summary forever."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "log.db")
+        pos = _mk_long_straddle_position(order_id=6403)
+        _seed_open_order(log, pos)
+
+        log.record_stale_close_alert(
+            opening_order_id=6403, symbol="AAPL", expiration=date(2026, 5, 15),
+            structure="straddle", attempts=3, last_exit_trigger="expiration_proximity",
+            detected_at=datetime.now(timezone.utc),
+        )
+        # Still open → alert is live.
+        assert len(log.stale_close_alerts_active()) == 1
+
+        # Reconciler settles it at expiration (sentinel closing_order_id=0).
+        log.record_expiration(
+            opening_order_id=6403, expired_at=datetime.now(timezone.utc),
+            realized_pnl=-408.0, exit_trigger="expired",
+        )
+        # Closed → alert auto-resolves, even though the row still exists.
+        assert log.stale_close_alerts_active() == []
+        log.close()
+    print("stale_close_alert auto-resolves on position close ✓")
+
+
+def test_stale_close_alert_orphan_row_still_surfaces():
+    """Fail-safe: an alert whose opening order row is missing must still show
+    (the LEFT JOIN keeps it) rather than being silently dropped."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "log.db")
+        log.record_stale_close_alert(
+            opening_order_id=999999, symbol="ZZZ", expiration=date(2026, 5, 15),
+            structure="straddle", attempts=3, last_exit_trigger="stop_loss",
+            detected_at=datetime.now(timezone.utc),
+        )
+        assert len(log.stale_close_alerts_active()) == 1
+        log.close()
+    print("stale_close_alert orphan row surfaces ✓")
+
+
 # ---------- Scenario 5: prevent duplicate submissions while pending ----------
 
 def test_submit_close_skips_when_pending_attempt_exists():
@@ -456,6 +500,8 @@ def main() -> int:
     test_reconcile_handles_terminal_failed_states()
     test_max_retries_exceeded_logs_critical_and_alerts()
     test_max_retries_alert_idempotent()
+    test_stale_close_alert_auto_resolves_when_position_closes()
+    test_stale_close_alert_orphan_row_still_surfaces()
     test_submit_close_skips_when_pending_attempt_exists()
     test_reconcile_cancel_race_reveals_fill()
     test_reconcile_leaves_pending_on_cancel_network_error()
