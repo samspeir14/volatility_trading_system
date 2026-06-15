@@ -104,6 +104,15 @@ def format_summary(summary: DailySummary) -> str:
                 f"@ ${p.submitted_price:.2f} submitted {p.submitted_at.isoformat()}"
             )
 
+    if summary.position_pnl_breakdown:
+        lines.append(f"Per-position P&L ({len(summary.position_pnl_breakdown)} open):")
+        for g in summary.position_pnl_breakdown:
+            count_str = f" ×{g.count}" if g.count > 1 else ""
+            lines.append(
+                f"  • {g.symbol} {g.structure} exp {g.expiration.isoformat()}{count_str} "
+                f"— total ${g.total_pnl:+,.2f} / today ${g.daily_pnl:+,.2f}"
+            )
+
     return "\n".join(lines)
 
 

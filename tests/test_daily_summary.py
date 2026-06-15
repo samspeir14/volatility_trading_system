@@ -363,6 +363,96 @@ def test_summary_surfaces_stale_close_alerts_and_pending():
     print("daily_summary: stale_close_alerts + pending_closes surfaced ✓")
 
 
+def _mk_pos(order_id, symbol, structure, expiration, direction="BUY"):
+    leg = TradeLeg(100.0, "call", "buy", 1, f"{symbol}260619C00100000")
+    return OpenPosition(
+        tradier_order_id=order_id, symbol=symbol, expiration=expiration,
+        direction=direction, structure=structure, legs=[leg], entry_premium=4.0,
+        entry_atm_iv=0.27, entry_predicted_iv=0.42, entry_divergence=0.15,
+        entry_horizon_lower=10, entry_horizon_upper=21, entry_weight_lower=0.5,
+        submitted_at=datetime(2026, 5, 1, 16, 0, tzinfo=timezone.utc),
+    )
+
+
+def _mk_mark(pos, pnl):
+    return PositionMark(
+        position=pos, current_legs=[], close_cash_flow=0.0, cost_to_close=0.0,
+        pnl_dollars=pnl, pnl_pct_of_entry_premium=0.0, pnl_pct_of_max=float("nan"),
+        delta=0, gamma=0, theta=0, vega=0, dte=10,
+    )
+
+
+def test_position_pnl_breakdown_groups_and_daily_delta():
+    """Identical open positions group into one row; daily P&L is the change
+    since the prior EOD snapshot, total P&L is lifetime since entry."""
+    with tempfile.TemporaryDirectory() as tmp:
+        order_log = OrderLog(Path(tmp) / "orders.db")
+        div_history = DivergenceHistory(Path(tmp) / "div.db")
+        risk_log = RiskRejectionLog(Path(tmp) / "risk.db")
+        kill_switch = DailyKillSwitch(Path(tmp) / "ks.db")
+        builder = DailySummaryBuilder(order_log, div_history, risk_log, kill_switch)
+
+        exp = date(2026, 6, 19)
+        nvda_a = _mk_pos(2001, "NVDA", "iron_condor", exp, direction="SELL")
+        nvda_b = _mk_pos(2002, "NVDA", "iron_condor", exp, direction="SELL")
+        tsla = _mk_pos(2003, "TSLA", "straddle", date(2026, 6, 26))
+
+        # Day 1: no prior snapshots → daily == total.
+        snap1 = _mk_snapshot()
+        snap1.open_marks = [_mk_mark(nvda_a, 100.0), _mk_mark(nvda_b, 200.0),
+                            _mk_mark(tsla, -50.0)]
+        s1 = builder.build(date(2026, 6, 15), snap1)
+
+        by_sym = {g.symbol: g for g in s1.position_pnl_breakdown}
+        assert by_sym["NVDA"].count == 2
+        assert by_sym["NVDA"].total_pnl == 300.0
+        assert by_sym["NVDA"].daily_pnl == 300.0   # first observation
+        assert by_sym["TSLA"].count == 1
+        assert by_sym["TSLA"].daily_pnl == -50.0
+        # Sorted by absolute total P&L desc → NVDA (300) before TSLA (50).
+        assert s1.position_pnl_breakdown[0].symbol == "NVDA"
+
+        # Day 2: marks move; daily = today_lifetime − yesterday_lifetime.
+        snap2 = _mk_snapshot()
+        snap2.open_marks = [_mk_mark(nvda_a, 150.0), _mk_mark(nvda_b, 250.0),
+                            _mk_mark(tsla, -80.0)]
+        s2 = builder.build(date(2026, 6, 16), snap2)
+
+        by_sym2 = {g.symbol: g for g in s2.position_pnl_breakdown}
+        assert by_sym2["NVDA"].total_pnl == 400.0
+        assert by_sym2["NVDA"].daily_pnl == 100.0  # (150-100)+(250-200)
+        assert by_sym2["TSLA"].total_pnl == -80.0
+        assert by_sym2["TSLA"].daily_pnl == -30.0  # -80-(-50)
+
+        for c in (order_log, div_history, risk_log, kill_switch):
+            c.close()
+    print("daily_summary: per-position P&L grouping + daily delta ✓")
+
+
+def test_position_pnl_breakdown_skips_nan_marks():
+    """A position with a NaN mark (missing legs) must not appear or be recorded."""
+    with tempfile.TemporaryDirectory() as tmp:
+        order_log = OrderLog(Path(tmp) / "orders.db")
+        div_history = DivergenceHistory(Path(tmp) / "div.db")
+        risk_log = RiskRejectionLog(Path(tmp) / "risk.db")
+        kill_switch = DailyKillSwitch(Path(tmp) / "ks.db")
+        builder = DailySummaryBuilder(order_log, div_history, risk_log, kill_switch)
+
+        good = _mk_pos(3001, "AAPL", "straddle", date(2026, 6, 19))
+        broken = _mk_pos(3002, "MSFT", "straddle", date(2026, 6, 19))
+        snap = _mk_snapshot()
+        snap.open_marks = [_mk_mark(good, 75.0), _mk_mark(broken, float("nan"))]
+        summary = builder.build(date(2026, 6, 15), snap)
+
+        syms = {g.symbol for g in summary.position_pnl_breakdown}
+        assert syms == {"AAPL"}
+        assert order_log.previous_position_pnl(3002, date(2026, 6, 16)) is None
+
+        for c in (order_log, div_history, risk_log, kill_switch):
+            c.close()
+    print("daily_summary: NaN marks skipped ✓")
+
+
 def main() -> int:
     test_summary_with_no_activity()
     test_summary_with_filled_positions()
@@ -370,6 +460,8 @@ def main() -> int:
     test_summary_rejection_categories()
     test_summary_pnl_matches_equity_delta()
     test_summary_surfaces_stale_close_alerts_and_pending()
+    test_position_pnl_breakdown_groups_and_daily_delta()
+    test_position_pnl_breakdown_skips_nan_marks()
     print("all daily_summary tests passed")
     return 0
 

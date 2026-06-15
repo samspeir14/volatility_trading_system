@@ -4,6 +4,7 @@ from datetime import date, datetime, timezone
 from logs import (
     DailySummary,
     PendingCloseSummary,
+    PositionPnlGroup,
     StaleCloseAlertSummary,
     format_summary,
 )
@@ -125,6 +126,27 @@ def test_format_summary_pending_closes():
     print("format_summary: pending_closes rendered")
 
 
+def test_format_summary_position_pnl_breakdown():
+    groups = [
+        PositionPnlGroup(
+            symbol="NVDA", structure="iron_condor", expiration=date(2026, 6, 19),
+            count=3, total_pnl=420.0, daily_pnl=85.0,
+        ),
+        PositionPnlGroup(
+            symbol="TSLA", structure="straddle", expiration=date(2026, 6, 26),
+            count=1, total_pnl=-150.0, daily_pnl=-30.0,
+        ),
+    ]
+    text = format_summary(_mk_summary(position_pnl_breakdown=groups))
+    assert "Per-position P&L (2 open):" in text
+    # Grouped row shows the ×count multiplier and both P&L figures.
+    assert "NVDA iron_condor exp 2026-06-19 ×3 — total $+420.00 / today $+85.00" in text
+    # Singleton row omits the multiplier.
+    assert "TSLA straddle exp 2026-06-26 — total $-150.00 / today $-30.00" in text
+    assert "×1" not in text
+    print("format_summary: per-position P&L breakdown rendered")
+
+
 def main() -> int:
     test_format_summary_basic()
     test_format_summary_kill_switch_active()
@@ -134,6 +156,7 @@ def main() -> int:
     test_format_summary_negative_pnl()
     test_format_summary_stale_close_alert()
     test_format_summary_pending_closes()
+    test_format_summary_position_pnl_breakdown()
     print("all slack_formatter tests passed")
     return 0
 

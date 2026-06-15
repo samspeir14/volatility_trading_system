@@ -65,6 +65,21 @@ class PendingCloseSummary:
 
 
 @dataclass(frozen=True)
+class PositionPnlGroup:
+    """Per-position P&L breakdown line. Identical open positions (same symbol,
+    structure, and expiration — e.g. several NVDA iron condors expiring the
+    same day) are collapsed into one row with `count` legs-of-the-same-trade.
+    total_pnl is lifetime since-entry; daily_pnl is the change since the prior
+    EOD snapshot."""
+    symbol: str
+    structure: str
+    expiration: date
+    count: int
+    total_pnl: float
+    daily_pnl: float
+
+
+@dataclass(frozen=True)
 class DailySummary:
     date: date
     starting_equity: float
@@ -84,6 +99,7 @@ class DailySummary:
     assignment_alerts: list[AssignmentAlertSummary] = field(default_factory=list)
     stale_close_alerts: list[StaleCloseAlertSummary] = field(default_factory=list)
     pending_closes: list[PendingCloseSummary] = field(default_factory=list)
+    position_pnl_breakdown: list[PositionPnlGroup] = field(default_factory=list)
 
     @property
     def total_pnl(self) -> float:
@@ -157,6 +173,7 @@ class DailySummaryBuilder:
         assignment_alerts = self._load_assignment_alerts()
         stale_close_alerts = self._load_stale_close_alerts()
         pending_closes = self._load_pending_closes()
+        position_pnl_breakdown = self._compute_position_pnl_breakdown(today, snapshot)
 
         summary = DailySummary(
             date=today,
@@ -177,9 +194,46 @@ class DailySummaryBuilder:
             assignment_alerts=assignment_alerts,
             stale_close_alerts=stale_close_alerts,
             pending_closes=pending_closes,
+            position_pnl_breakdown=position_pnl_breakdown,
         )
         _check_reconciliation(summary)
         return summary
+
+    def _compute_position_pnl_breakdown(
+        self, today: date, snapshot: "PortfolioSnapshot"
+    ) -> list[PositionPnlGroup]:
+        """Per-position total (since-entry) and daily (since prior EOD) P&L for
+        the open book, grouping identical trades by (symbol, structure,
+        expiration). Records today's lifetime P&L per position so tomorrow can
+        diff against it."""
+        # Aggregate by trade identity. Each value: [count, total_pnl, daily_pnl].
+        groups: dict[tuple[str, str, date], list[float]] = {}
+        for mark in snapshot.open_marks:
+            lifetime = mark.pnl_dollars
+            if lifetime != lifetime:  # NaN mark (missing legs) — skip
+                continue
+            pos = mark.position
+            order_id = pos.tradier_order_id
+            prior = self._order_log.previous_position_pnl(order_id, today)
+            daily = lifetime if prior is None else lifetime - prior
+            self._order_log.record_position_pnl_snapshot(order_id, today, lifetime)
+
+            key = (pos.symbol, pos.structure, pos.expiration)
+            agg = groups.setdefault(key, [0.0, 0.0, 0.0])
+            agg[0] += 1
+            agg[1] += lifetime
+            agg[2] += daily
+
+        out = [
+            PositionPnlGroup(
+                symbol=sym, structure=struct, expiration=exp,
+                count=int(agg[0]), total_pnl=agg[1], daily_pnl=agg[2],
+            )
+            for (sym, struct, exp), agg in groups.items()
+        ]
+        # Biggest absolute total P&L first — surfaces the most material positions.
+        out.sort(key=lambda g: abs(g.total_pnl), reverse=True)
+        return out
 
     def _load_stale_close_alerts(self) -> list[StaleCloseAlertSummary]:
         out: list[StaleCloseAlertSummary] = []
