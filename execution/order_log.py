@@ -476,12 +476,21 @@ class OrderLog:
         return cur.rowcount > 0
 
     def stale_close_alerts_active(self) -> list[dict]:
-        """All recorded stale-close alerts. Once a position is manually closed
-        or retried, the operator can DELETE the row to dismiss it."""
+        """Stale-close alerts for positions that are STILL open. An alert is
+        auto-resolved once its opening order gets a closing_order_id by any
+        path — a real close, a between-cycle fill, or expiration settled by the
+        reconciler (sentinel id=0). The LEFT JOIN keeps any orphan alert whose
+        opening order row is missing (fail-safe: surface, don't silently drop).
+        Matches the `closing_order_id IS NULL` convention in
+        open_unclosed_positions()."""
         cur = self._conn.execute(
-            "SELECT opening_order_id, symbol, expiration, structure, attempts, "
-            "last_exit_trigger, detected_at FROM stale_close_alerts "
-            "ORDER BY detected_at DESC"
+            "SELECT sca.opening_order_id, sca.symbol, sca.expiration, "
+            "sca.structure, sca.attempts, sca.last_exit_trigger, sca.detected_at "
+            "FROM stale_close_alerts sca "
+            "LEFT JOIN submitted_orders so "
+            "ON so.tradier_order_id = sca.opening_order_id "
+            "WHERE so.closing_order_id IS NULL "
+            "ORDER BY sca.detected_at DESC"
         )
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
