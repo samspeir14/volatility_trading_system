@@ -1,7 +1,7 @@
 """Unit tests for MainLoop.run_once with all components mocked."""
 import asyncio
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest import mock
 
 import pandas as pd
@@ -61,6 +61,7 @@ def _mk_loop(*, market_state="open", kill_active_initial=False, snapshot=None,
     feature_pipeline = mock.MagicMock()
     feature_pipeline._watchlist = []
     feature_pipeline.build_features.return_value = pd.DataFrame()
+    feature_pipeline.ensure_data = mock.AsyncMock()
 
     store = mock.MagicMock()
     order_log = mock.MagicMock()
@@ -100,7 +101,7 @@ def _mk_loop(*, market_state="open", kill_active_initial=False, snapshot=None,
         "kill_switch": kill_switch, "sig_gen": sig_gen, "risk_manager": risk_manager,
         "order_manager": order_manager, "exit_manager": exit_manager,
         "risk_rejection_log": risk_rejection_log, "summary_builder": summary_builder,
-        "position_reconciler": position_reconciler,
+        "position_reconciler": position_reconciler, "feature_pipeline": feature_pipeline,
     }
 
 
@@ -253,6 +254,33 @@ def test_kill_switch_active_still_runs_exits():
     print("kill_switch_active + exits: exits ran, signal gen skipped")
 
 
+def test_cycle_refreshes_daily_bars_through_yesterday():
+    loop, mocks = _mk_loop()
+    mocks["feature_pipeline"].ensure_data = mock.AsyncMock()
+    result = asyncio.run(loop.run_once())
+    assert result.market_open is True
+    mocks["feature_pipeline"].ensure_data.assert_awaited_once()
+    end = mocks["feature_pipeline"].ensure_data.await_args.kwargs["end"]
+    # run_once derives "yesterday" from the UTC clock (cycles only execute
+    # during US market hours, when the UTC and Eastern dates agree).
+    utc_today = datetime.now(timezone.utc).date()
+    assert end == main_module._last_weekday(utc_today - timedelta(days=1))
+    assert end.weekday() < 5, f"end must be a weekday, got {end}"
+    print(f"bar refresh: ensure_data awaited once with end={end}")
+
+
+def test_cycle_survives_bar_refresh_failure():
+    loop, mocks = _mk_loop()
+    mocks["feature_pipeline"].ensure_data = mock.AsyncMock(
+        side_effect=RuntimeError("api down")
+    )
+    result = asyncio.run(loop.run_once())
+    assert result.market_open is True
+    assert result.error is None
+    mocks["sig_gen"].generate.assert_called_once()
+    print("bar refresh fail-soft: cycle completed on cached bars")
+
+
 def main() -> int:
     test_market_closed_returns_early()
     test_normal_cycle_with_no_signals()
@@ -261,6 +289,8 @@ def main() -> int:
     test_kill_switch_active_skips_signal_generation()
     test_run_once_calls_reconcile_pending_closes_before_snapshot()
     test_kill_switch_active_still_runs_exits()
+    test_cycle_refreshes_daily_bars_through_yesterday()
+    test_cycle_survives_bar_refresh_failure()
     print("all main_loop tests passed")
     return 0
 
