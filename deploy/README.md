@@ -112,6 +112,7 @@ The JSON also carries a `diagnostics_by_horizon` block (informational only — r
 | No trades placed | Risk gates may be rejecting; check `data/cache/risk_state.db` |
 | Cycle errors every iteration | Tradier API issue — check rate limit and recent commits |
 | Slack posts not arriving | Verify webhook URL with `--summary-only`; check log for 4xx responses |
+| Predictions look frozen / stale signals | `SELECT MAX(date) FROM daily_bars` in `data/cache/market_data.db` should be yesterday. The cycle (step 1b) and the retrain both refresh via `ensure_data`; grep the journal for `daily bar refresh failed`. The routing JSON's `bars_through` field records what the last retrain actually trained on |
 | Position not closing on exit signal | Confirm `EXECUTE_EXITS` is NOT set to "NO" anywhere; the prod loop always runs live |
 
 ## 8. Account safety

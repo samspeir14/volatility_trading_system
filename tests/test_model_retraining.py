@@ -8,6 +8,7 @@ RUN_SLOW_TESTS=1.
 Replaces tests/test_xgb_hyperparam_tuning.py (XGBoost-only). The cron entry
 in deploy/README.md points here now.
 """
+import asyncio
 import json
 import os
 import sys
@@ -18,7 +19,7 @@ from pathlib import Path
 import pandas as pd
 
 from config import load_settings, load_watchlist
-from data import HistoricalStore, compute_log_returns
+from data import AsyncTradierClient, HistoricalStore, compute_log_returns
 from features import FeaturePipeline
 from model import (
     GARCHBaseline,
@@ -155,6 +156,31 @@ def main() -> int:
             store, tickers,
             garch_min_history=100, garch_refit_every=21,
         )
+
+        # Refresh daily bars before training — build_features is read-only, so
+        # without this the retrain silently trains on whatever the cache last
+        # saw (frozen at 2026-04-24 for two months before this step existed).
+        # End is the last weekday strictly before today so a mid-session manual
+        # run can never cache a partial bar. Fail-soft: a transient API outage
+        # shouldn't kill the weekly cron, but the staleness must be loud —
+        # bars_through goes to stdout and the routing JSON either way.
+        async def _refresh_bars() -> None:
+            async with AsyncTradierClient(settings) as client:
+                await pipeline.ensure_data(
+                    client, end=_last_weekday(date.today() - timedelta(days=1))
+                )
+
+        try:
+            asyncio.run(_refresh_bars())
+        except Exception as e:
+            print(f"WARNING: daily bar refresh failed ({e}); "
+                  f"training on cached bars", file=sys.stderr)
+        bars_through = max(
+            (d for d in (store.latest_date(s) for s in symbols) if d is not None),
+            default=None,
+        )
+        print(f"daily bars through: {bars_through}")
+
         t0 = time.monotonic()
         feature_df = pipeline.build_features(start, end)
         feat_elapsed = time.monotonic() - t0
@@ -250,6 +276,7 @@ def main() -> int:
         # reads r2_by_horizon and ignores unknown keys, so routing is unaffected.
         payload = {
             "trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "bars_through": bars_through.isoformat() if bars_through else None,
             "train_window_days": train_window_days,
             "refit_every": refit_every,
             "n_tickers": len(tickers),

@@ -234,6 +234,21 @@ class MainLoop:
             logger.info("market state=%s, skipping cycle", state)
             return CycleResult(market_open=False, timestamp=now)
 
+        # 1b. Refresh daily bars through the last completed trading day.
+        # ensure_data is incremental (latest cached date + 1 forward), so this
+        # is ~zero API calls when the cache is current and self-heals any gap
+        # after an outage. End is the last weekday strictly BEFORE today:
+        # cycles only run while the market is open, so today's bar is partial,
+        # and caching it would freeze it permanently (INSERT OR REPLACE is
+        # never revisited once latest_date moves past it).
+        try:
+            bars_end = _last_weekday(now.date() - timedelta(days=1))
+            await self._feature_pipeline.ensure_data(self._client, end=bars_end)
+        except Exception as e:
+            logger.warning(
+                "daily bar refresh failed: %s — continuing on cached bars", e
+            )
+
         # 2. Scan
         scan = await self._market_data.scan(expiration_window=SCAN_EXPIRATION_WINDOW)
         scan_contracts = scan.total_contracts
