@@ -102,6 +102,8 @@ The `&&` between retraining and restart is load-bearing: if the retrain crashes 
 
 If the JSON is missing, malformed, or partial, `_load_routing_r2` falls back to a conservative hardcoded table — the bot stays bootable while a retrain is pending. Watch for `latest_retrain_r2.json missing` warnings in the journal as a signal that the cron silently failed.
 
+The JSON also carries a `diagnostics_by_horizon` block (informational only — routing ignores it): per-model **within-ticker R²** (per-symbol vol levels stripped out, so it scores timing skill rather than "TSLA is more volatile than KO") and **R² vs a lagged-RV random walk** ("next h days = last h days" — positive means the model beats naive persistence, which is the minimum bar for beating implied vol). Pooled `r2_by_horizon` will read higher than both; that gap is cross-sectional level credit, not tradeable skill.
+
 ## 7. Troubleshooting
 
 | Symptom | Check |

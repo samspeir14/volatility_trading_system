@@ -22,9 +22,12 @@ from data import HistoricalStore, compute_log_returns
 from features import FeaturePipeline
 from model import (
     GARCHBaseline,
+    lagged_rv_forecast,
+    r2_vs_baseline,
     regression_metrics,
     walk_forward_evaluate_lightgbm,
     walk_forward_evaluate_xgboost,
+    within_ticker_r2,
 )
 
 
@@ -38,6 +41,34 @@ def _last_weekday(d: date) -> date:
     return d
 
 
+def compute_horizon_diagnostics(
+    frames: dict[str, pd.DataFrame],
+    returns_by_symbol: dict,
+    horizon: int,
+) -> dict:
+    """Within-ticker R² and OOS R² vs a lagged-RV random walk for each model's
+    (symbol, date)-indexed predicted/actual frame. The naive baseline is scored
+    on the LGBM frame's index (all model frames share the same OOS rows)."""
+    naive = lagged_rv_forecast(returns_by_symbol, horizon)
+    ref = frames["lgbm"]
+    return {
+        "within_r2": {
+            name: within_ticker_r2(df["actual"], df["predicted"])
+            for name, df in frames.items()
+        },
+        "r2_vs_lagged_rv": {
+            name: r2_vs_baseline(df["actual"], df["predicted"], naive.reindex(df.index))
+            for name, df in frames.items()
+        },
+        "lagged_rv_pooled_r2": regression_metrics(
+            ref["actual"], naive.reindex(ref.index)
+        )["r2"],
+        "lagged_rv_within_r2": within_ticker_r2(
+            ref["actual"], naive.reindex(ref.index)
+        ),
+    }
+
+
 def evaluate_horizon(
     horizon: int,
     feature_df: pd.DataFrame,
@@ -45,10 +76,13 @@ def evaluate_horizon(
     train_window_days: int,
     refit_every: int,
     symbols: list[str],
-) -> tuple[dict, dict, dict, float, float]:
+) -> tuple[dict, dict, dict, dict, float, float]:
     """Run LightGBM (with tuning) + XGBoost (with tuning) + GARCH walk-forward
     at a single horizon. Returns (garch_metrics, lgbm_metrics, xgb_metrics,
-    lgbm_elapsed, xgb_elapsed)."""
+    diagnostics, lgbm_elapsed, xgb_elapsed). `diagnostics` holds within-ticker
+    R² (cross-sectional vol-level differences stripped) and OOS R² vs a
+    lagged-RV random-walk forecast — the two views that pooled R² can't
+    separate: level knowledge vs timing skill."""
     print(f"\n--- horizon={horizon} ---")
 
     t0 = time.monotonic()
@@ -79,13 +113,20 @@ def evaluate_horizon(
     for sym in symbols:
         eval_df = baseline.walk_forward_evaluate(returns_by_symbol[sym], horizons=(horizon,))
         eval_df = eval_df.loc[eval_df.index.isin(oos_dates)]
-        garch_pooled.append(eval_df[[f"pred_rv_{horizon}", f"actual_rv_{horizon}"]])
-    garch_df = pd.concat(garch_pooled)
-    garch_metrics = regression_metrics(
-        garch_df[f"actual_rv_{horizon}"],
-        garch_df[f"pred_rv_{horizon}"],
+        garch_pooled.append(
+            eval_df[[f"pred_rv_{horizon}", f"actual_rv_{horizon}"]].rename(
+                columns={f"pred_rv_{horizon}": "predicted", f"actual_rv_{horizon}": "actual"}
+            )
+        )
+    garch_df = pd.concat(garch_pooled, keys=symbols)
+    garch_df.index.names = ["symbol", "date"]
+    garch_metrics = regression_metrics(garch_df["actual"], garch_df["predicted"])
+
+    diagnostics = compute_horizon_diagnostics(
+        {"lgbm": lgbm_results, "xgb": xgb_results, "garch": garch_df},
+        returns_by_symbol, horizon,
     )
-    return garch_metrics, lgbm_metrics, xgb_metrics, lgbm_elapsed, xgb_elapsed
+    return garch_metrics, lgbm_metrics, xgb_metrics, diagnostics, lgbm_elapsed, xgb_elapsed
 
 
 def main() -> int:
@@ -126,10 +167,11 @@ def main() -> int:
 
         rows = []
         r2_by_horizon: dict[int, dict[str, float]] = {}
+        diagnostics_by_horizon: dict[int, dict] = {}
         total_lgbm_elapsed = 0.0
         total_xgb_elapsed = 0.0
         for h in horizons:
-            garch_m, lgbm_m, xgb_m, l_elapsed, x_elapsed = evaluate_horizon(
+            garch_m, lgbm_m, xgb_m, diag, l_elapsed, x_elapsed = evaluate_horizon(
                 h, feature_df, returns_by_symbol,
                 train_window_days, refit_every, symbols,
             )
@@ -143,6 +185,7 @@ def main() -> int:
                 "xgb": float(xgb_m["r2"]),
                 "garch": float(garch_m["r2"]),
             }
+            diagnostics_by_horizon[h] = diag
 
         # 30-min budget: LightGBM is ~3× faster than XGBoost so even with both
         # fits per horizon this should comfortably fit in 30 min.
@@ -171,6 +214,22 @@ def main() -> int:
                 f"GARCH={r2s['GARCH']:+.3f})"
             )
 
+        print("\n=== Diagnostics: within-ticker R² / R² vs lagged-RV random walk ===")
+        print("(within strips cross-sectional vol-level differences; vs-naive is")
+        print(" skill above 'next h days = last h days' — the bar IV already clears)")
+        for h in horizons:
+            d = diagnostics_by_horizon[h]
+            w, v = d["within_r2"], d["r2_vs_lagged_rv"]
+            print(
+                f"  h={h:2d}: within  LGBM={w['lgbm']:+.3f} XGB={w['xgb']:+.3f} "
+                f"GARCH={w['garch']:+.3f} | naive pooled={d['lagged_rv_pooled_r2']:+.3f} "
+                f"within={d['lagged_rv_within_r2']:+.3f}"
+            )
+            print(
+                f"        vs-naive LGBM={v['lgbm']:+.3f} XGB={v['xgb']:+.3f} "
+                f"GARCH={v['garch']:+.3f}"
+            )
+
         print(
             f"\ntotal lightgbm: {total_lgbm_elapsed:.1f}s, "
             f"total xgboost: {total_xgb_elapsed:.1f}s, "
@@ -187,12 +246,23 @@ def main() -> int:
         # Write the routing R² table that main.py's _load_predictors consumes.
         # Atomic write via temp file + rename so a partially-written JSON can
         # never confuse the bot during a concurrent restart.
+        # diagnostics_by_horizon is informational only — main._load_routing_r2
+        # reads r2_by_horizon and ignores unknown keys, so routing is unaffected.
         payload = {
             "trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "train_window_days": train_window_days,
             "refit_every": refit_every,
             "n_tickers": len(tickers),
             "r2_by_horizon": {str(h): r2_by_horizon[h] for h in horizons},
+            "diagnostics_by_horizon": {
+                str(h): {
+                    "within_r2": {k: float(x) for k, x in diagnostics_by_horizon[h]["within_r2"].items()},
+                    "r2_vs_lagged_rv": {k: float(x) for k, x in diagnostics_by_horizon[h]["r2_vs_lagged_rv"].items()},
+                    "lagged_rv_pooled_r2": float(diagnostics_by_horizon[h]["lagged_rv_pooled_r2"]),
+                    "lagged_rv_within_r2": float(diagnostics_by_horizon[h]["lagged_rv_within_r2"]),
+                }
+                for h in horizons
+            },
         }
         tmp_path = ROUTING_R2_JSON.with_suffix(".json.tmp")
         with open(tmp_path, "w") as f:

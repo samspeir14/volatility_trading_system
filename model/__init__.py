@@ -1,8 +1,11 @@
 from model.best_predictor import BestPredictor
 from model.evaluation import (
     date_based_ts_split,
+    lagged_rv_forecast,
     per_horizon_metrics,
+    r2_vs_baseline,
     regression_metrics,
+    within_ticker_r2,
 )
 from model.garch_baseline import GARCHBaseline, GarchPathForecast, garch_forecast_path
 from model.lightgbm_model import LightGBMVolPredictor
@@ -31,9 +34,12 @@ __all__ = [
     "build_training_matrix",
     "date_based_ts_split",
     "garch_forecast_path",
+    "lagged_rv_forecast",
     "per_horizon_metrics",
+    "r2_vs_baseline",
     "regression_metrics",
     "tune_hyperparameters",
+    "within_ticker_r2",
     "walk_forward_evaluate_lightgbm",
     "walk_forward_evaluate_xgboost",
 ]

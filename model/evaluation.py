@@ -53,6 +53,68 @@ def regression_metrics(actual: pd.Series, predicted: pd.Series) -> dict[str, flo
     return {"n": int(len(paired)), "rmse": rmse, "mae": mae, "r2": r2, "bias": bias}
 
 
+def within_ticker_r2(actual: pd.Series, predicted: pd.Series, level: str = "symbol") -> float:
+    """R² with SS_total computed within-symbol: 1 − SSE / Σ(y − ȳ_symbol)².
+
+    Pooled R² across tickers gets credit for knowing that high-vol names run
+    hotter than low-vol names — a level difference the options market already
+    prices into IV. This variant scores skill relative to a per-symbol-mean
+    forecast, so a model that only knows each ticker's vol level scores ~0.
+    Requires a MultiIndex with a `level` (default "symbol") on both series.
+    Drops pairs where either side is NaN."""
+    paired = pd.concat(
+        [actual.rename("y"), predicted.rename("p")], axis=1
+    ).dropna()
+    if paired.empty:
+        return float("nan")
+    y = paired["y"]
+    ss_res = float(((paired["p"] - y) ** 2).sum())
+    ss_within = float(((y - y.groupby(level=level).transform("mean")) ** 2).sum())
+    if ss_within <= 0:
+        return float("nan")
+    return 1.0 - ss_res / ss_within
+
+
+def r2_vs_baseline(actual: pd.Series, predicted: pd.Series, baseline: pd.Series) -> float:
+    """Out-of-sample R² against a competing forecast: 1 − SSE_model / SSE_baseline
+    (Campbell–Thompson style). Positive = model beats the baseline; 0 = ties it.
+    Rows where any of the three is NaN are dropped, so both forecasts are
+    scored on the identical sample."""
+    paired = pd.concat(
+        [actual.rename("y"), predicted.rename("p"), baseline.rename("b")], axis=1
+    ).dropna()
+    if paired.empty:
+        return float("nan")
+    sse_model = float(((paired["p"] - paired["y"]) ** 2).sum())
+    sse_base = float(((paired["b"] - paired["y"]) ** 2).sum())
+    if sse_base <= 0:
+        return float("nan")
+    return 1.0 - sse_model / sse_base
+
+
+def lagged_rv_forecast(
+    returns_by_symbol: dict[str, pd.Series],
+    horizon: int,
+) -> pd.Series:
+    """Random-walk vol forecast: predicted forward-`horizon`-day RV at (symbol, t)
+    = std(returns[t−horizon+1 : t+1], ddof=0), the trailing window ending at t.
+    Same estimator as the training target (std of the *next* horizon days), so
+    the two windows are adjacent and non-overlapping. First horizon−1 rows per
+    symbol are NaN. Returns a Series indexed by (symbol, date)."""
+    parts: list[pd.Series] = []
+    for symbol, returns in returns_by_symbol.items():
+        trailing = returns.rolling(horizon).std(ddof=0)
+        parts.append(
+            pd.Series(
+                trailing.to_numpy(),
+                index=pd.MultiIndex.from_product(
+                    [[symbol], trailing.index], names=["symbol", "date"]
+                ),
+            )
+        )
+    return pd.concat(parts)
+
+
 def per_horizon_metrics(
     eval_df: pd.DataFrame,
     horizons: tuple[int, ...],
