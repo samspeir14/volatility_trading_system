@@ -104,6 +104,15 @@ If the JSON is missing, malformed, or partial, `_load_routing_r2` falls back to 
 
 The JSON also carries a `diagnostics_by_horizon` block (informational only — routing ignores it): per-model **within-ticker R²** (per-symbol vol levels stripped out, so it scores timing skill rather than "TSLA is more volatile than KO") and **R² vs a lagged-RV random walk** ("next h days = last h days" — positive means the model beats naive persistence, which is the minimum bar for beating implied vol). Pooled `r2_by_horizon` will read higher than both; that gap is cross-sectional level credit, not tradeable skill.
 
+## 6d. Strategy mode
+
+`STRATEGY_MODE` in `.env` selects what the bot trades (restart to apply):
+
+- `model` (default): the original strategy — trade the model-vs-IV divergence in both directions, gated by z-score, divergence cap, and earnings filter.
+- `harvest`: sell short-DTE iron condors (entry DTE 7–15, held to expiry) on every eligible watchlist name, every cycle — the variance-risk-premium harvesting strategy motivated by the 2026-07 research: the short-tenor premium is fat and unconditional, and nothing (model, formula, or IV-gap rule) ordered it out-of-sample. Entry gates that remain: earnings filter, liquidity filters, and an **extreme-spread veto** (skip when ATM IV exceeds trailing 63-day realized vol by more than 0.12 — big gaps historically meant the market was pricing real incoming vol, not extra premium; March 2020 shape). No BUY side. The thesis-reversal exit is disabled (there is no model thesis); stop-loss and profit-target exits stay live. All risk gates apply unchanged.
+
+In both modes the models run every cycle and every signal (traded or not) is logged to `divergence_history.db`, so model-accuracy evaluations (e.g. the model-vs-IV-vs-trail63 prospective test) continue regardless of what's being traded.
+
 ## 7. Troubleshooting
 
 | Symptom | Check |

@@ -568,7 +568,9 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
         earnings_filter_enabled=settings.earnings_filter_enabled,
         earnings_buffer_days=settings.earnings_buffer_days,
         long_straddle_excluded_symbols=etf_symbols,
+        strategy_mode=settings.strategy_mode,
     )
+    logger.info("strategy mode: %s", settings.strategy_mode)
 
     risk_manager = RiskManager(
         watchlist=watchlist,
@@ -593,6 +595,7 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
         position_tracker=position_tracker,
         order_manager=order_manager,
         predictors_by_horizon=predictors,
+        thesis_exit_enabled=(settings.strategy_mode != "harvest"),
     )
 
     daily_summary_builder = DailySummaryBuilder(
