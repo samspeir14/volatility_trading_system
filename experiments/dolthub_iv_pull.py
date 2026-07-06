@@ -31,7 +31,7 @@ SYMBOLS = ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "AMD", "JPM", "GS",
 OUT = Path(__file__).resolve().parent / "results" / "dolthub_iv_history.csv"
 
 
-def query(q: str, retries: int = 3) -> list[dict]:
+def query(q: str, retries: int = 5) -> list[dict]:
     url = f"{API}?q={urllib.parse.quote(q)}"
     for attempt in range(retries):
         try:
@@ -43,39 +43,59 @@ def query(q: str, retries: int = 3) -> list[dict]:
         except Exception:
             if attempt == retries - 1:
                 raise
-            time.sleep(2.0 * (attempt + 1))
+            time.sleep(5.0 * (attempt + 1))  # patient backoff: soft rate limits
     return []
 
 
-def pull_symbol(symbol: str) -> list[dict]:
-    rows, last = [], "1900-01-01"
-    while True:
-        page = query(
-            "SELECT date, iv_current, hv_current FROM volatility_history "
-            f"WHERE act_symbol='{symbol}' AND date > '{last}' ORDER BY date LIMIT 41"
-        )
-        if not page:
-            return rows
-        rows.extend(page)
-        last = page[-1]["date"]
-        time.sleep(0.3)
-
-
 def main() -> int:
+    """Iterate weekday dates in pairs (2 dates x 20 symbols = 40 rows, under
+    the ~41-row response cap). The PK leads with `date`, so exact-date queries
+    are fast index lookups; anything range-shaped full-scans and hits the
+    server's 30s deadline. Appends and resumes from the last date in the CSV."""
+    from datetime import date as ddate, timedelta
+
     OUT.parent.mkdir(parents=True, exist_ok=True)
-    with open(OUT, "w", newline="") as f:
+    start = ddate(2019, 2, 1)
+    if OUT.exists():
+        with open(OUT) as f:
+            line = ""
+            for line in f:
+                pass
+        parts = line.strip().split(",")
+        if len(parts) >= 2 and parts[1] != "date":
+            start = ddate.fromisoformat(parts[1]) + timedelta(days=1)
+            print(f"resuming from {start}", flush=True)
+
+    weekdays = []
+    d = start
+    while d <= ddate.today():
+        if d.weekday() < 5:
+            weekdays.append(d.isoformat())
+        d += timedelta(days=1)
+
+    in_list = ",".join(f"'{s}'" for s in SYMBOLS)
+    mode = "a" if start != ddate(2019, 2, 1) else "w"
+    total = 0
+    t0 = time.monotonic()
+    with open(OUT, mode, newline="") as f:
         w = csv.writer(f)
-        w.writerow(["symbol", "date", "iv_current", "hv_current"])
-        total = 0
-        for sym in SYMBOLS:
-            t0 = time.monotonic()
-            rows = pull_symbol(sym)
+        if mode == "w":
+            w.writerow(["symbol", "date", "iv_current", "hv_current"])
+        for i in range(0, len(weekdays), 2):
+            pair = ",".join(f"'{x}'" for x in weekdays[i:i + 2])
+            rows = query(
+                "SELECT date, act_symbol, iv_current, hv_current FROM volatility_history "
+                f"WHERE date IN ({pair}) AND act_symbol IN ({in_list}) "
+                "ORDER BY date, act_symbol"
+            )
             for r in rows:
-                w.writerow([sym, r["date"], r["iv_current"], r["hv_current"]])
+                w.writerow([r["act_symbol"], r["date"], r["iv_current"], r["hv_current"]])
             f.flush()
             total += len(rows)
-            print(f"{sym}: {len(rows)} rows in {time.monotonic()-t0:.0f}s", flush=True)
-    print(f"done: {total} rows -> {OUT}")
+            if i % 100 == 0:
+                print(f"...{weekdays[i]}: {total} rows ({time.monotonic()-t0:.0f}s)", flush=True)
+            time.sleep(0.25)
+    print(f"done: {total} rows -> {OUT} in {time.monotonic()-t0:.0f}s")
     return 0
 
 
