@@ -115,6 +115,8 @@ Sizing is built for the correlated crash, not the average week: **1.5% equity ma
 
 In both modes the models run every cycle and every signal (traded or not) is logged to `divergence_history.db`, so model-accuracy evaluations (e.g. the model-vs-IV-vs-trail63 prospective test) continue regardless of what's being traded.
 
+Harvest mode also narrows the scan's expiration window to (3, 16) days — entries cap at DTE 15 and positions ride to expiry, so longer chains are dead weight, and the saved API calls pay for the larger watchlist (33 names as of 2026-07) against the 180/min rate budget. Open positions above the window (e.g. legacy model-mode condors during a transition) still mark via `fetch_missing_position_chains`. Note the divergence log only accumulates DTE ≤ 16 rows while in harvest mode. Watchlist candidates are screened with `experiments/screen_watchlist_candidates.py` (run intraday — off-hours quotes fake out the spread/OI filters).
+
 ## 7. Troubleshooting
 
 | Symptom | Check |

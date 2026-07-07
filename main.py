@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from config import load_settings, load_watchlist
+from config import Settings, load_settings, load_watchlist
 from data import (
     AsyncTradierClient,
     EarningsCalendar,
@@ -59,6 +59,20 @@ logger = logging.getLogger(__name__)
 # DTE 3 still mark off the scan; anything below that is pulled in by
 # fetch_missing_position_chains.
 SCAN_EXPIRATION_WINDOW = (3, 45)
+# Harvest mode never enters above DTE 15 and its positions ride to expiry, so
+# chains past 16 are dead weight — and the narrower window is what pays the
+# rate-limiter bill for the larger watchlist (~5 calls/name at (3,45) vs ~3 at
+# (3,16), against the 180/min budget). Legacy model-mode positions above the
+# window still mark: fetch_missing_position_chains pulls any open-position
+# expiration the scan didn't cover, above or below. Side effect: while in
+# harvest mode the divergence log only accumulates DTE ≤ 16 rows — fine for
+# the prospective accuracy tests, which target the short tenor anyway.
+SCAN_EXPIRATION_WINDOW_HARVEST = (3, 16)
+
+
+def _scan_window(settings: Settings) -> tuple[int, int]:
+    return (SCAN_EXPIRATION_WINDOW_HARVEST if settings.strategy_mode == "harvest"
+            else SCAN_EXPIRATION_WINDOW)
 
 
 @dataclass(frozen=True)
@@ -250,7 +264,7 @@ class MainLoop:
             )
 
         # 2. Scan
-        scan = await self._market_data.scan(expiration_window=SCAN_EXPIRATION_WINDOW)
+        scan = await self._market_data.scan(expiration_window=_scan_window(self._settings))
         scan_contracts = scan.total_contracts
         today = scan.fetched_at.date()
 
@@ -556,8 +570,12 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
     # Index ETFs carry a variance-risk premium (realized < implied), so buying
     # their straddles bleeds — every SPY long straddle in the live log lost.
     # Bar them from the BUY side; they stay eligible for the SELL/iron-condor
-    # side that harvests the premium.
-    etf_symbols = frozenset(t.symbol for t in watchlist if t.sector == "etf")
+    # side that harvests the premium. "bonds" (TLT) is an index product with
+    # the same structural premium — same exclusion, different risk bucket for
+    # the sector-concentration gate.
+    etf_symbols = frozenset(
+        t.symbol for t in watchlist if t.sector in ("etf", "bonds")
+    )
 
     signal_generator = SignalGenerator(
         predictors_by_horizon=predictors,
@@ -662,7 +680,7 @@ async def _run(args) -> int:
             if args.summary_only:
                 logger.info("building + posting daily summary, then exiting (--summary-only)")
                 # Need a snapshot for the summary; do a minimal scan
-                scan = await loop._market_data.scan(expiration_window=SCAN_EXPIRATION_WINDOW)
+                scan = await loop._market_data.scan(expiration_window=_scan_window(settings))
                 snapshot = await loop._builder.snapshot(scan)
                 today = scan.fetched_at.date()
                 await loop.post_daily_summary(today, snapshot)
