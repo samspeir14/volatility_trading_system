@@ -51,6 +51,7 @@ class ExitManager:
         iron_condor_stop_loss_pct: float = -1.00,
         expiration_proximity_dte: int = 2,
         thesis_reversal_min_magnitude: float = 0.05,
+        thesis_exit_enabled: bool = True,
     ):
         self._tracker = position_tracker
         self._order_manager = order_manager
@@ -61,6 +62,11 @@ class ExitManager:
         self._ic_sl = iron_condor_stop_loss_pct
         self._exp_dte = expiration_proximity_dte
         self._thesis_min = thesis_reversal_min_magnitude
+        # Harvest mode has no model thesis — positions are premium harvests,
+        # not divergence bets — so the thesis-reversal trigger is disabled
+        # there. Divergence is still computed and recorded on every decision
+        # for diagnostics; only the trigger is off.
+        self._thesis_enabled = thesis_exit_enabled
 
     def evaluate(
         self,
@@ -149,7 +155,7 @@ class ExitManager:
         pos = mark.position
 
         # 1. Thesis reversed (HIGHEST priority — overrides P&L)
-        if current_divergence is not None:
+        if self._thesis_enabled and current_divergence is not None:
             entry_sign = 1 if pos.entry_divergence > 0 else -1
             current_sign = 1 if current_divergence > 0 else -1
             if (current_sign != entry_sign

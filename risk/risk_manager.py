@@ -36,6 +36,7 @@ class RiskManager:
         max_per_trade_loss_pct: float = 0.01,
         max_per_ticker_exposure_pct: float = 0.05,
         max_per_sector_positions: int = 3,
+        max_portfolio_risk_pct: float = 0.12,
         max_portfolio_delta_pct: float = 0.05,
         max_portfolio_gamma_pct: float = 0.01,
         max_portfolio_vega_pct: float = 0.05,
@@ -48,6 +49,11 @@ class RiskManager:
         self._max_trade_pct = max_per_trade_loss_pct
         self._max_ticker_pct = max_per_ticker_exposure_pct
         self._max_sector_pos = max_per_sector_positions
+        # Cap on the SUM of open max-losses (wing risk). In a correlated crash
+        # every short-vol position can max out simultaneously — the per-trade
+        # and per-sector gates don't bound that sum, this does. It is the
+        # portfolio's worst-case drawdown by construction.
+        self._max_portfolio_risk_pct = max_portfolio_risk_pct
         self._delta_pct = max_portfolio_delta_pct
         self._gamma_pct = max_portfolio_gamma_pct
         self._vega_pct = max_portfolio_vega_pct
@@ -62,14 +68,41 @@ class RiskManager:
         scan: ScanResult,
         snapshot: PortfolioSnapshot,
     ) -> list[RiskDecision]:
-        return [self._evaluate(s, scan, snapshot) for s in signals]
+        # All signals in a cycle are gated against the same snapshot, so
+        # earlier approvals must be carried forward here — otherwise a batch
+        # of 15 harvest signals each sees an empty book and the portfolio,
+        # ticker, and sector caps are only enforced against *yesterday's*
+        # positions. (Greeks are not accumulated intra-cycle; the loss-based
+        # caps bind far earlier for defined-risk structures.)
+        committed_risk = 0.0
+        committed_ticker: dict[str, float] = {}
+        committed_sector: dict[str, int] = {}
+        decisions: list[RiskDecision] = []
+        for s in signals:
+            d = self._evaluate(
+                s, scan, snapshot, committed_risk, committed_ticker, committed_sector,
+            )
+            if d.approved:
+                committed_risk += d.projected_max_loss
+                committed_ticker[s.symbol] = (
+                    committed_ticker.get(s.symbol, 0.0) + d.projected_max_loss
+                )
+                sector = self._sector_map.get(s.symbol, "unknown")
+                committed_sector[sector] = committed_sector.get(sector, 0) + 1
+            decisions.append(d)
+        return decisions
 
     def _evaluate(
         self,
         signal: TradeSignal,
         scan: ScanResult,
         snapshot: PortfolioSnapshot,
+        committed_risk: float = 0.0,
+        committed_ticker: dict[str, float] | None = None,
+        committed_sector: dict[str, int] | None = None,
     ) -> RiskDecision:
+        committed_ticker = committed_ticker or {}
+        committed_sector = committed_sector or {}
         reasons: list[str] = []
 
         # 1. Kill switch (short-circuit — no other gate matters)
@@ -104,8 +137,11 @@ class RiskManager:
 
         projected_loss = max_loss_per_contract * max(sized_qty, 0)
 
-        # 3. Per-ticker exposure
-        current_ticker_exposure = snapshot.exposure_by_symbol.get(signal.symbol, 0.0)
+        # 3. Per-ticker exposure (open positions + earlier approvals this cycle)
+        current_ticker_exposure = (
+            snapshot.exposure_by_symbol.get(signal.symbol, 0.0)
+            + committed_ticker.get(signal.symbol, 0.0)
+        )
         new_ticker_total = current_ticker_exposure + projected_loss
         ticker_cap = self._max_ticker_pct * snapshot.equity
         if new_ticker_total > ticker_cap:
@@ -114,9 +150,24 @@ class RiskManager:
                 f"cap ${ticker_cap:.2f} ({self._max_ticker_pct:.1%} equity)"
             )
 
-        # 4. Per-sector concentration
+        # 3b. Portfolio wing risk: the sum of open max-losses is what a
+        # correlated crash (every name through its put wing at once) costs.
+        # Bounding it here makes worst-case drawdown a chosen number instead
+        # of whatever the per-position gates happen to allow.
+        open_risk = sum(snapshot.exposure_by_symbol.values()) + committed_risk
+        portfolio_risk_cap = self._max_portfolio_risk_pct * snapshot.equity
+        if open_risk + projected_loss > portfolio_risk_cap:
+            reasons.append(
+                f"portfolio wing risk ${open_risk + projected_loss:.2f} would exceed "
+                f"cap ${portfolio_risk_cap:.2f} ({self._max_portfolio_risk_pct:.1%} equity)"
+            )
+
+        # 4. Per-sector concentration (open positions + earlier approvals this cycle)
         sector = self._sector_map.get(signal.symbol, "unknown")
-        sector_positions = snapshot.positions_by_sector.get(sector, 0)
+        sector_positions = (
+            snapshot.positions_by_sector.get(sector, 0)
+            + committed_sector.get(sector, 0)
+        )
         if sector_positions + 1 > self._max_sector_pos:
             reasons.append(
                 f"{sector} sector already has {sector_positions} positions "

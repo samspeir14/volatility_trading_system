@@ -167,6 +167,28 @@ def test_thesis_reversal_fires_when_sign_flips_and_magnitude_clears():
     print("thesis_reversal: sign flip + magnitude floor verified")
 
 
+def test_thesis_exit_disabled_in_harvest_mode():
+    """Harvest-mode positions are premium harvests, not divergence bets —
+    with thesis_exit_enabled=False a flipped divergence must NOT close the
+    position, while P&L triggers keep working."""
+    mgr = ExitManager(
+        position_tracker=mock.MagicMock(),
+        order_manager=mock.MagicMock(),
+        predictors_by_horizon={5: mock.MagicMock(), 10: mock.MagicMock(), 21: mock.MagicMock()},
+        thesis_exit_enabled=False,
+    )
+    pos = _mk_iron_condor_position(entry_credit=13.55)
+    # Flipped divergence, flat P&L → hold (would be thesis_reversed if enabled)
+    mark = _mark(pos, pnl_dollars=0.0)
+    trigger, _ = mgr._evaluate_one(mark, current_divergence=+0.10)
+    assert trigger is None, f"thesis exit fired while disabled: {trigger}"
+    # Stop loss still works with the thesis trigger off
+    mark = _mark(pos, pnl_dollars=-1500.0)
+    trigger, _ = mgr._evaluate_one(mark, current_divergence=+0.10)
+    assert trigger == "stop_loss"
+    print("harvest: thesis exit off, stop loss intact")
+
+
 # ---------- the user's flagged priority test ----------
 
 def test_thesis_overrides_stop_loss():

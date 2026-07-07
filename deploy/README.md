@@ -104,6 +104,19 @@ If the JSON is missing, malformed, or partial, `_load_routing_r2` falls back to 
 
 The JSON also carries a `diagnostics_by_horizon` block (informational only — routing ignores it): per-model **within-ticker R²** (per-symbol vol levels stripped out, so it scores timing skill rather than "TSLA is more volatile than KO") and **R² vs a lagged-RV random walk** ("next h days = last h days" — positive means the model beats naive persistence, which is the minimum bar for beating implied vol). Pooled `r2_by_horizon` will read higher than both; that gap is cross-sectional level credit, not tradeable skill.
 
+## 6d. Strategy mode
+
+`STRATEGY_MODE` in `.env` selects what the bot trades (restart to apply):
+
+- `model` (default): the original strategy — trade the model-vs-IV divergence in both directions, gated by z-score, divergence cap, and earnings filter.
+- `harvest`: sell short-DTE iron condors (entry DTE 5–15, nearest-first so the book concentrates at DTE 5–8 and rides to expiry) on every eligible watchlist name, every cycle — the variance-risk-premium harvesting strategy motivated by the 2026-07 research: the short-tenor premium is fat and unconditional, and nothing (model, formula, or IV-gap rule) ordered it out-of-sample. Entry gates that remain: earnings filter, liquidity filters, and an **extreme-spread veto** (skip when ATM IV exceeds trailing 63-day realized vol by more than 0.12 — big gaps historically meant the market was pricing real incoming vol, not extra premium; March 2020 shape). No BUY side. The thesis-reversal exit is disabled (there is no model thesis); stop-loss and profit-target exits stay live.
+
+Sizing is built for the correlated crash, not the average week: **1.5% equity max loss per trade** and a **20% portfolio wing-risk cap** (sum of open max-losses — the book's worst case when every name gaps through its wings at once — bounded by construction; entries auto-throttle when the ladder is full). The 20% is **paper calibration** — faster friction measurement, fake drawdowns are tuition; revisit down to ≤12% before any real-money deployment. Risk gates also accrue approvals *within* a cycle, so a first-day batch of harvest signals can't stampede past the portfolio/sector/ticker caps. Note at 1.5%/$100k the expensive names (AMD, CAT, GS: price × IV too big for one contract) never trade — they already didn't fit the old 2% budget — and META/TSLA/UNH only enter at the short end of the DTE window.
+
+In both modes the models run every cycle and every signal (traded or not) is logged to `divergence_history.db`, so model-accuracy evaluations (e.g. the model-vs-IV-vs-trail63 prospective test) continue regardless of what's being traded.
+
+Harvest mode also narrows the scan's expiration window to (3, 16) days — entries cap at DTE 15 and positions ride to expiry, so longer chains are dead weight, and the saved API calls pay for the larger watchlist (33 names as of 2026-07) against the 180/min rate budget. Open positions above the window (e.g. legacy model-mode condors during a transition) still mark via `fetch_missing_position_chains`. Note the divergence log only accumulates DTE ≤ 16 rows while in harvest mode. Watchlist candidates are screened with `experiments/screen_watchlist_candidates.py` (run intraday — off-hours quotes fake out the spread/OI filters).
+
 ## 7. Troubleshooting
 
 | Symptom | Check |

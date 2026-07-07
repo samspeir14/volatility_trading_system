@@ -301,6 +301,141 @@ def test_long_straddle_exclusion_demotes_etf_buy_only():
     print("long_straddle_exclusion: SPY BUY demoted, CTRL BUY actionable")
 
 
+# ---------- harvest mode ----------
+
+# Alternating ±1.2% daily returns → trail63 ≈ 0.012 × √252 ≈ 0.19 annualized.
+_HARVEST_RETURNS = pd.Series([0.012, -0.012] * 50)
+
+
+def _harvest_scan(rows, expirations=None):
+    """rows: [(symbol, atm_iv)]; expirations: list of dates (default one DTE-11)."""
+    from data.market_data import ScanResult, TickerSnapshot
+    expirations = expirations or [date(2026, 6, 12)]
+    snapshots = {
+        sym: TickerSnapshot(
+            symbol=sym, sector="tech",
+            underlying={"symbol": sym, "last": 100.0},
+            contracts=[c for exp in expirations for c in _straddle_chain(sym, exp, iv)],
+        )
+        for sym, iv in rows
+    }
+    return ScanResult(fetched_at=datetime(2026, 6, 1, 16, 0, tzinfo=timezone.utc),
+                      snapshots=snapshots)
+
+
+def test_harvest_mode_sells_unconditionally_no_z_gate():
+    """Harvest mode: every eligible name becomes an actionable SELL condor —
+    even where the model would say BUY, and with a z-threshold no candidate
+    could clear. The divergence is still computed and carried on the signal
+    (the prospective model-accuracy tests read it from the history log)."""
+    scan = _harvest_scan([("HI", 0.30), ("LO", 0.10)])
+    predictors = {h: _ConstPredictor() for h in (5, 10, 21)}  # ~0.19 annualized
+    feature_rows = {s: pd.DataFrame({"a": [0.0]}, index=[date(2026, 5, 29)]) for s in ("HI", "LO")}
+    returns_by_symbol = {s: _HARVEST_RETURNS for s in ("HI", "LO")}
+
+    gen = SignalGenerator(predictors_by_horizon=predictors, history_store=None,
+                          cross_sectional_z_threshold=99.0,  # would gate everything in model mode
+                          strategy_mode="harvest")
+    actionable, all_signals = gen.generate(scan, feature_rows, returns_by_symbol, top_n=10)
+    by = {s.symbol: s for s in actionable}
+
+    assert set(by) == {"HI", "LO"}, f"expected both actionable, got {sorted(by)}"
+    for s in actionable:
+        assert s.direction == "SELL"
+        assert len(s.legs) == 4, f"{s.symbol}: expected condor legs, got {s.legs}"
+    # LO's divergence is positive (predicted 0.19 > implied 0.10) — model mode
+    # would direct BUY. Harvest sells anyway, and the divergence survives.
+    assert by["LO"].divergence > 0
+    print("harvest_unconditional: HI+LO both SELL condors past a z=99 gate")
+
+
+def test_harvest_extreme_spread_veto_and_fail_open():
+    """ATM IV far above trailing 63d realized → demoted (market pricing real
+    incoming vol). Short return history → veto fails open, signal passes."""
+    scan = _harvest_scan([("CRAZY", 0.45), ("OK", 0.25), ("NEWLIST", 0.45)])
+    predictors = {h: _ConstPredictor() for h in (5, 10, 21)}
+    feature_rows = {s: pd.DataFrame({"a": [0.0]}, index=[date(2026, 5, 29)])
+                    for s in ("CRAZY", "OK", "NEWLIST")}
+    returns_by_symbol = {
+        "CRAZY": _HARVEST_RETURNS,          # trail63 ≈ 0.19; 0.45-0.19=0.26 > 0.12 → veto
+        "OK": _HARVEST_RETURNS,             # 0.25-0.19=0.06 → passes
+        "NEWLIST": _HARVEST_RETURNS.iloc[:30],  # <63 returns → veto disabled → passes
+    }
+
+    gen = SignalGenerator(predictors_by_horizon=predictors, history_store=None,
+                          strategy_mode="harvest")
+    actionable, all_signals = gen.generate(scan, feature_rows, returns_by_symbol, top_n=10)
+    by = {s.symbol: s for s in all_signals}
+
+    assert not by["CRAZY"].is_actionable
+    assert "extreme-spread veto" in by["CRAZY"].diagnostic_notes
+    assert by["OK"].is_actionable, by["OK"].diagnostic_notes
+    assert by["NEWLIST"].is_actionable, by["NEWLIST"].diagnostic_notes
+    assert {s.symbol for s in actionable} == {"OK", "NEWLIST"}
+    print("harvest_veto: CRAZY demoted, OK passes, short-history NEWLIST fails open")
+
+
+def test_harvest_dte_ceiling_and_per_symbol_dedupe():
+    """Expirations above the harvest ceiling are skipped outright; among the
+    eligible ones only the nearest lands in actionable (one condor per symbol
+    per cycle — the weekly cadence builds the ladder)."""
+    exps = [date(2026, 6, 9), date(2026, 6, 12), date(2026, 6, 26)]  # DTE 8, 11, 25
+    scan = _harvest_scan([("X", 0.25)], expirations=exps)
+    predictors = {h: _ConstPredictor() for h in (5, 10, 21)}
+    feature_rows = {"X": pd.DataFrame({"a": [0.0]}, index=[date(2026, 5, 29)])}
+    returns_by_symbol = {"X": _HARVEST_RETURNS}
+
+    gen = SignalGenerator(predictors_by_horizon=predictors, history_store=None,
+                          strategy_mode="harvest", harvest_max_entry_dte=15)
+    actionable, all_signals = gen.generate(scan, feature_rows, returns_by_symbol, top_n=10)
+
+    assert sorted({s.dte for s in all_signals}) == [8, 11], \
+        f"DTE 25 should be skipped: {sorted({s.dte for s in all_signals})}"
+    assert len(actionable) == 1 and actionable[0].dte == 8, \
+        f"expected single nearest-DTE signal, got {[(s.symbol, s.dte) for s in actionable]}"
+    print("harvest_dte: DTE-25 skipped, DTE-8 chosen over DTE-11")
+
+
+def test_harvest_entry_floor_below_model_floor():
+    """Harvest's floor (5) sits below the model-mode MIN_ENTRY_DTE (7):
+    DTE-5 condors enter, DTE-4 stays out, and the nearest eligible wins the
+    actionable slot. Guards the fat-zone coverage the strategy is built on."""
+    from signals import MIN_ENTRY_DTE
+    exps = [date(2026, 6, 5), date(2026, 6, 6), date(2026, 6, 12)]  # DTE 4, 5, 11
+    scan = _harvest_scan([("X", 0.25)], expirations=exps)
+    predictors = {h: _ConstPredictor() for h in (5, 10, 21)}
+    feature_rows = {"X": pd.DataFrame({"a": [0.0]}, index=[date(2026, 5, 29)])}
+    returns_by_symbol = {"X": _HARVEST_RETURNS}
+
+    gen = SignalGenerator(predictors_by_horizon=predictors, history_store=None,
+                          strategy_mode="harvest")
+    actionable, all_signals = gen.generate(scan, feature_rows, returns_by_symbol, top_n=10)
+
+    assert sorted({s.dte for s in all_signals}) == [5, 11], \
+        f"expected DTE 4 out / 5 in: {sorted({s.dte for s in all_signals})}"
+    assert actionable[0].dte == 5 < MIN_ENTRY_DTE
+    print("harvest_floor: DTE-5 enters (below model floor 7), DTE-4 excluded")
+
+
+def test_strategy_mode_validated():
+    predictors = {h: _ConstPredictor() for h in (5, 10, 21)}
+    try:
+        SignalGenerator(predictors_by_horizon=predictors, strategy_mode="yolo")
+    except ValueError as e:
+        assert "strategy_mode" in str(e)
+        print("strategy_mode_validated: 'yolo' rejected")
+    else:
+        raise AssertionError("invalid strategy_mode should raise")
+    try:
+        SignalGenerator(predictors_by_horizon=predictors, strategy_mode="harvest",
+                        harvest_min_entry_dte=2)
+    except ValueError as e:
+        assert "harvest_min_entry_dte" in str(e)
+        print("harvest_min_entry_dte: 2 rejected (below horizon-mapping floor)")
+    else:
+        raise AssertionError("harvest_min_entry_dte below MIN_DTE should raise")
+
+
 # ---------- live integration ----------
 
 async def _bootstrap_predictors(

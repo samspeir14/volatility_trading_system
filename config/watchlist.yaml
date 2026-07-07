@@ -6,16 +6,29 @@ tickers:
   - {symbol: META,  sector: tech}
   - {symbol: GOOGL, sector: tech}
   - {symbol: AMD,   sector: tech}
+  - {symbol: ORCL,  sector: tech}
+  - {symbol: QCOM,  sector: tech}
+  - {symbol: CRM,   sector: tech}
+  - {symbol: PLTR,  sector: tech}
   - {symbol: JPM,   sector: financials}
   - {symbol: GS,    sector: financials}
   - {symbol: BAC,   sector: financials}
+  - {symbol: WFC,   sector: financials}
   - {symbol: XOM,   sector: energy}
   - {symbol: CVX,   sector: energy}
+  - {symbol: SLB,   sector: energy}
+  - {symbol: OXY,   sector: energy}
   - {symbol: JNJ,   sector: healthcare}
   - {symbol: UNH,   sector: healthcare}
   - {symbol: TSLA,  sector: consumer}
   - {symbol: HD,    sector: consumer}
+  - {symbol: DIS,   sector: consumer}
+  - {symbol: KO,    sector: consumer}
+  - {symbol: WMT,   sector: consumer}
   - {symbol: CAT,   sector: industrials}
   - {symbol: BA,    sector: industrials}
   - {symbol: SPY,   sector: etf}
   - {symbol: QQQ,   sector: etf}
+  - {symbol: IWM,   sector: etf}
+  - {symbol: DIA,   sector: etf}
+  - {symbol: TLT,   sector: bonds}

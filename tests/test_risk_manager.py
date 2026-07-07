@@ -172,6 +172,73 @@ def test_sector_concentration():
     print("sector_concentration: tech already at 3 positions → reject")
 
 
+def test_portfolio_wing_risk_cap_blocks_full_book():
+    """Sum of open max-losses + the new trade must stay under the portfolio
+    cap — the correlated-crash bound (every position through its wings)."""
+    rm = RiskManager(
+        watchlist=WATCHLIST, max_per_trade_loss_pct=0.015,
+        max_portfolio_risk_pct=0.12,
+    )
+    signal = _mk_iron_condor_signal()
+    scan = _mk_scan_for_iron_condor()
+    # Open book already carries $11,500 wing risk; cap 12% of $100k = $12,000.
+    # New trade: qty 1 × $1,500 max loss → $13,000 > cap → reject.
+    snapshot = _mk_snapshot(
+        equity=100000.0,
+        exposure_by_symbol={"AAPL": 5000.0, "MSFT": 6500.0},
+    )
+    decision = rm.gate([signal], scan, snapshot)[0]
+    assert decision.approved is False
+    assert any("portfolio wing risk" in r for r in decision.reasons)
+    print("portfolio_wing_risk: $11.5k open + $1.5k new > $12k cap → reject")
+
+
+def test_portfolio_wing_risk_accumulates_within_cycle():
+    """A batch of approvals in ONE cycle must count against the cap as they
+    accrue — day one of harvest mode, empty book, many actionable signals."""
+    rm = RiskManager(
+        watchlist=WATCHLIST, max_per_trade_loss_pct=0.015,
+        max_per_ticker_exposure_pct=1.0,     # not the limiter here
+        max_per_sector_positions=99,          # not the limiter here
+        max_portfolio_risk_pct=0.04,          # $4k on $100k → two $1.5k trades fit
+    )
+    signals = [_mk_iron_condor_signal() for _ in range(3)]
+    scan = _mk_scan_for_iron_condor()
+    snapshot = _mk_snapshot(equity=100000.0)  # empty book
+    decisions = rm.gate(signals, scan, snapshot)
+    assert [d.approved for d in decisions] == [True, True, False], \
+        [(d.approved, d.reasons) for d in decisions]
+    assert any("portfolio wing risk" in r for r in decisions[2].reasons)
+    print("portfolio_wing_risk: intra-cycle accrual — 3rd of 3 identical trades rejected")
+
+
+def test_ticker_and_sector_caps_accumulate_within_cycle():
+    """Same-cycle approvals must also count toward the per-ticker and
+    per-sector gates, not just what was open at snapshot time."""
+    # Sector: cap 2, three tech signals in one batch → third rejected.
+    rm = RiskManager(
+        watchlist=WATCHLIST, max_per_trade_loss_pct=0.015,
+        max_per_ticker_exposure_pct=1.0, max_per_sector_positions=2,
+        max_portfolio_risk_pct=1.0,
+    )
+    signals = [_mk_iron_condor_signal() for _ in range(3)]
+    scan = _mk_scan_for_iron_condor()
+    decisions = rm.gate(signals, scan, _mk_snapshot(equity=100000.0))
+    assert [d.approved for d in decisions] == [True, True, False]
+    assert any("tech sector" in r for r in decisions[2].reasons)
+
+    # Ticker: cap $3k, $1.5k per approval → third NVDA rejected.
+    rm = RiskManager(
+        watchlist=WATCHLIST, max_per_trade_loss_pct=0.015,
+        max_per_ticker_exposure_pct=0.03, max_per_sector_positions=99,
+        max_portfolio_risk_pct=1.0,
+    )
+    decisions = rm.gate(signals, scan, _mk_snapshot(equity=100000.0))
+    assert [d.approved for d in decisions] == [True, True, False]
+    assert any("NVDA exposure" in r for r in decisions[2].reasons)
+    print("intra-cycle accrual: sector and ticker caps bind on batch approvals")
+
+
 def test_portfolio_delta_limit():
     rm = RiskManager(
         watchlist=WATCHLIST,

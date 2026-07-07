@@ -199,7 +199,18 @@ class SignalGenerator:
         earnings_filter_enabled: bool = True,
         earnings_buffer_days: int = 7,
         long_straddle_excluded_symbols: frozenset[str] | set[str] | None = None,
+        strategy_mode: str = "model",
+        extreme_spread_veto: float = 0.12,
+        harvest_min_entry_dte: int = 5,
+        harvest_max_entry_dte: int = 15,
     ):
+        if strategy_mode not in ("model", "harvest"):
+            raise ValueError(f"strategy_mode must be 'model' or 'harvest', got {strategy_mode!r}")
+        if harvest_min_entry_dte < MIN_DTE:
+            raise ValueError(
+                f"harvest_min_entry_dte must be >= {MIN_DTE} (horizon-mapping floor), "
+                f"got {harvest_min_entry_dte}"
+            )
         for h in TRAINED_HORIZONS:
             if h not in predictors_by_horizon:
                 raise ValueError(f"missing predictor for horizon {h}")
@@ -221,6 +232,29 @@ class SignalGenerator:
         # implied, so buying their premium bleeds. They stay eligible for the
         # SELL (iron condor) side, which harvests that premium.
         self._no_long_straddle = frozenset(long_straddle_excluded_symbols or ())
+        # "model": trade the model-vs-IV divergence (z-scored, both directions).
+        # "harvest": sell iron condors on every eligible name — the 2026-07
+        # research verdict: the short-tenor variance risk premium is fat and
+        # unconditional, and no model/formula orders it, so there is nothing to
+        # gate entries on. Model predictions still run and log to the
+        # divergence history for the prospective accuracy tests.
+        self._mode = strategy_mode
+        # Harvest-mode SELL veto: when ATM IV sits more than this above the
+        # trailing 63d realized vol, the gap is usually the market pricing REAL
+        # incoming vol (COVID 2020-03-06 shape), not extra premium — the top
+        # spread decile was the only reliably losing sell bucket in 7 years.
+        # Crash insurance, not alpha: it costs a little in calm years.
+        self._spread_veto = extreme_spread_veto
+        # Entry window for harvest sells: premium concentrates near expiry
+        # (DTE 2-10 in the live log), and the ranking prefers the nearest
+        # expiration, so the FLOOR sets where the book actually lives — at 5,
+        # entries cluster in DTE 5-8 and ride to zero, covering the fat zone.
+        # The model-mode floor (MIN_ENTRY_DTE=7) exists for straddles the
+        # proximity exit would force-close; condors are exempt from that exit,
+        # so harvest can start closer in. Ceiling: DTE 22+ short vol lost
+        # money May-June; just above the fat zone keeps every position in it.
+        self._harvest_min_dte = harvest_min_entry_dte
+        self._harvest_max_dte = harvest_max_entry_dte
 
     def generate(
         self,
@@ -268,11 +302,16 @@ class SignalGenerator:
 
             for expiration, chain in chains_by_exp.items():
                 dte = (expiration - today).days
-                # Entry floor: too close to expiry and the position would just be
-                # force-closed by the expiration_proximity exit before its thesis
-                # can play out (see MIN_ENTRY_DTE). Skip silently — same as an
-                # out-of-window DTE — so these don't clutter the signal log.
-                if dte < MIN_ENTRY_DTE:
+                # Entry floor. Model mode: below MIN_ENTRY_DTE a fresh straddle
+                # would just be force-closed by the expiration_proximity exit
+                # before its thesis can play out. Harvest mode: condors are
+                # exempt from that exit, so the floor drops to the fat zone;
+                # the ceiling keeps entries inside it. Skip silently — same as
+                # an out-of-window DTE — so these don't clutter the signal log.
+                if self._mode == "harvest":
+                    if dte < self._harvest_min_dte or dte > self._harvest_max_dte:
+                        continue
+                elif dte < MIN_ENTRY_DTE:
                     continue
                 horizon_pair = interpolate_horizon(dte)
                 if horizon_pair is None:
@@ -327,6 +366,24 @@ class SignalGenerator:
                 z_by_id[id(m)] = float(z)
 
         # 4. Build TradeSignal per candidate
+        # Harvest mode vetoes on ATM IV minus trailing 63d realized vol; compute
+        # it once per symbol. Missing return history fails open (no veto) —
+        # consistent with the earnings filter, and post-ingest-fix bars are
+        # fresh, so this only fires on genuinely new symbols.
+        trail63_by_symbol: dict[str, float] = {}
+        if self._mode == "harvest":
+            for symbol in {c.symbol for c in candidates}:
+                rets = returns_by_symbol.get(symbol)
+                if rets is not None and len(rets) >= 63:
+                    trail63_by_symbol[symbol] = float(
+                        rets.iloc[-63:].std(ddof=0)
+                    ) * math.sqrt(TRADING_DAYS_PER_YEAR)
+                else:
+                    logger.warning(
+                        "harvest: no 63d return history for %s — spread veto disabled",
+                        symbol,
+                    )
+
         all_signals: list[TradeSignal] = []
         for c in candidates:
             cs_z = z_by_id[id(c)]
@@ -336,7 +393,37 @@ class SignalGenerator:
                     c.symbol, c.horizon_lower, c.horizon_upper, c.divergence,
                 )
 
-            direction = "BUY" if c.divergence > 0 else "SELL"
+            # Harvest mode sells premium unconditionally — direction never
+            # comes from the model. The divergence is still computed above and
+            # logged below so the prospective model-accuracy tests continue.
+            if self._mode == "harvest":
+                direction = "SELL"
+            else:
+                direction = "BUY" if c.divergence > 0 else "SELL"
+
+            # Extreme-spread veto (harvest only): IV far above trailing
+            # realized usually means the market is pricing real incoming vol,
+            # not extra premium — the one sell bucket that reliably lost
+            # across 7 years of history. Demote, keep auditable.
+            if self._mode == "harvest":
+                trail63 = trail63_by_symbol.get(c.symbol)
+                if trail63 is not None and (c.atm_iv - trail63) > self._spread_veto:
+                    all_signals.append(TradeSignal(
+                        symbol=c.symbol, expiration=c.expiration, dte=c.dte,
+                        horizon_lower=c.horizon_lower, horizon_upper=c.horizon_upper,
+                        weight_lower=c.weight_lower, direction=direction,
+                        underlying_price=c.underlying_price, atm_iv=c.atm_iv,
+                        predicted_iv_equivalent=c.predicted_iv_equivalent,
+                        divergence=c.divergence, cross_sectional_z=cs_z,
+                        time_series_z=ts_z, liquidity_score=0.0, legs=[],
+                        is_actionable=False,
+                        diagnostic_notes=(
+                            f"extreme-spread veto: atm_iv-trail63="
+                            f"{c.atm_iv - trail63:.3f} > {self._spread_veto} "
+                            "(market likely pricing incoming vol)"
+                        ),
+                    ))
+                    continue
 
             # Long-straddle exclusion: never buy premium on the configured
             # symbols (index ETFs). Demote the BUY to non-actionable but keep it
@@ -361,8 +448,10 @@ class SignalGenerator:
             # Event-suspect: divergences above the cap are almost certainly
             # driven by a known event (earnings, FDA, FOMC, product launch)
             # that the market is pricing and the model structurally cannot
-            # capture. Demote rather than trade.
-            if abs(c.divergence) > self._max_divergence:
+            # capture. Demote rather than trade. Model mode only — harvest
+            # doesn't trade the divergence, so its analogue is the
+            # extreme-spread veto above plus the earnings filter below.
+            if self._mode == "model" and abs(c.divergence) > self._max_divergence:
                 all_signals.append(TradeSignal(
                     symbol=c.symbol, expiration=c.expiration, dte=c.dte,
                     horizon_lower=c.horizon_lower, horizon_upper=c.horizon_upper,
@@ -400,8 +489,11 @@ class SignalGenerator:
                 ))
                 continue
 
-            # Below z threshold: emit non-actionable signal for diagnostics
-            if abs(cs_z) < self._z_threshold:
+            # Below z threshold: emit non-actionable signal for diagnostics.
+            # Model mode only — harvest sells every eligible name; there is no
+            # ranking signal worth gating on (nothing ordered the premium in
+            # any historical test), so the z-score is diagnostic-only there.
+            if self._mode == "model" and abs(cs_z) < self._z_threshold:
                 all_signals.append(TradeSignal(
                     symbol=c.symbol, expiration=c.expiration, dte=c.dte,
                     horizon_lower=c.horizon_lower, horizon_upper=c.horizon_upper,
@@ -435,7 +527,22 @@ class SignalGenerator:
 
         # 6. Rank actionable
         actionable = [s for s in all_signals if s.is_actionable]
-        actionable.sort(key=lambda s: (-abs(s.cross_sectional_z), -s.liquidity_score))
+        if self._mode == "harvest":
+            # Nearest expiration first (premium concentrates near expiry),
+            # liquidity breaks ties. One signal per symbol per cycle — the
+            # weekly re-entry cadence builds the ladder; multiple same-name
+            # expirations in one cycle would just stack correlated risk that
+            # the per-ticker exposure gate has to unwind.
+            actionable.sort(key=lambda s: (s.dte, -s.liquidity_score))
+            seen: set[str] = set()
+            deduped = []
+            for s in actionable:
+                if s.symbol not in seen:
+                    seen.add(s.symbol)
+                    deduped.append(s)
+            actionable = deduped
+        else:
+            actionable.sort(key=lambda s: (-abs(s.cross_sectional_z), -s.liquidity_score))
         return actionable[:top_n], all_signals
 
     def _check_earnings(
@@ -478,9 +585,13 @@ class SignalGenerator:
                 TradeLeg(atm_put.strike, "put", "buy", 1, atm_put.symbol),
             ], ""
 
-        # SELL → short iron condor: short ATM call + short ATM put + long OTM wings
+        # SELL → short iron condor: short ATM call + short ATM put + long OTM wings.
+        # σ for wing placement: the model's view in model mode; the market's own
+        # ATM IV in harvest mode (there is no model thesis to size wings off,
+        # and market σ places wings wider exactly when vol is priced higher).
+        wing_iv = c.predicted_iv_equivalent if self._mode == "model" else c.atm_iv
         wings = _pick_iron_condor_wings(
-            c.chain, atm_call.strike, c.predicted_iv_equivalent, c.dte, c.underlying_price,
+            c.chain, atm_call.strike, wing_iv, c.dte, c.underlying_price,
         )
         if wings is None:
             return [], "SELL: insufficient OTM strikes for iron condor wings"
