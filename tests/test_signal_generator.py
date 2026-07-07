@@ -396,6 +396,27 @@ def test_harvest_dte_ceiling_and_per_symbol_dedupe():
     print("harvest_dte: DTE-25 skipped, DTE-8 chosen over DTE-11")
 
 
+def test_harvest_entry_floor_below_model_floor():
+    """Harvest's floor (5) sits below the model-mode MIN_ENTRY_DTE (7):
+    DTE-5 condors enter, DTE-4 stays out, and the nearest eligible wins the
+    actionable slot. Guards the fat-zone coverage the strategy is built on."""
+    from signals import MIN_ENTRY_DTE
+    exps = [date(2026, 6, 5), date(2026, 6, 6), date(2026, 6, 12)]  # DTE 4, 5, 11
+    scan = _harvest_scan([("X", 0.25)], expirations=exps)
+    predictors = {h: _ConstPredictor() for h in (5, 10, 21)}
+    feature_rows = {"X": pd.DataFrame({"a": [0.0]}, index=[date(2026, 5, 29)])}
+    returns_by_symbol = {"X": _HARVEST_RETURNS}
+
+    gen = SignalGenerator(predictors_by_horizon=predictors, history_store=None,
+                          strategy_mode="harvest")
+    actionable, all_signals = gen.generate(scan, feature_rows, returns_by_symbol, top_n=10)
+
+    assert sorted({s.dte for s in all_signals}) == [5, 11], \
+        f"expected DTE 4 out / 5 in: {sorted({s.dte for s in all_signals})}"
+    assert actionable[0].dte == 5 < MIN_ENTRY_DTE
+    print("harvest_floor: DTE-5 enters (below model floor 7), DTE-4 excluded")
+
+
 def test_strategy_mode_validated():
     predictors = {h: _ConstPredictor() for h in (5, 10, 21)}
     try:
@@ -405,6 +426,14 @@ def test_strategy_mode_validated():
         print("strategy_mode_validated: 'yolo' rejected")
     else:
         raise AssertionError("invalid strategy_mode should raise")
+    try:
+        SignalGenerator(predictors_by_horizon=predictors, strategy_mode="harvest",
+                        harvest_min_entry_dte=2)
+    except ValueError as e:
+        assert "harvest_min_entry_dte" in str(e)
+        print("harvest_min_entry_dte: 2 rejected (below horizon-mapping floor)")
+    else:
+        raise AssertionError("harvest_min_entry_dte below MIN_DTE should raise")
 
 
 # ---------- live integration ----------

@@ -201,10 +201,16 @@ class SignalGenerator:
         long_straddle_excluded_symbols: frozenset[str] | set[str] | None = None,
         strategy_mode: str = "model",
         extreme_spread_veto: float = 0.12,
+        harvest_min_entry_dte: int = 5,
         harvest_max_entry_dte: int = 15,
     ):
         if strategy_mode not in ("model", "harvest"):
             raise ValueError(f"strategy_mode must be 'model' or 'harvest', got {strategy_mode!r}")
+        if harvest_min_entry_dte < MIN_DTE:
+            raise ValueError(
+                f"harvest_min_entry_dte must be >= {MIN_DTE} (horizon-mapping floor), "
+                f"got {harvest_min_entry_dte}"
+            )
         for h in TRAINED_HORIZONS:
             if h not in predictors_by_horizon:
                 raise ValueError(f"missing predictor for horizon {h}")
@@ -239,10 +245,15 @@ class SignalGenerator:
         # spread decile was the only reliably losing sell bucket in 7 years.
         # Crash insurance, not alpha: it costs a little in calm years.
         self._spread_veto = extreme_spread_veto
-        # Entry ceiling for harvest sells: premium concentrates near expiry
-        # (DTE 2-10 in the live log); condors are held to expiry, so a ceiling
-        # just above the fat zone keeps every position inside it while weekly
-        # re-entry covers the ladder. DTE 22+ short vol lost money May-June.
+        # Entry window for harvest sells: premium concentrates near expiry
+        # (DTE 2-10 in the live log), and the ranking prefers the nearest
+        # expiration, so the FLOOR sets where the book actually lives — at 5,
+        # entries cluster in DTE 5-8 and ride to zero, covering the fat zone.
+        # The model-mode floor (MIN_ENTRY_DTE=7) exists for straddles the
+        # proximity exit would force-close; condors are exempt from that exit,
+        # so harvest can start closer in. Ceiling: DTE 22+ short vol lost
+        # money May-June; just above the fat zone keeps every position in it.
+        self._harvest_min_dte = harvest_min_entry_dte
         self._harvest_max_dte = harvest_max_entry_dte
 
     def generate(
@@ -291,15 +302,16 @@ class SignalGenerator:
 
             for expiration, chain in chains_by_exp.items():
                 dte = (expiration - today).days
-                # Entry floor: too close to expiry and the position would just be
-                # force-closed by the expiration_proximity exit before its thesis
-                # can play out (see MIN_ENTRY_DTE). Skip silently — same as an
-                # out-of-window DTE — so these don't clutter the signal log.
-                if dte < MIN_ENTRY_DTE:
-                    continue
-                # Harvest mode only sells the short-tenor fat zone; longer
-                # expirations are skipped silently like any out-of-window DTE.
-                if self._mode == "harvest" and dte > self._harvest_max_dte:
+                # Entry floor. Model mode: below MIN_ENTRY_DTE a fresh straddle
+                # would just be force-closed by the expiration_proximity exit
+                # before its thesis can play out. Harvest mode: condors are
+                # exempt from that exit, so the floor drops to the fat zone;
+                # the ceiling keeps entries inside it. Skip silently — same as
+                # an out-of-window DTE — so these don't clutter the signal log.
+                if self._mode == "harvest":
+                    if dte < self._harvest_min_dte or dte > self._harvest_max_dte:
+                        continue
+                elif dte < MIN_ENTRY_DTE:
                     continue
                 horizon_pair = interpolate_horizon(dte)
                 if horizon_pair is None:
