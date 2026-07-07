@@ -468,12 +468,16 @@ class SignalGenerator:
                 ))
                 continue
 
-            # Earnings filter: demote if a known earnings date falls within
-            # `earnings_buffer_days` of today. The 0.25 divergence cap catches
-            # obvious earnings-day IV spikes; this catches the gradual pre-
-            # earnings ramp where divergence sits at 0.18-0.24. Failing open
-            # is intentional — a flaky earnings API must not halt trading.
-            earnings_demote = self._check_earnings(c.symbol, today)
+            # Earnings filter. Model mode: fixed buffer only — the old
+            # today->expiration rule over-blocked 45-DTE entries for reports a
+            # month out with no IV ramp yet (see 9364f85). Harvest mode: the
+            # window extends to the candidate's EXPIRATION — entries go out to
+            # DTE 15 and ride to expiry, so a report on day 10 is exactly what
+            # kills the premium seller; "imminent" is the wrong test when you
+            # can't exit before the event. Failing open is intentional — a
+            # flaky earnings API must not halt trading.
+            earnings_window_end = c.expiration if self._mode == "harvest" else None
+            earnings_demote = self._check_earnings(c.symbol, today, earnings_window_end)
             if earnings_demote is not None:
                 earnings_date, note = earnings_demote
                 all_signals.append(TradeSignal(
@@ -546,14 +550,18 @@ class SignalGenerator:
         return actionable[:top_n], all_signals
 
     def _check_earnings(
-        self, symbol: str, today: date
+        self, symbol: str, today: date, window_end: date | None = None
     ) -> tuple[date, str] | None:
         """Return (earnings_date, diagnostic_note) if the signal should be demoted
-        for earnings risk, None if it should pass. Fails open: missing calendar,
+        for earnings risk, None if it should pass. The window runs from today to
+        `window_end` (the candidate's expiration, for held-to-expiry structures)
+        or the fixed buffer, whichever is later. Fails open: missing calendar,
         no API key, or no data for the symbol all return None."""
         if not self._earnings_filter_enabled or self._earnings is None:
             return None
         end = today + timedelta(days=self._earnings_buffer_days)
+        if window_end is not None and window_end > end:
+            end = window_end
         result = self._earnings.has_earnings_in_window(symbol, today, end)
         if result is None:
             # No information — fail open. The calendar logs a single WARNING on
@@ -567,7 +575,7 @@ class SignalGenerator:
         return (
             earnings_date,
             f"earnings_within_window: {symbol} reports {earnings_date.isoformat()} "
-            f"within {self._earnings_buffer_days}-day buffer",
+            f"on/before window end {end.isoformat()}",
         )
 
     def _build_legs(self, c: _Candidate, direction: str) -> tuple[list[TradeLeg], str]:
