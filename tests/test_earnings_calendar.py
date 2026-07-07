@@ -81,6 +81,7 @@ def _build_generator(
     earnings: EarningsCalendar | None,
     enabled: bool = True,
     buffer_days: int = 7,
+    strategy_mode: str = "model",
 ) -> SignalGenerator:
     predictors = {h: _FixedPredictor() for h in (5, 10, 21)}
     return SignalGenerator(
@@ -91,6 +92,7 @@ def _build_generator(
         earnings_calendar=earnings,
         earnings_filter_enabled=enabled,
         earnings_buffer_days=buffer_days,
+        strategy_mode=strategy_mode,
     )
 
 
@@ -180,17 +182,18 @@ def test_signal_demoted_when_earnings_inside_buffer():
         assert not sig.is_actionable, "NVDA must be demoted by earnings filter"
         assert "earnings_within_window" in sig.diagnostic_notes
         assert "2026-05-10" in sig.diagnostic_notes
-        assert "7-day buffer" in sig.diagnostic_notes
+        assert "2026-05-13" in sig.diagnostic_notes  # window end = today + 7
         assert "NVDA" not in [s.symbol for s in actionable]
         cal.close()
     print("filter_demote: NVDA earnings 5/10 (4d out) within 7-day buffer → demoted")
 
 
 def test_signal_passes_when_earnings_outside_buffer_but_inside_expiration():
-    """Earnings 14 days out, default buffer 7. Under the OLD rule (earnings ≤
-    expiration) this would be demoted because 5/20 ≤ 5/22. Under the NEW rule
-    (earnings within buffer) it passes — this is the case that demonstrates
-    the rule change."""
+    """MODEL MODE ONLY: earnings 14 days out, default buffer 7 → passes. The
+    buffer-only rule exists so a 45-DTE divergence trade isn't blocked by a
+    report a month out with no IV ramp yet (9364f85). Harvest mode inverts
+    this deliberately — see test_harvest_earnings_window_extends_to_expiration:
+    held-to-expiry sellers sit through any report inside the position's life."""
     today = date(2026, 5, 6)
     expiration = date(2026, 5, 22)  # earnings 5/20 is BEFORE expiration
     with tempfile.TemporaryDirectory() as tmp:
@@ -207,6 +210,38 @@ def test_signal_passes_when_earnings_outside_buffer_but_inside_expiration():
         assert "earnings_within_window" not in sig.diagnostic_notes
         cal.close()
     print("filter_pass_outside_buffer: earnings 5/20 (14d out) outside 7-day buffer → not demoted")
+
+
+def test_harvest_earnings_window_extends_to_expiration():
+    """Harvest mode: a report OUTSIDE the buffer but INSIDE the position's
+    life demotes the sell — the condor rides to expiry, so it sits through
+    the report either way. Identical input passes in model mode."""
+    today = date(2026, 5, 6)
+    expiration = date(2026, 5, 18)          # DTE 12 — inside harvest's 5-15 window
+    earnings_date = date(2026, 5, 16)       # 10 days out: past buffer 7, before expiry
+    feature_rows = {"NVDA": pd.DataFrame({"a": [0.0]}, index=[date(2026, 5, 5)])}
+    # ±1.2% daily → trail63 ≈ 0.19; fixture IV 0.30 → spread 0.11, under the
+    # 0.12 extreme-spread veto so the earnings gate is what decides.
+    returns_by_symbol = {"NVDA": pd.Series([0.012, -0.012] * 50)}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cal = EarningsCalendar(Path(tmp) / "earnings.db", api_key=None)
+        cal._seed_for_testing([("NVDA", earnings_date)], today=today)
+
+        gen_h = _build_generator(earnings=cal, strategy_mode="harvest")
+        scan = _mk_scan(today, expiration, ["NVDA"])
+        actionable, sigs = gen_h.generate(scan, feature_rows, returns_by_symbol, top_n=10)
+        sig = next(s for s in sigs if s.symbol == "NVDA")
+        assert "earnings_within_window" in sig.diagnostic_notes, sig.diagnostic_notes
+        assert "2026-05-16" in sig.diagnostic_notes
+        assert not actionable
+
+        gen_m = _build_generator(earnings=cal, strategy_mode="model")
+        _, sigs_m = gen_m.generate(scan, feature_rows, returns_by_symbol, top_n=10)
+        sig_m = next(s for s in sigs_m if s.symbol == "NVDA")
+        assert "earnings_within_window" not in sig_m.diagnostic_notes
+        cal.close()
+    print("harvest_earnings_window: 10d-out report demotes harvest sell, passes model mode")
 
 
 def test_custom_buffer_days_changes_demotion():
@@ -227,7 +262,7 @@ def test_custom_buffer_days_changes_demotion():
         _, sigs_wide = gen_wide.generate(scan, feature_rows, returns_by_symbol, top_n=10)
         sig_wide = next(s for s in sigs_wide if s.symbol == "NVDA")
         assert "earnings_within_window" in sig_wide.diagnostic_notes
-        assert "10-day buffer" in sig_wide.diagnostic_notes
+        assert "2026-05-16" in sig_wide.diagnostic_notes  # window end = today + 10
 
         # buffer=3: 6 days out is outside → allowed
         gen_narrow = _build_generator(earnings=cal, buffer_days=3)
