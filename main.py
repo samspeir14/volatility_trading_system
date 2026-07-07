@@ -572,11 +572,19 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
     )
     logger.info("strategy mode: %s", settings.strategy_mode)
 
+    # Per-trade 1.5% + portfolio wing-risk 12%: sized for the correlated
+    # crash, not the average week. At 1.5%/$100k, one contract of AMD/CAT/GS
+    # (price × IV too big) doesn't fit — they were already over the old 2%
+    # budget; META/TSLA/UNH fit at the short end of the entry window only.
+    # The 12% cap bounds worst-case book drawdown (all condors through their
+    # wings at once, March-2020 shape) by construction: ~8 concurrent
+    # full-size positions, entries auto-throttle when the ladder is full.
     risk_manager = RiskManager(
         watchlist=watchlist,
-        max_per_trade_loss_pct=0.02,
+        max_per_trade_loss_pct=0.015,
         max_per_ticker_exposure_pct=0.05,
         max_per_sector_positions=4,
+        max_portfolio_risk_pct=0.12,
         max_portfolio_delta_pct=0.05,
         max_portfolio_gamma_pct=0.01,
         max_portfolio_vega_pct=0.05,
