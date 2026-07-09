@@ -68,6 +68,7 @@ async def main() -> int:
             reconciler = PositionReconciler(
                 client=client, order_log=order_log,
                 account_id=settings.account_id,
+                per_contract_fee=settings.per_contract_fee,
             )
             result = await reconciler.reconcile(date.today())
 

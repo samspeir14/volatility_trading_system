@@ -161,10 +161,12 @@ class PositionReconciler:
         client: AsyncTradierClient,
         order_log: OrderLog,
         account_id: str,
+        per_contract_fee: float = 0.0,
     ):
         self._client = client
         self._log = order_log
         self._account_id = account_id
+        self._per_contract_fee = per_contract_fee
         # Underlying close-price cache, scoped per reconcile() call.
         self._close_cache: dict[tuple[str, date], float | None] = {}
 
@@ -324,17 +326,25 @@ class PositionReconciler:
 
             trigger = "expired_worthless" if abs(realized - floor) < 0.01 and row["direction"] == "BUY" \
                 else "expired"
+            # Only the opening order ever executed (the legs expired), so net
+            # out one side's contract fees. The floor check and trigger above
+            # stay on the gross number — the floor is a theoretical payoff
+            # bound that doesn't include fees.
+            open_fees = self._per_contract_fee * sum(
+                int(leg["quantity"]) for leg in legs
+            )
             self._log.record_expiration(
                 opening_order_id=order_id,
                 expired_at=now,
-                realized_pnl=realized,
+                realized_pnl=realized - open_fees,
                 exit_trigger=trigger,
             )
             logger.info(
                 "reconciler: order %s (%s %s %s exp=%s) marked %s "
-                "realized_pnl=$%+.2f (entry_premium=$%.2f S_close=$%.2f)",
+                "realized_pnl=$%+.2f (entry_premium=$%.2f S_close=$%.2f fees=$%.2f)",
                 order_id, underlying, row["structure"], row["direction"],
-                expiration.isoformat(), trigger, realized, entry_premium, underlying_close,
+                expiration.isoformat(), trigger, realized - open_fees,
+                entry_premium, underlying_close, open_fees,
             )
             expired_closed.append(order_id)
 

@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from config import Settings, load_settings, load_watchlist
+from config import SMALL_WATCHLIST_PATH, Settings, load_settings, load_watchlist
 from data import (
     AsyncTradierClient,
     EarningsCalendar,
@@ -73,6 +73,89 @@ SCAN_EXPIRATION_WINDOW_HARVEST = (3, 16)
 def _scan_window(settings: Settings) -> tuple[int, int]:
     return (SCAN_EXPIRATION_WINDOW_HARVEST if settings.strategy_mode == "harvest"
             else SCAN_EXPIRATION_WINDOW)
+
+
+@dataclass(frozen=True)
+class RiskCalibration:
+    """The equity-relative risk knobs plus the few absolute-dollar backstops,
+    bundled so the two harvest profiles stay side-by-side and comparable."""
+    max_per_trade_loss_pct: float
+    max_per_ticker_exposure_pct: float
+    max_per_sector_positions: int
+    max_portfolio_risk_pct: float
+    max_portfolio_delta_pct: float
+    max_portfolio_gamma_pct: float
+    max_portfolio_vega_pct: float
+    daily_loss_kill_switch_pct: float
+    min_buying_power_buffer_pct: float
+    max_premium_per_trade: float
+    min_credit: float
+    # Cap on RiskManager's sized quantity. Orders always submit 1-lot (signal
+    # legs are quantity=1 and RiskDecision.quantity is never applied), so any
+    # value above 1 books phantom multi-lot risk into the committed-risk /
+    # Greek / margin projections. Standard keeps the historical 10 to preserve
+    # paper behavior; small uses 1 so the gates account for what actually
+    # trades — at a $1,200 wing-risk cap, $130-250 of phantom commitment per
+    # approval would otherwise throttle the ladder at ~half its design size.
+    max_contracts_per_trade: int
+
+
+# Per-trade 1.5% + portfolio wing-risk 20%: the cap bounds worst-case
+# book drawdown (all condors through their wings at once, March-2020
+# shape) by construction — ~13 concurrent full-size positions, entries
+# auto-throttle when the ladder is full. 20% is PAPER calibration: more
+# positions = faster friction measurement, and fake drawdowns are
+# tuition. Revisit (≤12%) before any real-money deployment. At
+# 1.5%/$100k, one contract of AMD/CAT/GS (price × IV too big) doesn't
+# fit — they were already over the old 2% budget; META/TSLA/UNH fit at
+# the short end of the entry window only.
+CALIBRATION_STANDARD = RiskCalibration(
+    max_per_trade_loss_pct=0.015,
+    max_per_ticker_exposure_pct=0.05,
+    max_per_sector_positions=4,
+    max_portfolio_risk_pct=0.20,
+    max_portfolio_delta_pct=0.05,
+    max_portfolio_gamma_pct=0.01,
+    max_portfolio_vega_pct=0.05,
+    daily_loss_kill_switch_pct=-0.05,
+    min_buying_power_buffer_pct=0.05,
+    max_premium_per_trade=5000.0,
+    min_credit=0.0,
+    max_contracts_per_trade=10,
+)
+
+# small_harvest: same strategy, ~$10k bankroll, watchlist_small.yaml. Orders
+# are 1-lot, so the per-trade pct is an eligibility gate, not a size: at 2.5%
+# the $250 budget admits the whole cheap watchlist's 1σ condors ($40-$220 max
+# loss) with the pricier names (BAC/SLV/B) fitting at the short-DTE end only.
+# Portfolio wing risk 12% is the real-money number the 20% comment above
+# defers — this profile exists to go live. Gamma cap 10%, not 1%: the gamma
+# gate sums raw gamma × 100, and raw ATM gamma scales as 1/(S·σ·√T), so a $14
+# name carries ~15× the raw gamma of a $170 one — at 1% the cap would reject
+# a cheap-name book after ~2 positions; 10% admits the intended ~10-15
+# position ladder while still capping a pile-up. Premium backstop $500 (5% of
+# bankroll, mirroring $5k/5% at $100k). Min credit $0.25: execution prices 2%
+# below mid and a round trip costs ~$1-4 in fees, so thinner credits are
+# structurally unprofitable.
+CALIBRATION_SMALL = RiskCalibration(
+    max_per_trade_loss_pct=0.025,
+    max_per_ticker_exposure_pct=0.05,
+    max_per_sector_positions=4,
+    max_portfolio_risk_pct=0.12,
+    max_portfolio_delta_pct=0.05,
+    max_portfolio_gamma_pct=0.10,
+    max_portfolio_vega_pct=0.05,
+    daily_loss_kill_switch_pct=-0.05,
+    min_buying_power_buffer_pct=0.05,
+    max_premium_per_trade=500.0,
+    min_credit=0.25,
+    max_contracts_per_trade=1,
+)
+
+
+def _calibration(settings: Settings) -> RiskCalibration:
+    return (CALIBRATION_SMALL if settings.harvest_profile == "small"
+            else CALIBRATION_STANDARD)
 
 
 @dataclass(frozen=True)
@@ -549,7 +632,8 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
             "the key is added to .env"
         )
 
-    watchlist = load_watchlist()
+    watchlist = (load_watchlist(SMALL_WATCHLIST_PATH)
+                 if settings.harvest_profile == "small" else load_watchlist())
     market_data = MarketData(client, watchlist)
     feature_pipeline = FeaturePipeline(
         store, watchlist,
@@ -558,6 +642,7 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
     position_tracker = PositionTracker(client=client, order_log=order_log, settings=settings)
     position_reconciler = PositionReconciler(
         client=client, order_log=order_log, account_id=settings.account_id,
+        per_contract_fee=settings.per_contract_fee,
     )
     portfolio_state_builder = PortfolioStateBuilder(
         client=client, order_log=order_log,
@@ -577,6 +662,8 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
         t.symbol for t in watchlist if t.sector in ("etf", "bonds")
     )
 
+    cal = _calibration(settings)
+
     signal_generator = SignalGenerator(
         predictors_by_horizon=predictors,
         history_store=divergence_history,
@@ -587,34 +674,33 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
         earnings_buffer_days=settings.earnings_buffer_days,
         long_straddle_excluded_symbols=etf_symbols,
         strategy_mode=settings.strategy_mode,
+        min_credit=cal.min_credit,
     )
-    logger.info("strategy mode: %s", settings.strategy_mode)
+    logger.info(
+        "strategy mode: %s (profile: %s, %d-name watchlist)",
+        settings.strategy_mode, settings.harvest_profile, len(watchlist),
+    )
 
-    # Per-trade 1.5% + portfolio wing-risk 20%: the cap bounds worst-case
-    # book drawdown (all condors through their wings at once, March-2020
-    # shape) by construction — ~13 concurrent full-size positions, entries
-    # auto-throttle when the ladder is full. 20% is PAPER calibration: more
-    # positions = faster friction measurement, and fake drawdowns are
-    # tuition. Revisit (≤12%) before any real-money deployment. At
-    # 1.5%/$100k, one contract of AMD/CAT/GS (price × IV too big) doesn't
-    # fit — they were already over the old 2% budget; META/TSLA/UNH fit at
-    # the short end of the entry window only.
+    # The rationale for both parameter sets lives on CALIBRATION_STANDARD /
+    # CALIBRATION_SMALL at the top of this module.
     risk_manager = RiskManager(
         watchlist=watchlist,
-        max_per_trade_loss_pct=0.015,
-        max_per_ticker_exposure_pct=0.05,
-        max_per_sector_positions=4,
-        max_portfolio_risk_pct=0.20,
-        max_portfolio_delta_pct=0.05,
-        max_portfolio_gamma_pct=0.01,
-        max_portfolio_vega_pct=0.05,
-        daily_loss_kill_switch_pct=-0.05,
-        min_buying_power_buffer_pct=0.05,
+        max_per_trade_loss_pct=cal.max_per_trade_loss_pct,
+        max_per_ticker_exposure_pct=cal.max_per_ticker_exposure_pct,
+        max_per_sector_positions=cal.max_per_sector_positions,
+        max_portfolio_risk_pct=cal.max_portfolio_risk_pct,
+        max_portfolio_delta_pct=cal.max_portfolio_delta_pct,
+        max_portfolio_gamma_pct=cal.max_portfolio_gamma_pct,
+        max_portfolio_vega_pct=cal.max_portfolio_vega_pct,
+        daily_loss_kill_switch_pct=cal.daily_loss_kill_switch_pct,
+        min_buying_power_buffer_pct=cal.min_buying_power_buffer_pct,
         kill_switch=kill_switch,
+        max_quantity_per_leg=cal.max_contracts_per_trade,
     )
 
     order_manager = OrderManager(
         client=client, order_log=order_log, settings=settings,
+        max_premium_per_trade=cal.max_premium_per_trade,
         stale_order_threshold_minutes=settings.stale_order_threshold_minutes,
         max_close_retries=settings.max_close_retries,
     )
@@ -656,6 +742,10 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
         watchlist_symbols=[t.symbol for t in watchlist],
         slack_webhook_url=os.environ.get("SLACK_WEBHOOK_URL"),
         scan_interval_seconds=int(os.environ.get("SCAN_INTERVAL_SECONDS", "300")),
+        # The kill switch that actually trips lives here, not in RiskManager
+        # (whose daily_loss_kill_switch_pct is stored but never read) — wire
+        # the calibration through so the knob is real for both profiles.
+        kill_switch_threshold_pct=cal.daily_loss_kill_switch_pct,
     )
     return loop, closeables
 

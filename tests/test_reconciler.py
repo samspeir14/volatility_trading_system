@@ -420,6 +420,80 @@ def test_settle_intrinsic_pnl_unit():
     print("settle_intrinsic_pnl: all unit cases pass ✓")
 
 
+def test_reconciler_expiry_fees_netted_and_floor_check_stays_gross():
+    """per_contract_fee on expiry settlement: realized = gross intrinsic −
+    fee × Σ leg quantities (open side only — expired legs pay no close fees).
+    CRITICAL invariant: the max-loss floor sanity check and the trigger
+    comparison stay on the GROSS number, so a max-loss expiry with fees on
+    nets BELOW the theoretical floor and must still be recorded, not skipped
+    as a floor breach."""
+    fee = 0.45
+
+    # Scenario 1: short IC expires all OTM → gross +$120, minus 4 × $0.45.
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "orders.db")
+        expiration = date(2026, 5, 15)
+        _seed_open_order(
+            log, order_id=9060, symbol="AAPL", expiration=expiration,
+            direction="SELL", structure="iron_condor", entry_premium=1.20,
+            legs=_ic_legs(),
+            submitted_at=datetime(2026, 4, 27, 16, 0, tzinfo=timezone.utc),
+        )
+        client = mock.AsyncMock()
+        client.get_positions.return_value = []
+        _mock_close(client, {"AAPL": 145.0}, expiration)  # all 4 legs OTM
+
+        reconciler = PositionReconciler(client=client, order_log=log,
+                                        account_id="VA1", per_contract_fee=fee)
+        result = asyncio.run(reconciler.reconcile(expiration + timedelta(days=1)))
+
+        assert result.expired_closed == [9060], result
+        row = log._conn.execute(
+            "SELECT realized_pnl FROM submitted_orders WHERE tradier_order_id = ?",
+            (9060,),
+        ).fetchone()
+        expected = 120.0 - 4 * fee  # $118.20
+        assert abs(row[0] - expected) < 0.01, f"expected {expected:+.2f}, got {row[0]}"
+        log.close()
+
+    # Scenario 2: max-loss expiry. Gross = −$380, exactly the defined-risk
+    # floor; net −$381.80 sits below it. Must still be marked closed — if
+    # this lands in skipped_premature, the floor check is (wrongly) netting.
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "orders.db")
+        expiration = date(2026, 5, 15)
+        entry_credit = 1.20
+        _seed_open_order(
+            log, order_id=9061, symbol="AAPL", expiration=expiration,
+            direction="SELL", structure="iron_condor", entry_premium=entry_credit,
+            legs=_ic_legs(),  # 150/155 call wings → max loss (5 − 1.20) × 100
+            submitted_at=datetime(2026, 4, 27, 16, 0, tzinfo=timezone.utc),
+        )
+        client = mock.AsyncMock()
+        client.get_positions.return_value = []
+        _mock_close(client, {"AAPL": 170.0}, expiration)  # both call legs ITM
+
+        reconciler = PositionReconciler(client=client, order_log=log,
+                                        account_id="VA1", per_contract_fee=fee)
+        result = asyncio.run(reconciler.reconcile(expiration + timedelta(days=1)))
+
+        assert result.expired_closed == [9061], (
+            f"max-loss expiry with fees skipped as floor breach: {result}"
+        )
+        assert result.skipped_premature == []
+        row = log._conn.execute(
+            "SELECT realized_pnl, exit_trigger FROM submitted_orders WHERE tradier_order_id = ?",
+            (9061,),
+        ).fetchone()
+        expected = -380.0 - 4 * fee  # −$381.80, below the gross floor of −$380
+        assert abs(row[0] - expected) < 0.01, f"expected {expected:+.2f}, got {row[0]}"
+        floor = max_loss_dollars([asdict(l) for l in _ic_legs()], "SELL", entry_credit)
+        assert row[0] < floor, "net must land below the gross-only floor"
+        assert row[1] == "expired"  # SELL never gets 'expired_worthless'
+        log.close()
+    print("reconciler: expiry fees netted (open side only), floor check stays gross ✓")
+
+
 def test_reconciler_holds_live_position_with_legs_still_in_tradier():
     """Sanity check: position whose legs are still present is left alone."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -815,6 +889,7 @@ def main() -> int:
     test_reconciler_short_ic_max_loss_both_call_legs_itm()
     test_reconciler_defers_closure_when_history_unavailable()
     test_reconciler_underlying_close_cached_within_one_call()
+    test_reconciler_expiry_fees_netted_and_floor_check_stays_gross()
     test_reconciler_holds_live_position_with_legs_still_in_tradier()
     test_reconciler_flags_assignment_when_stock_position_appears()
     test_reconciler_idempotent_assignment_alert()

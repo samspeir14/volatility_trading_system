@@ -1,0 +1,27 @@
+# small_harvest universe (~$10k bankroll): names priced so a 1-sigma-wing
+# iron condor's max loss fits the 2.5%/$250 per-trade budget. All verified
+# 2026-07 to have weekly options and liquid chains ($0.50-$1 strikes near the
+# money) except KVUE, whose weekly listing is unverified — the per-leg
+# liquidity gates (vol>=10, OI>=50, spread<=10%) filter it at runtime if the
+# chain doesn't cooperate. Prices drift: a name that outgrows the budget is
+# rejected per-cycle by the per-trade sizing gate, not an error.
+tickers:
+  - {symbol: F,     sector: consumer}      # ~$14
+  - {symbol: RIVN,  sector: consumer}      # ~$17, high IV
+  - {symbol: CCL,   sector: consumer}      # ~$27, very liquid
+  - {symbol: AAL,   sector: industrials}   # ~$17
+  - {symbol: SOFI,  sector: financials}    # ~$18, high IV
+  - {symbol: BAC,   sector: financials}    # ~$59
+  - {symbol: T,     sector: telecom}       # ~$21, low IV
+  - {symbol: VZ,    sector: telecom}       # ~$43, low IV
+  - {symbol: CMCSA, sector: telecom}       # ~$23; NBCU/Sky spinoff ~mid-2027
+  - {symbol: PFE,   sector: healthcare}    # ~$24
+  - {symbol: KVUE,  sector: healthcare}    # ~$19; weeklies unverified
+  - {symbol: HAL,   sector: energy}        # ~$34
+  - {symbol: KMI,   sector: energy}        # ~$33; widest quotes of the set
+  - {symbol: KO,    sector: staples}       # ~$83, low IV so wings stay narrow
+  - {symbol: PCG,   sector: utilities}     # ~$17; CA wildfire tail risk
+  - {symbol: B,     sector: materials}     # ~$37 Barrick (ex-GOLD), high vol
+  - {symbol: XLF,   sector: etf}           # ~$55
+  - {symbol: SLV,   sector: etf}           # ~$53; silver vol elevated 2026
+  - {symbol: TLT,   sector: bonds}         # ~$84, elite liquidity, low IV
