@@ -38,7 +38,18 @@ class Settings:
     # "model": trade model-vs-IV divergence (both directions, z-gated).
     # "harvest": sell short-DTE iron condors on every eligible name — the
     # variance-risk-premium harvesting strategy; model runs log-only.
+    # STRATEGY_MODE=small_harvest normalizes to strategy_mode="harvest" with
+    # harvest_profile="small", so every mode check in the strategy path sees
+    # plain "harvest" and only the calibration wiring branches on the profile.
     strategy_mode: str = "model"
+    # "standard": the ~$100k calibration the watchlist/risk numbers were tuned
+    # on. "small": ~$10k bankroll — cheap-ticker watchlist, retuned risk caps.
+    harvest_profile: str = "standard"
+    # Estimated all-in cost per option contract per side, netted out of each
+    # position's realized P&L. 0.0 preserves gross-P&L bookkeeping (paper).
+    # Live on Tradier: ~0.10 covers ORF/OCC/TAF pass-throughs on the Pro plan;
+    # ~0.45 on the Lite plan ($0.35 commission + pass-throughs).
+    per_contract_fee: float = 0.0
 
 
 def load_settings() -> Settings:
@@ -75,10 +86,28 @@ def load_settings() -> Settings:
         os.environ.get("MAX_CLOSE_RETRIES"), default=3,
     )
     strategy_mode = os.environ.get("STRATEGY_MODE", "model").strip().lower()
-    if strategy_mode not in ("model", "harvest"):
+    if strategy_mode not in ("model", "harvest", "small_harvest"):
         raise ValueError(
-            f"STRATEGY_MODE must be 'model' or 'harvest', got {strategy_mode!r}"
+            f"STRATEGY_MODE must be 'model', 'harvest', or 'small_harvest', "
+            f"got {strategy_mode!r}"
         )
+    harvest_profile = "small" if strategy_mode == "small_harvest" else "standard"
+    if strategy_mode == "small_harvest":
+        strategy_mode = "harvest"
+    # Strict parse, unlike the operational knobs above: a typo'd fee silently
+    # becoming 0.0 would overstate every live realized P&L with no log trace.
+    raw_fee = os.environ.get("PER_CONTRACT_FEE")
+    if raw_fee is None or raw_fee.strip() == "":
+        per_contract_fee = 0.0
+    else:
+        try:
+            per_contract_fee = float(raw_fee)
+        except ValueError:
+            raise ValueError(
+                f"PER_CONTRACT_FEE must be a number, got {raw_fee!r}"
+            ) from None
+    if per_contract_fee < 0:
+        raise ValueError(f"PER_CONTRACT_FEE must be >= 0, got {per_contract_fee}")
 
     return Settings(
         api_key=api_key,
@@ -91,6 +120,8 @@ def load_settings() -> Settings:
         stale_order_threshold_minutes=stale_order_threshold_minutes,
         max_close_retries=max_close_retries,
         strategy_mode=strategy_mode,
+        harvest_profile=harvest_profile,
+        per_contract_fee=per_contract_fee,
     )
 
 

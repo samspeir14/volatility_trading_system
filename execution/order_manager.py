@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import time
@@ -184,6 +185,7 @@ class OrderManager:
         self._settings = settings
         self._max_qty = max_quantity_per_leg
         self._max_premium = max_premium_per_trade
+        self._fee_per_contract = settings.per_contract_fee
         self._poll_interval = poll_interval_seconds
         self._poll_timeout = poll_timeout_seconds
         self._slippage = slippage_buffer
@@ -528,12 +530,17 @@ class OrderManager:
         terminal_at = datetime.now(timezone.utc)
 
         if terminal_status == "filled":
+            # Open + close sides both executed: fees on every leg, twice.
+            fees = self._fee_per_contract * 2 * sum(
+                leg.quantity for leg in position.legs
+            )
             realized_pnl = self._compute_close_realized_pnl(
                 is_long=position.is_long,
                 entry_premium=position.entry_premium,
                 order_type=order_type,
                 fill_price=fill_price,
                 fallback_pnl=mark.pnl_dollars,
+                fees=fees,
             )
             self._log.update_close_attempt(
                 closing_order_id=closing_order_id, status="filled",
@@ -732,10 +739,22 @@ class OrderManager:
         )
         entry_premium = abs(float(raw_fill))
 
+        # Guarded like every other reader of legs_json (reconciler, tracker):
+        # a corrupt row must not block booking the close it describes.
+        try:
+            opening_legs = json.loads(opening["legs_json"])
+            contracts = sum(int(leg["quantity"]) for leg in opening_legs)
+        except (json.JSONDecodeError, TypeError, KeyError, ValueError):
+            logger.warning(
+                "reconcile: bad legs_json on opening order %s — booking close "
+                "without fee netting", opening_order_id,
+            )
+            contracts = 0
+        fees = self._fee_per_contract * 2 * contracts
         realized_pnl = self._compute_close_realized_pnl(
             is_long=is_long, entry_premium=entry_premium,
             order_type=order_type, fill_price=fill_price,
-            fallback_pnl=0.0,
+            fallback_pnl=0.0, fees=fees,
         )
 
         self._log.update_close_attempt(
@@ -763,18 +782,22 @@ class OrderManager:
         order_type: str,
         fill_price: float | None,
         fallback_pnl: float,
+        fees: float = 0.0,
     ) -> float:
         """Realized P&L using Tradier's signed avg_fill_price + order_type.
         Tradier returns credit fills as NEGATIVE; abs() + order_type carries
         the canonical sign so credits add and debits subtract from realized.
-        If fill_price is missing (rare), falls back to the mark estimate."""
+        If fill_price is missing (rare), falls back to the mark estimate.
+        `fees` (estimated round-trip contract fees) are netted out; the
+        equity-derived unrealized split in portfolio_state absorbs the
+        difference, so the bookkeeping identity still holds."""
         if fill_price is None:
-            return fallback_pnl
+            return fallback_pnl - fees
         abs_fill = abs(fill_price)
         close_cash_realized = abs_fill * 100 if order_type == "credit" else -abs_fill * 100
         entry_sign = -1 if is_long else 1
         entry_cash = entry_sign * entry_premium * 100
-        return entry_cash + close_cash_realized
+        return entry_cash + close_cash_realized - fees
 
     @staticmethod
     def _extract_fill_price(order_node: dict) -> float | None:

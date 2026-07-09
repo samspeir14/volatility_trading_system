@@ -203,6 +203,7 @@ class SignalGenerator:
         extreme_spread_veto: float = 0.12,
         harvest_min_entry_dte: int = 5,
         harvest_max_entry_dte: int = 15,
+        min_credit: float = 0.0,
     ):
         if strategy_mode not in ("model", "harvest"):
             raise ValueError(f"strategy_mode must be 'model' or 'harvest', got {strategy_mode!r}")
@@ -255,6 +256,13 @@ class SignalGenerator:
         # money May-June; just above the fat zone keeps every position in it.
         self._harvest_min_dte = harvest_min_entry_dte
         self._harvest_max_dte = harvest_max_entry_dte
+        # SELL floor on the condor's mid-price net credit. Execution prices 2%
+        # below mid and fees take ~$1-4 per round trip, so sub-$0.25 credits
+        # ($25/contract gross, ~$12 at the +50% target) are fee-and-slippage
+        # food — a small-account problem; 0.0 keeps standard behavior.
+        if min_credit < 0:
+            raise ValueError(f"min_credit must be >= 0, got {min_credit}")
+        self._min_credit = min_credit
 
     def generate(
         self,
@@ -608,6 +616,18 @@ class SignalGenerator:
         for leg in legs_to_check:
             if not _passes_liquidity_filters(leg, self._min_volume, self._min_oi, self._max_rel_spread):
                 return [], f"SELL iron condor: {leg.option_type} k={leg.strike} fails liquidity"
+        if self._min_credit > 0:
+            credit_mid = (
+                (atm_call.bid + atm_call.ask) / 2.0
+                + (atm_put.bid + atm_put.ask) / 2.0
+                - (long_call.bid + long_call.ask) / 2.0
+                - (long_put.bid + long_put.ask) / 2.0
+            )
+            if credit_mid < self._min_credit:
+                return [], (
+                    f"SELL iron condor: mid credit ${credit_mid:.2f} below "
+                    f"floor ${self._min_credit:.2f}"
+                )
         return [
             TradeLeg(atm_call.strike, "call", "sell", 1, atm_call.symbol),
             TradeLeg(atm_put.strike, "put", "sell", 1, atm_put.symbol),

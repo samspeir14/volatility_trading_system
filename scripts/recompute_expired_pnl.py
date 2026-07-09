@@ -14,14 +14,21 @@ the row. Prints before/after per row and aggregate so the correction is
 auditable.
 
 Safe to re-run — only updates rows whose recomputed realized differs from
-the stored value by more than a cent.
+the stored value by more than a cent. Caveat: rows carry no record of the
+fee regime they traded under, so the fee to net out of expired rows is an
+EXPLICIT argument (default 0.0 = gross, correct for paper history), NOT the
+live PER_CONTRACT_FEE from .env — otherwise re-running after going live
+would silently rewrite paper-era rows with today's fee.
 
 Usage:
     cd ~/options-trader
     PYTHONPATH=. venv/bin/python scripts/recompute_expired_pnl.py
+    # live rows only, Tradier Pro pass-throughs:
+    PYTHONPATH=. venv/bin/python scripts/recompute_expired_pnl.py --per-contract-fee 0.10
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import logging
@@ -52,6 +59,20 @@ async def fetch_close(client, symbol: str, expiration: date) -> float | None:
 
 
 async def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Recompute expired rows' realized P&L at intrinsic value."
+    )
+    parser.add_argument(
+        "--per-contract-fee", type=float, default=0.0,
+        help="fee per contract to net out of each expired row's open side "
+             "(default 0.0 = gross; deliberately not read from .env — see "
+             "module docstring)",
+    )
+    args = parser.parse_args()
+    if args.per_contract_fee < 0:
+        print("ERROR: --per-contract-fee must be >= 0", file=sys.stderr)
+        return 2
+
     logging.basicConfig(
         level=logging.WARNING,  # quiet — script does its own printing
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -111,17 +132,23 @@ async def main() -> int:
                 skipped.append(oid)
                 continue
 
-            new_pnl = settle_intrinsic_pnl(
+            gross_pnl = settle_intrinsic_pnl(
                 legs=legs, underlying_close=close,
                 direction=direction, entry_premium=float(entry_premium),
             )
             floor = max_loss_dollars(legs, direction, float(entry_premium))
-            if floor > float("-inf") and new_pnl < floor - 0.01:
+            if floor > float("-inf") and gross_pnl < floor - 0.01:
                 print(f"{oid:<11} {symbol:<5} {direction:<5} {structure:<13} "
-                      f"{exp_str:<11}  ⚠ computed ${new_pnl:+,.2f} < floor "
+                      f"{exp_str:<11}  ⚠ computed ${gross_pnl:+,.2f} < floor "
                       f"${floor:+,.2f} — skipping")
                 floor_breaches.append(oid)
                 continue
+            # Match the live reconciler: expired positions carry open-side
+            # fees only; floor check and trigger stay on the gross number.
+            open_fees = args.per_contract_fee * sum(
+                int(leg["quantity"]) for leg in legs
+            )
+            new_pnl = gross_pnl - open_fees
 
             delta = new_pnl - (old_pnl or 0.0)
             print(f"{oid:<11} {symbol:<5} {direction:<5} {structure:<13} "
@@ -130,7 +157,7 @@ async def main() -> int:
 
             if abs(delta) > 0.01:
                 new_trigger = "expired_worthless" \
-                    if abs(new_pnl - floor) < 0.01 and direction == "BUY" else "expired"
+                    if abs(gross_pnl - floor) < 0.01 and direction == "BUY" else "expired"
                 order_log._conn.execute(
                     "UPDATE submitted_orders SET realized_pnl = ?, exit_trigger = ? "
                     "WHERE tradier_order_id = ?",
