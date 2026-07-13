@@ -8,7 +8,7 @@ from logs.daily_summary import (
     StaleCloseAlertSummary,
 )
 from logs.logger import setup_logging
-from logs.slack import format_summary, post_to_slack
+from logs.slack import format_summary, post_text, post_to_slack
 
 __all__ = [
     "AssignmentAlertSummary",
@@ -19,6 +19,7 @@ __all__ = [
     "PositionPnlGroup",
     "StaleCloseAlertSummary",
     "format_summary",
+    "post_text",
     "post_to_slack",
     "setup_logging",
 ]

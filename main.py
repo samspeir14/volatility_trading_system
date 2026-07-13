@@ -33,7 +33,7 @@ from data import (
 )
 from execution import OrderLog, OrderManager
 from features import FeaturePipeline
-from logs import DailySummary, DailySummaryBuilder, post_to_slack, setup_logging
+from logs import DailySummary, DailySummaryBuilder, post_text, post_to_slack, setup_logging
 from model import (
     BestPredictor,
     GARCHBaseline,
@@ -42,10 +42,14 @@ from model import (
 )
 from positions import ExitManager, PositionReconciler, PositionTracker
 from risk import (
+    BarsFreshnessGuard,
     DailyKillSwitch,
+    DrawdownBreaker,
+    HaltFlag,
     PortfolioStateBuilder,
     RiskManager,
     RiskRejectionLog,
+    write_heartbeat,
 )
 from signals import DivergenceHistory, SignalGenerator
 
@@ -173,6 +177,9 @@ class CycleResult:
     exits_evaluated: int | None = None
     exits_closed: int | None = None
     kill_switch_active: bool = False
+    # Every reason the entry side was blocked this cycle (kill switch, manual
+    # HALT, drawdown breaker, stale bars). Exits always run regardless.
+    entry_blocks: tuple[str, ...] = ()
     error: str | None = None
 
 
@@ -288,6 +295,11 @@ class MainLoop:
         slack_webhook_url: str | None = None,
         scan_interval_seconds: int = 300,
         kill_switch_threshold_pct: float = -0.05,
+        halt_flag: HaltFlag | None = None,
+        drawdown_breaker: DrawdownBreaker | None = None,
+        bars_guard: BarsFreshnessGuard | None = None,
+        heartbeat_path: Path | None = None,
+        error_streak_alert_threshold: int = 5,
     ):
         self._settings = settings
         self._client = client
@@ -311,9 +323,19 @@ class MainLoop:
         self._slack_url = slack_webhook_url
         self._scan_interval = scan_interval_seconds
         self._kill_pct = kill_switch_threshold_pct
+        self._halt_flag = halt_flag
+        self._drawdown_breaker = drawdown_breaker
+        self._bars_guard = bars_guard
+        self._heartbeat_path = heartbeat_path
         self._summary_posted_for_date: date | None = None
         self._last_snapshot = None
         self._last_snapshot_date: date | None = None
+        # Alert dedupe: only Slack a block reason the first cycle it appears.
+        self._prev_entry_blocks: set[str] = set()
+        # Consecutive failed cycles → one Slack alert per streak.
+        self._error_streak = 0
+        self._error_streak_alerted = False
+        self._error_streak_threshold = error_streak_alert_threshold
 
     async def run_once(self) -> CycleResult:
         """Single cycle. Returns what happened. Tested with mocks."""
@@ -338,10 +360,12 @@ class MainLoop:
         # cycles only run while the market is open, so today's bar is partial,
         # and caching it would freeze it permanently (INSERT OR REPLACE is
         # never revisited once latest_date moves past it).
+        bars_end = _last_weekday(now.date() - timedelta(days=1))
         try:
-            bars_end = _last_weekday(now.date() - timedelta(days=1))
             await self._feature_pipeline.ensure_data(self._client, end=bars_end)
         except Exception as e:
+            # Failing soft is fine for a single miss — the BarsFreshnessGuard
+            # below blocks entries if the cache actually goes stale.
             logger.warning(
                 "daily bar refresh failed: %s — continuing on cached bars", e
             )
@@ -404,6 +428,31 @@ class MainLoop:
             threshold_pct=self._kill_pct,
         )
 
+        # 4b. Entry guards: manual HALT, multi-day drawdown breakers, bars
+        # freshness. Any hit blocks NEW entries only — exit management below
+        # runs unconditionally. Reasons are stable strings per activation so
+        # the transition alert fires once, not every cycle.
+        entry_blocks: list[str] = []
+        if kill_active:
+            entry_blocks.append("daily kill switch active")
+        if self._halt_flag is not None:
+            halt_reason = self._halt_flag.reason()
+            if halt_reason is not None:
+                entry_blocks.append(f"manual HALT: {halt_reason}")
+        if self._drawdown_breaker is not None and snapshot.equity:
+            breaker_reason = self._drawdown_breaker.evaluate_and_maybe_trigger(
+                today, snapshot.equity,
+            )
+            if breaker_reason is not None:
+                entry_blocks.append(breaker_reason)
+        stale_symbols: list[str] = []
+        if self._bars_guard is not None:
+            freshness = self._bars_guard.check(bars_end)
+            stale_symbols = freshness.stale_symbols
+            if freshness.block_reason is not None:
+                entry_blocks.append(freshness.block_reason)
+        self._alert_new_blocks(entry_blocks)
+
         # 5. Always manage existing positions (even with kill switch active)
         exit_decisions = []
         exits_closed = 0
@@ -420,12 +469,23 @@ class MainLoop:
                 if result is not None and result.status == "filled":
                     exits_closed += 1
 
-        # 6. New entries only when kill switch NOT active
+        # 6. New entries only when no guard tripped
         signals_total = signals_actionable = signals_approved = 0
         submissions_filled = submissions_failed = 0
-        if not kill_active:
+        if not entry_blocks:
             feature_rows = self._build_feature_rows()
             returns_by_symbol = self._build_returns_dict()
+            # Individually-stale symbols (below the systemic block threshold)
+            # are dropped from the ENTRY universe only — their bars are old,
+            # so their predictions and spread vetoes would be fiction. Exits
+            # above already handled them off live marks.
+            for sym in stale_symbols:
+                if sym in feature_rows or sym in returns_by_symbol:
+                    logger.warning(
+                        "excluding %s from entries: daily bars stale", sym,
+                    )
+                feature_rows.pop(sym, None)
+                returns_by_symbol.pop(sym, None)
             actionable, all_signals = self._signal_generator.generate(
                 scan=scan,
                 feature_rows=feature_rows,
@@ -462,6 +522,7 @@ class MainLoop:
             exits_evaluated=len(exit_decisions),
             exits_closed=exits_closed,
             kill_switch_active=kill_active,
+            entry_blocks=tuple(entry_blocks),
         )
         self._log_cycle(result)
         # Stash latest snapshot so run_forever can post the daily summary on close-transition
@@ -478,6 +539,12 @@ class MainLoop:
             try:
                 clock = await self._client.get_clock()
                 current_state = clock.get("state")
+                # Heartbeat = "the loop is alive and can reach the broker".
+                # Written open or closed (closed-market sleeps are capped at
+                # 1h, so a beat older than ~75 min means the process is gone —
+                # that's the threshold scripts/heartbeat_check.py alerts on).
+                if self._heartbeat_path is not None:
+                    write_heartbeat(self._heartbeat_path, current_state or "unknown")
 
                 # State transition from open → not-open: post the daily summary
                 if (last_state == "open" and current_state != "open"
@@ -500,11 +567,55 @@ class MainLoop:
                     await asyncio.sleep(min(sleep_seconds, 3600))  # cap at 1h re-poll
                     continue
 
-                await self.run_once()
+                result = await self.run_once()
+                if result.error is not None:
+                    self._note_cycle_error(result.error)
+                else:
+                    self._note_cycle_success()
                 await asyncio.sleep(self._scan_interval)
             except Exception as e:
                 logger.exception("cycle exception, continuing: %s", e)
+                if self._heartbeat_path is not None:
+                    # Loop is alive even though the cycle failed; state="error"
+                    # keeps the dead-man switch honest without firing it.
+                    write_heartbeat(self._heartbeat_path, "error")
+                self._note_cycle_error(str(e))
                 await asyncio.sleep(self._scan_interval)
+
+    def _note_cycle_error(self, error: str) -> None:
+        """Consecutive-error breaker: failing cycles already mean no trading,
+        so this alerts (once per streak) rather than halts."""
+        self._error_streak += 1
+        if (self._error_streak >= self._error_streak_threshold
+                and not self._error_streak_alerted):
+            self._error_streak_alerted = True
+            message = (
+                f"⚠️ {self._error_streak} consecutive cycle errors — bot is up "
+                f"but not trading. Last error: {error}"
+            )
+            logger.error(message)
+            if self._slack_url:
+                post_text(self._slack_url, message)
+
+    def _note_cycle_success(self) -> None:
+        if self._error_streak_alerted and self._slack_url:
+            post_text(
+                self._slack_url,
+                f"✅ cycles recovered after {self._error_streak} consecutive errors",
+            )
+        self._error_streak = 0
+        self._error_streak_alerted = False
+
+    def _alert_new_blocks(self, blocks: list[str]) -> None:
+        """Slack-alert each entry-block reason the first cycle it appears.
+        Reasons are stable strings per activation, so re-alerts only happen on
+        genuinely new conditions (or a changed HALT file message)."""
+        new = [b for b in blocks if b not in self._prev_entry_blocks]
+        self._prev_entry_blocks = set(blocks)
+        for block in new:
+            logger.warning("entries blocked: %s", block)
+        if new and self._slack_url:
+            post_text(self._slack_url, "🛑 Entries blocked: " + " | ".join(new))
 
     async def post_daily_summary(self, today: date, snapshot) -> None:
         """Build and post (file + Slack) the daily summary."""
@@ -574,12 +685,13 @@ class MainLoop:
         logger.info(
             "cycle_complete equity=$%.2f pnl_today=$%+.2f (%+.2f%%) "
             "scan_contracts=%d signals=%d actionable=%d approved=%d "
-            "submitted=%d failed=%d exits=%d kill_switch=%s",
+            "submitted=%d failed=%d exits=%d kill_switch=%s entry_blocks=%s",
             result.equity or 0.0, result.today_total_pnl or 0.0, pnl_pct,
             result.scan_contracts or 0, result.signals_total or 0,
             result.signals_actionable or 0, result.signals_approved or 0,
             result.submissions_filled or 0, result.submissions_failed or 0,
             result.exits_closed or 0, result.kill_switch_active,
+            list(result.entry_blocks) or "none",
         )
 
     def _sleep_seconds_until_open(self, clock: dict) -> float:
@@ -614,6 +726,13 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
 
     kill_switch = DailyKillSwitch(cache_dir / "risk_state.db")
     closeables.append(kill_switch)
+
+    # Multi-day breakers share risk_state.db (they read the equity_snapshots
+    # rows the daily kill switch records); the HALT flag and heartbeat live
+    # next to the caches so one directory holds all operational state.
+    drawdown_breaker = DrawdownBreaker(cache_dir / "risk_state.db")
+    closeables.append(drawdown_breaker)
+    halt_flag = HaltFlag(cache_dir / "HALT")
 
     risk_rejection_log = RiskRejectionLog(cache_dir / "risk_state.db")
     closeables.append(risk_rejection_log)
@@ -746,6 +865,10 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
         # (whose daily_loss_kill_switch_pct is stored but never read) — wire
         # the calibration through so the knob is real for both profiles.
         kill_switch_threshold_pct=cal.daily_loss_kill_switch_pct,
+        halt_flag=halt_flag,
+        drawdown_breaker=drawdown_breaker,
+        bars_guard=BarsFreshnessGuard(store, [t.symbol for t in watchlist]),
+        heartbeat_path=cache_dir / "heartbeat.json",
     )
     return loop, closeables
 

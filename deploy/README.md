@@ -120,6 +120,27 @@ Harvest mode also narrows the scan's expiration window to (3, 16) days — entri
 
 `small_harvest` is the harvest strategy recalibrated for a **~$10k bankroll** — the intended first live-money configuration. Same code path as `harvest` (internally it normalizes to `strategy_mode="harvest"` with `harvest_profile="small"`); what changes is the calibration bundle (`CALIBRATION_SMALL` in `main.py`) and the universe (`config/watchlist_small.yaml`, 19 cheap liquid weekly-options names across 11 sectors, verified 2026-07). Orders are 1-lot, so the per-trade budget is an *eligibility gate*: at **2.5%/$10k = $250** the whole small watchlist's 1σ condors fit ($40–$220 max loss), with the priciest (BAC/SLV/B) fitting at the short-DTE end only. Portfolio wing-risk cap is **12%** — the real-money number the harvest paragraph above defers to. The gamma cap is **10%**, not 1%: the gate sums raw gamma × 100 and raw ATM gamma scales as 1/(S·σ·√T), so cheap names carry ~15× the raw gamma of $100k-watchlist names — at 1% the cap would choke the book after ~2 positions. New floors for small-credit economics: signals need **$0.25 mid credit** minimum, and the premium backstop drops to $500. Set `PER_CONTRACT_FEE` in `.env` when live (0.10 on Tradier Pro pass-throughs; 0.45 on Lite) — it's netted out of realized P&L (close = both sides' legs, expiry = open side only), keeping the realized/unrealized split honest since Tradier's equity already reflects fees. Before going live: Tradier margin accounts need **$2,000 minimum** and options **Level 3** (spreads); confirm with Tradier that day-trade counting is off post-FINRA-26-10 (PDT was eliminated 2026-06-04, but brokers may phase in until 2027-10) since profit-target exits can close same-day; and subscribe to Tradier Pro ($10/mo) — at ~$0.35/contract on Lite, 8-contract round trips eat 10–15% of small-condor winners.
 
+## 6e. Operational guards + dead-man switch
+
+Four guards sit between the strategy and the market (see `risk/trading_guards.py`). All of them block **new entries only** — exit management always keeps running. Every activation is Slack-alerted once and shows up in the `cycle_complete` log line as `entry_blocks=[...]`.
+
+- **Manual HALT**: `touch data/cache/HALT` (optionally write a reason into the file) stops new entries on the next cycle without touching the process. Delete the file to resume. See `deploy/RUNBOOK.md`.
+- **Drawdown breakers**: weekly (−8% vs the 5-session equity peak) and monthly (−12% vs the 21-session peak) circuit breakers on top of the daily kill switch, persisted in `risk_state.db` (`breaker_log` table). A tripped breaker blocks entries through the end of its ISO week / calendar month, and re-trips if equity is still deep below the rolling peak after that.
+- **Bars freshness**: the guard that turns the frozen-cache failure (2026-04-24→07-02) from "quietly stale" into "loudly blocked". Individually stale symbols are dropped from the entry universe; when ≥50% of the watchlist is stale (bars older than 4 days before the expected end date) the whole entry side blocks.
+- **Dead-man switch**: the loop writes `data/cache/heartbeat.json` every iteration (open: per scan cycle; closed: at least hourly). `scripts/heartbeat_check.py` runs from cron *outside* the bot process and Slack-alerts when the heartbeat is >20 min old with the market open (>75 min otherwise). Install:
+
+```bash
+sudo tee /etc/cron.d/options-trader-heartbeat >/dev/null <<'EOF'
+# Dead-man switch: alert to Slack when the trading loop's heartbeat goes
+# stale. Runs every 10 minutes on weekdays around US market hours (UTC).
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+*/10 12-22 * * 1-5 ubuntu cd /home/ubuntu/options-trader && /home/ubuntu/options-trader/venv/bin/python -m scripts.heartbeat_check >> /home/ubuntu/options-trader/logs/heartbeat_check.log 2>&1
+EOF
+```
+
+The bot also self-reports: 5 consecutive failed cycles post a ⚠️ Slack alert (and a ✅ when cycles recover) — that covers "process alive but can't trade", which the heartbeat alone wouldn't catch.
+
 ## 7. Troubleshooting
 
 | Symptom | Check |
