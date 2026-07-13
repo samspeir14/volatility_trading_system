@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import sqlite3
 from datetime import date, timedelta
 from pathlib import Path
@@ -7,6 +8,8 @@ import numpy as np
 import pandas as pd
 
 from data.async_client import AsyncTradierClient, Bar
+
+logger = logging.getLogger(__name__)
 
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS daily_bars (
@@ -112,8 +115,20 @@ async def fetch_and_cache(
         else:
             fetch_start = latest + timedelta(days=1)
         if fetch_start <= end:
-            bars = await client.get_history(symbol, fetch_start, end)
-            store.upsert_bars(symbol, bars)
+            # Per-symbol isolation: one symbol's bad fetch/upsert must not
+            # abort the whole batch (the gather would otherwise drop every
+            # other symbol's result and the caller would log one opaque
+            # warning per cycle — the IWM NaN-row failure mode). The stale
+            # symbol still serves its cached bars and the BarsFreshnessGuard
+            # excludes it from entries if it stays stale.
+            try:
+                bars = await client.get_history(symbol, fetch_start, end)
+                store.upsert_bars(symbol, bars)
+            except Exception as e:
+                logger.warning(
+                    "bar refresh failed for %s (%s -> %s): %r — serving cached bars",
+                    symbol, fetch_start, end, e,
+                )
         return symbol, store.get_bars(symbol, start, end)
 
     results = await asyncio.gather(*[fetch_one(s) for s in symbols])
