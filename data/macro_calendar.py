@@ -37,8 +37,9 @@ MACRO_EVENTS: tuple[tuple[date, str], ...] = (
     (date(2026, 9, 16), "FOMC decision"),
     (date(2026, 10, 28), "FOMC decision"),
     (date(2026, 12, 9), "FOMC decision"),
-    # --- 2026 CPI releases (8:30 ET) — verify against the BLS schedule when
-    # extending; release days drift a day or two month to month ---
+    # --- 2026 CPI releases (8:30 ET) — verified against the BLS schedule
+    # 2026-07-13 (three independent mirrors; bls.gov blocks bots). Re-verify
+    # when extending; release days drift a day or two month to month ---
     (date(2026, 1, 13), "CPI release"),
     (date(2026, 2, 11), "CPI release"),
     (date(2026, 3, 11), "CPI release"),
@@ -48,7 +49,7 @@ MACRO_EVENTS: tuple[tuple[date, str], ...] = (
     (date(2026, 7, 14), "CPI release"),
     (date(2026, 8, 12), "CPI release"),
     (date(2026, 9, 11), "CPI release"),
-    (date(2026, 10, 13), "CPI release"),
+    (date(2026, 10, 14), "CPI release"),
     (date(2026, 11, 10), "CPI release"),
     (date(2026, 12, 10), "CPI release"),
 )
