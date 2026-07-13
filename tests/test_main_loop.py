@@ -134,10 +134,31 @@ def test_approved_signal_submits_order():
         actionable_signals=[fake_signal],
         risk_decisions=[approved_decision],
     )
-    result = asyncio.run(loop.run_once())
+    # run_once gates submission on the real wall clock (9:45-15:30 ET);
+    # pin the window open so this test is deterministic whenever it runs.
+    with mock.patch("main._within_entry_window", return_value=True):
+        result = asyncio.run(loop.run_once())
     mocks["order_manager"].submit.assert_called_once()
     mocks["risk_rejection_log"].record_rejection.assert_not_called()
     print("approved_signal: order_manager.submit called once")
+
+
+def test_approved_signal_held_outside_entry_window():
+    """Outside 9:45-15:30 ET an approved signal is HELD: no submission, but
+    also no risk-rejection row (it wasn't rejected, just deferred)."""
+    fake_signal = mock.MagicMock()
+    fake_signal.symbol = "NVDA"
+    approved_decision = mock.MagicMock(approved=True, signal=fake_signal)
+    loop, mocks = _mk_loop(
+        actionable_signals=[fake_signal],
+        risk_decisions=[approved_decision],
+    )
+    with mock.patch("main._within_entry_window", return_value=False):
+        result = asyncio.run(loop.run_once())
+    mocks["order_manager"].submit.assert_not_called()
+    mocks["risk_rejection_log"].record_rejection.assert_not_called()
+    assert result.signals_approved == 0
+    print("entry_window: approved signal held outside window, no rejection logged")
 
 
 def test_rejected_signal_logs_rejection_no_submit():
@@ -285,6 +306,7 @@ def main() -> int:
     test_market_closed_returns_early()
     test_normal_cycle_with_no_signals()
     test_approved_signal_submits_order()
+    test_approved_signal_held_outside_entry_window()
     test_rejected_signal_logs_rejection_no_submit()
     test_kill_switch_active_skips_signal_generation()
     test_run_once_calls_reconcile_pending_closes_before_snapshot()
