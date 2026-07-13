@@ -116,16 +116,20 @@ def format_summary(summary: DailySummary) -> str:
     return "\n".join(lines)
 
 
-def post_to_slack(webhook_url: str, summary: DailySummary, timeout: float = 10.0) -> bool:
-    """Returns True on successful post, False otherwise. Never raises."""
-    text = format_summary(summary)
+def post_text(webhook_url: str, text: str, timeout: float = 10.0) -> bool:
+    """Post a plain text message. Returns True on success. Never raises."""
     try:
         resp = requests.post(webhook_url, json={"text": text}, timeout=timeout)
         if resp.ok:
-            logger.info("Slack daily summary posted (%d chars)", len(text))
+            logger.info("Slack message posted (%d chars)", len(text))
             return True
         logger.warning("Slack post returned %d: %s", resp.status_code, resp.text[:200])
         return False
     except requests.RequestException as e:
         logger.warning("Slack post failed: %s", e)
         return False
+
+
+def post_to_slack(webhook_url: str, summary: DailySummary, timeout: float = 10.0) -> bool:
+    """Returns True on successful post, False otherwise. Never raises."""
+    return post_text(webhook_url, format_summary(summary), timeout=timeout)
