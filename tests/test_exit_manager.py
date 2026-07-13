@@ -8,6 +8,7 @@ import sys
 from datetime import date, datetime, timezone
 from unittest import mock
 
+from data.async_client import OptionContract
 from positions.exit_manager import EXIT_TRIGGER_PRIORITY, ExitManager
 from positions.position_tracker import OpenPosition, PositionMark
 from signals.signal_generator import TradeLeg
@@ -45,12 +46,26 @@ def _mk_long_straddle_position(*, entry_debit=4.08) -> OpenPosition:
     )
 
 
-def _mark(pos: OpenPosition, *, pnl_dollars: float, dte: int = 20) -> PositionMark:
+def _mark(
+    pos: OpenPosition, *, pnl_dollars: float, dte: int = 20,
+    underlying_price: float = float("nan"), current_legs=None,
+) -> PositionMark:
     return PositionMark(
-        position=pos, current_legs=[], close_cash_flow=0, cost_to_close=0,
+        position=pos, current_legs=current_legs or [], close_cash_flow=0, cost_to_close=0,
         pnl_dollars=pnl_dollars, pnl_pct_of_entry_premium=pnl_dollars / (pos.entry_premium * 100),
         pnl_pct_of_max=float("nan"),
         delta=0, gamma=0, theta=0, vega=0, dte=dte,
+        underlying_price=underlying_price,
+    )
+
+
+def _contract(strike: float, option_type: str, bid: float, ask: float) -> OptionContract:
+    return OptionContract(
+        symbol=f"TEST{option_type[0].upper()}{int(strike * 1000):08d}",
+        underlying="TEST", expiration=date(2026, 5, 22), strike=strike,
+        option_type=option_type, bid=bid, ask=ask, last=(bid + ask) / 2,
+        volume=100, open_interest=500, delta=0.5, gamma=0.01, theta=-0.05,
+        vega=0.10, iv=0.30, fetched_at=datetime(2026, 5, 12, 15, 0, tzinfo=timezone.utc),
     )
 
 
@@ -123,18 +138,150 @@ def test_expiration_proximity_long_straddle_dte_2():
 
 
 def test_expiration_proximity_skipped_for_iron_condor():
-    """Iron condors do NOT trigger expiration_proximity — wings cap risk so
-    we let them ride to expiration unless another trigger fires."""
+    """Iron condors do NOT trigger expiration_proximity — their end-of-life
+    handling is the assignment_risk close-out, which starts at dte <= 1
+    (short_close_dte), not at the straddle's dte <= 2."""
     pos = _mk_iron_condor_position()
-    # dte=2 (would fire for a straddle)
-    mark = _mark(pos, pnl_dollars=0.0, dte=2)
+    # dte=2 (would fire expiration_proximity for a straddle): holds — outside
+    # the assignment close window, quotes present, shorts not at parity.
+    mark = _mark(pos, pnl_dollars=0.0, dte=2, underlying_price=210.0)
     trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=-0.08)
     assert trigger is None, f"IC at dte=2 should hold, got {trigger}"
-    # dte=0 (expiration day)
-    mark = _mark(pos, pnl_dollars=0.0, dte=0)
+    print("expiration_proximity (iron_condor): dte=2 holds (assignment window starts at 1)")
+
+
+# ---------- assignment risk ----------
+
+def _mk_otm_condor_position(*, entry_credit=2.10) -> OpenPosition:
+    """A true condor (OTM shorts), unlike the harvest fly whose shorts sit ATM.
+    Exercises the near-money buffer as a real decision, not a tautology."""
+    legs = [
+        TradeLeg(220.0, "call", "sell", 1, "NVDA260522C00220000"),
+        TradeLeg(200.0, "put", "sell", 1, "NVDA260522P00200000"),
+        TradeLeg(230.0, "call", "buy", 1, "NVDA260522C00230000"),
+        TradeLeg(190.0, "put", "buy", 1, "NVDA260522P00190000"),
+    ]
+    return OpenPosition(
+        tradier_order_id=3, symbol="NVDA",
+        expiration=date(2026, 5, 22), direction="SELL",
+        structure="iron_condor", legs=legs, entry_premium=entry_credit,
+        entry_atm_iv=0.40, entry_predicted_iv=0.32, entry_divergence=-0.08,
+        entry_horizon_lower=21, entry_horizon_upper=21, entry_weight_lower=1.0,
+        submitted_at=datetime(2026, 5, 8, 16, 0, tzinfo=timezone.utc),
+    )
+
+
+def test_assignment_risk_expiry_day_unconditional():
+    """Rule (a): short legs never ride through expiration day, even far OTM
+    with good quotes."""
+    pos = _mk_otm_condor_position()
+    mark = _mark(pos, pnl_dollars=0.0, dte=0, underlying_price=210.0)
+    trigger, rationale = _exit_mgr()._evaluate_one(mark, current_divergence=-0.08)
+    assert trigger == "assignment_risk", f"expected assignment_risk, got {trigger}"
+    assert "expiration" in rationale
+    print("assignment_risk (a): dte=0 closes unconditionally")
+
+
+def test_assignment_risk_near_money_short_at_dte1():
+    """Rule (b): dte=1 closes when a short leg is in/near the money, holds when
+    both shorts are comfortably OTM."""
+    mgr = _exit_mgr()
+    # Harvest fly: shorts at 210, spot pinned there → close.
+    fly = _mk_iron_condor_position()
+    mark = _mark(fly, pnl_dollars=0.0, dte=1, underlying_price=210.5)
+    trigger, _ = mgr._evaluate_one(mark, current_divergence=-0.08)
+    assert trigger == "assignment_risk", f"expected assignment_risk, got {trigger}"
+    # OTM condor: shorts at 200/220, spot 210 → both >1.5% away, let it ride.
+    condor = _mk_otm_condor_position()
+    mark = _mark(condor, pnl_dollars=0.0, dte=1, underlying_price=210.0)
+    trigger, _ = mgr._evaluate_one(mark, current_divergence=-0.08)
+    assert trigger is None, f"comfortably-OTM condor at dte=1 should hold, got {trigger}"
+    # Spot drifts to the call side: 218.0 >= 220 × 0.985 = 216.7 → close.
+    mark = _mark(condor, pnl_dollars=0.0, dte=1, underlying_price=218.0)
+    trigger, _ = mgr._evaluate_one(mark, current_divergence=-0.08)
+    assert trigger == "assignment_risk", f"expected assignment_risk, got {trigger}"
+    print("assignment_risk (b): near-money short at dte=1 closes, comfortably-OTM holds")
+
+
+def test_assignment_risk_missing_underlying_fails_safe():
+    """Rule (b) with no usable underlying quote: close rather than carry short
+    legs blind into expiration."""
+    pos = _mk_otm_condor_position()
+    mark = _mark(pos, pnl_dollars=0.0, dte=1)  # underlying_price defaults to NaN
+    trigger, rationale = _exit_mgr()._evaluate_one(mark, current_divergence=-0.08)
+    assert trigger == "assignment_risk", f"expected assignment_risk, got {trigger}"
+    assert "failing safe" in rationale
+    # Outside the close window the missing quote does NOT force a close.
+    mark = _mark(pos, pnl_dollars=0.0, dte=5)
     trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=-0.08)
-    assert trigger is None, f"IC at dte=0 should hold, got {trigger}"
-    print("expiration_proximity (iron_condor): never fires")
+    assert trigger is None
+    print("assignment_risk (b): missing underlying fails safe inside window only")
+
+
+def test_assignment_risk_parity_short_any_dte():
+    """Rule (c): a short leg trading at parity (extrinsic <= floor) closes the
+    position at ANY dte — early assignment doesn't wait for expiry week."""
+    pos = _mk_iron_condor_position()  # shorts at 210
+    # Spot ripped to 240: short call intrinsic 30.00, mid 30.02 → extrinsic 0.02.
+    legs_at_parity = [
+        _contract(210.0, "call", 29.95, 30.09),
+        _contract(210.0, "put", 0.01, 0.05),
+        _contract(230.0, "call", 10.00, 10.10),
+        _contract(190.0, "put", 0.00, 0.02),
+    ]
+    mark = _mark(pos, pnl_dollars=0.0, dte=10, underlying_price=240.0,
+                 current_legs=legs_at_parity)
+    trigger, rationale = _exit_mgr()._evaluate_one(mark, current_divergence=-0.08)
+    assert trigger == "assignment_risk", f"expected assignment_risk, got {trigger}"
+    assert "parity" in rationale
+    # Same shape but with real extrinsic left (mid 31.00 → extrinsic 1.00): hold.
+    legs_with_extrinsic = [
+        _contract(210.0, "call", 30.80, 31.20),
+        _contract(210.0, "put", 0.01, 0.05),
+        _contract(230.0, "call", 10.00, 10.10),
+        _contract(190.0, "put", 0.00, 0.02),
+    ]
+    mark = _mark(pos, pnl_dollars=0.0, dte=10, underlying_price=240.0,
+                 current_legs=legs_with_extrinsic)
+    trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=-0.08)
+    assert trigger is None, f"short with extrinsic left should hold, got {trigger}"
+    print("assignment_risk (c): parity short closes at dte=10, extrinsic-rich holds")
+
+
+def test_assignment_risk_not_for_long_straddle():
+    """Long straddles have no short legs — expiry handling stays
+    expiration_proximity, never assignment_risk."""
+    pos = _mk_long_straddle_position()
+    mark = _mark(pos, pnl_dollars=0.0, dte=0, underlying_price=100.0)
+    trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=0.15)
+    assert trigger == "expiration_proximity", f"expected expiration_proximity, got {trigger}"
+    print("assignment_risk: long straddle unaffected (expiration_proximity fires)")
+
+
+def test_stop_loss_overrides_assignment_risk():
+    """When both fire (deep drawdown on expiry day), the label is stop_loss —
+    matches EXIT_TRIGGER_PRIORITY. Either way the position closes."""
+    pos = _mk_iron_condor_position(entry_credit=13.55)
+    mark = _mark(pos, pnl_dollars=-1500.0, dte=0, underlying_price=240.0)
+    trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=-0.08)
+    assert trigger == "stop_loss", f"expected stop_loss, got {trigger}"
+    print("PRIORITY: stop_loss overrides assignment_risk when both fire")
+
+
+def test_harvest_entry_floor_clears_assignment_close_window():
+    """Invariant: the harvest entry floor must sit above the assignment close
+    window, or fresh entries would be closed within a session or two."""
+    import inspect
+    from signals.signal_generator import SignalGenerator
+    harvest_floor = inspect.signature(SignalGenerator.__init__).parameters[
+        "harvest_min_entry_dte"
+    ].default
+    mgr = _exit_mgr()
+    assert harvest_floor > mgr._short_close_dte + 1, (
+        f"harvest_min_entry_dte ({harvest_floor}) must exceed short_close_dte "
+        f"({mgr._short_close_dte}) by 2+ so entries aren't instant round-trips"
+    )
+    print(f"invariant: harvest floor {harvest_floor} > close window {mgr._short_close_dte} ✓")
 
 
 def test_min_dte_strictly_greater_than_expiration_proximity_dte():
@@ -225,7 +372,8 @@ def test_priority_constant_matches_evaluation_order():
     """Sanity check: the EXIT_TRIGGER_PRIORITY tuple matches the order in the
     actual logic. If someone reorders one without the other, this catches it."""
     assert EXIT_TRIGGER_PRIORITY == (
-        "thesis_reversed", "stop_loss", "expiration_proximity", "profit_target",
+        "thesis_reversed", "stop_loss", "assignment_risk",
+        "expiration_proximity", "profit_target",
     )
     print(f"priority constant: {EXIT_TRIGGER_PRIORITY}")
 
@@ -260,6 +408,13 @@ def main() -> int:
     test_long_straddle_stop_loss_at_neg_50pct()
     test_expiration_proximity_long_straddle_dte_2()
     test_expiration_proximity_skipped_for_iron_condor()
+    test_assignment_risk_expiry_day_unconditional()
+    test_assignment_risk_near_money_short_at_dte1()
+    test_assignment_risk_missing_underlying_fails_safe()
+    test_assignment_risk_parity_short_any_dte()
+    test_assignment_risk_not_for_long_straddle()
+    test_stop_loss_overrides_assignment_risk()
+    test_harvest_entry_floor_clears_assignment_close_window()
     test_min_dte_strictly_greater_than_expiration_proximity_dte()
     test_thesis_reversal_fires_when_sign_flips_and_magnitude_clears()
     test_thesis_overrides_stop_loss()

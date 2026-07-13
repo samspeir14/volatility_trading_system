@@ -67,6 +67,10 @@ class PositionMark:
     theta: float
     vega: float
     dte: int
+    # Underlying spot at mark time; NaN when the scan had no usable quote.
+    # Consumed by the exit manager's assignment-risk close-out, which fails
+    # SAFE (closes) rather than open when this is missing near expiry.
+    underlying_price: float = float("nan")
 
 
 def _leg_sign(side: str) -> int:
@@ -161,6 +165,16 @@ class PositionTracker:
 
             dte = (pos.expiration - today).days
 
+            # Underlying spot for the assignment-risk exit. _lookup_current_legs
+            # succeeded, so the snapshot exists; only the quote can be bad.
+            snap = scan.snapshots[pos.symbol]
+            try:
+                underlying_price = float(snap.underlying.get("last") or 0.0)
+            except (TypeError, ValueError):
+                underlying_price = 0.0
+            if underlying_price <= 0:
+                underlying_price = float("nan")
+
             marks.append(PositionMark(
                 position=pos,
                 current_legs=current_legs,
@@ -174,6 +188,7 @@ class PositionTracker:
                 theta=theta_sum,
                 vega=vega_sum,
                 dte=dte,
+                underlying_price=underlying_price,
             ))
         return marks
 
