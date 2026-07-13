@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 = local dev machine, 3.12 = EC2 production venv
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest
+
+      # Offline suite only. The excluded tests hit the live Tradier API and
+      # need TRADIER_API_KEY from .env — they stay manual (see deploy/RUNBOOK.md).
+      # If you add a new live test, exclude it here or CI will fail on it.
+      - name: Run offline test suite
+        run: >
+          python -m pytest tests/ -q
+          --ignore=tests/test_main_loop_live.py
+          --ignore=tests/test_order_execution_live.py
+          --ignore=tests/test_position_management_live.py
+          --ignore=tests/test_risk_management_live.py
+          --ignore=tests/test_xgb_vs_garch_live.py
+          --ignore=tests/test_market_data.py
+          --deselect tests/test_feature_pipeline.py::test_small_pipeline
+          --deselect tests/test_feature_pipeline.py::test_full_watchlist_perf
+          --deselect tests/test_garch_baseline.py::test_live_aapl_eval
+          --deselect tests/test_historical.py::test_cache_lifecycle
