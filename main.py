@@ -18,8 +18,9 @@ import logging
 import os
 import sys
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -77,6 +78,21 @@ SCAN_EXPIRATION_WINDOW_HARVEST = (3, 16)
 def _scan_window(settings: Settings) -> tuple[int, int]:
     return (SCAN_EXPIRATION_WINDOW_HARVEST if settings.strategy_mode == "harvest"
             else SCAN_EXPIRATION_WINDOW)
+
+
+# NEW entries only submit inside this ET window. Options spreads are widest in
+# the opening minutes (overnight risk repricing, thin books) and erratic into
+# the close (MOC imbalances) — entering there donates edge to the market
+# maker. Signals are still generated and logged outside the window (the
+# divergence history and risk-rejection diagnostics don't stop); only order
+# submission is held until the next in-window cycle.
+ENTRY_WINDOW_ET = (dt_time(9, 45), dt_time(15, 30))
+_EASTERN = ZoneInfo("America/New_York")
+
+
+def _within_entry_window(now_utc: datetime) -> bool:
+    et = now_utc.astimezone(_EASTERN).time()
+    return ENTRY_WINDOW_ET[0] <= et <= ENTRY_WINDOW_ET[1]
 
 
 @dataclass(frozen=True)
@@ -138,9 +154,9 @@ CALIBRATION_STANDARD = RiskCalibration(
 # name carries ~15× the raw gamma of a $170 one — at 1% the cap would reject
 # a cheap-name book after ~2 positions; 10% admits the intended ~10-15
 # position ladder while still capping a pile-up. Premium backstop $500 (5% of
-# bankroll, mirroring $5k/5% at $100k). Min credit $0.25: execution prices 2%
-# below mid and a round trip costs ~$1-4 in fees, so thinner credits are
-# structurally unprofitable.
+# bankroll, mirroring $5k/5% at $100k). Min credit $0.25: the execution ladder
+# starts at mid but can concede up to 3%, and a round trip costs ~$1-4 in
+# fees, so thinner credits are structurally unprofitable.
 CALIBRATION_SMALL = RiskCalibration(
     max_per_trade_loss_pct=0.025,
     max_per_ticker_exposure_pct=0.05,
@@ -495,9 +511,16 @@ class MainLoop:
             signals_total = len(all_signals)
             signals_actionable = len(actionable)
 
+            in_entry_window = _within_entry_window(now)
+            if actionable and not in_entry_window:
+                logger.info(
+                    "outside entry window %s-%s ET — holding %d actionable "
+                    "signal(s) until the next in-window cycle",
+                    ENTRY_WINDOW_ET[0], ENTRY_WINDOW_ET[1], len(actionable),
+                )
             risk_decisions = self._risk_manager.gate(actionable, scan, snapshot)
             for d in risk_decisions:
-                if d.approved:
+                if d.approved and in_entry_window:
                     snap = scan[d.signal.symbol]
                     res = await self._order_manager.submit(d.signal, snap, today)
                     if res.status == "filled":
@@ -505,7 +528,7 @@ class MainLoop:
                         signals_approved += 1
                     else:
                         submissions_failed += 1
-                else:
+                elif not d.approved:
                     self._risk_rejection_log.record_rejection(d, datetime.now(timezone.utc))
 
         result = CycleResult(

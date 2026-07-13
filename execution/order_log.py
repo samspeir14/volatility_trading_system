@@ -120,6 +120,13 @@ CLOSE_COLUMNS_MIGRATIONS = [
     ("closed_at", "ALTER TABLE submitted_orders ADD COLUMN closed_at TEXT"),
     ("exit_trigger", "ALTER TABLE submitted_orders ADD COLUMN exit_trigger TEXT"),
     ("realized_pnl", "ALTER TABLE submitted_orders ADD COLUMN realized_pnl REAL"),
+    # TCA: the theoretical mid at submission time (per contract). Together
+    # with fill_price this yields realized slippage per fill.
+    ("arrival_mid", "ALTER TABLE submitted_orders ADD COLUMN arrival_mid REAL"),
+]
+
+CLOSE_ATTEMPT_COLUMNS_MIGRATIONS = [
+    ("arrival_mid", "ALTER TABLE close_attempts ADD COLUMN arrival_mid REAL"),
 ]
 
 
@@ -139,9 +146,13 @@ class OrderLog:
         self._conn.commit()
 
     def _migrate_close_columns(self) -> None:
-        cur = self._conn.execute("PRAGMA table_info(submitted_orders)")
+        self._migrate_columns("submitted_orders", CLOSE_COLUMNS_MIGRATIONS)
+        self._migrate_columns("close_attempts", CLOSE_ATTEMPT_COLUMNS_MIGRATIONS)
+
+    def _migrate_columns(self, table: str, migrations: list[tuple[str, str]]) -> None:
+        cur = self._conn.execute(f"PRAGMA table_info({table})")
         existing = {row[1] for row in cur.fetchall()}
-        for col_name, sql in CLOSE_COLUMNS_MIGRATIONS:
+        for col_name, sql in migrations:
             if col_name not in existing:
                 self._conn.execute(sql)
         self._conn.commit()
@@ -163,6 +174,7 @@ class OrderLog:
         submitted_price: float,
         order_id: int,
         submitted_at: datetime,
+        arrival_mid: float | None = None,
     ) -> None:
         legs_json = json.dumps([asdict(leg) for leg in signal.legs])
         self._conn.execute(
@@ -171,8 +183,8 @@ class OrderLog:
             "direction, structure, horizon_lower, horizon_upper, weight_lower, "
             "underlying_price_at_signal, atm_iv_at_signal, predicted_iv_at_signal, "
             "divergence_at_signal, cross_sectional_z, time_series_z, "
-            "submitted_price, legs_json"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "submitted_price, legs_json, arrival_mid"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 order_id, fingerprint, submitted_at.isoformat(), signal.symbol,
                 signal.expiration.isoformat(), signal.direction, structure,
@@ -180,7 +192,7 @@ class OrderLog:
                 signal.underlying_price, signal.atm_iv,
                 signal.predicted_iv_equivalent, signal.divergence,
                 signal.cross_sectional_z, signal.time_series_z,
-                submitted_price, legs_json,
+                submitted_price, legs_json, arrival_mid,
             ),
         )
         self._conn.commit()
@@ -401,14 +413,15 @@ class OrderLog:
         order_type: str,
         submitted_price: float,
         status: str = PENDING_CLOSE_STATUS,
+        arrival_mid: float | None = None,
     ) -> None:
         self._conn.execute(
             "INSERT INTO close_attempts ("
             "closing_order_id, opening_order_id, submitted_at, exit_trigger, "
-            "order_type, submitted_price, status"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "order_type, submitted_price, status, arrival_mid"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (closing_order_id, opening_order_id, submitted_at.isoformat(),
-             exit_trigger, order_type, submitted_price, status),
+             exit_trigger, order_type, submitted_price, status, arrival_mid),
         )
         self._conn.commit()
 
