@@ -29,6 +29,7 @@ from data import (
     AsyncTradierClient,
     EarningsCalendar,
     HistoricalStore,
+    MacroCalendar,
     MarketData,
     compute_log_returns,
 )
@@ -110,6 +111,10 @@ class RiskCalibration:
     min_buying_power_buffer_pct: float
     max_premium_per_trade: float
     min_credit: float
+    # Relative credit floor: reject condors collecting less than this fraction
+    # of their wing width — a per-trade EV test that scales across cheap and
+    # expensive names where the absolute min_credit can't.
+    min_credit_to_width: float
     # Cap on RiskManager's sized quantity. Orders always submit 1-lot (signal
     # legs are quantity=1 and RiskDecision.quantity is never applied), so any
     # value above 1 books phantom multi-lot risk into the committed-risk /
@@ -141,6 +146,7 @@ CALIBRATION_STANDARD = RiskCalibration(
     min_buying_power_buffer_pct=0.05,
     max_premium_per_trade=5000.0,
     min_credit=0.0,
+    min_credit_to_width=0.25,
     max_contracts_per_trade=10,
 )
 
@@ -169,6 +175,7 @@ CALIBRATION_SMALL = RiskCalibration(
     min_buying_power_buffer_pct=0.05,
     max_premium_per_trade=500.0,
     min_credit=0.25,
+    min_credit_to_width=0.25,
     max_contracts_per_trade=1,
 )
 
@@ -507,6 +514,7 @@ class MainLoop:
                 feature_rows=feature_rows,
                 returns_by_symbol=returns_by_symbol,
                 top_n=10,
+                vix_term_ratio=self._vix_term_structure_ratio(),
             )
             signals_total = len(all_signals)
             signals_actionable = len(actionable)
@@ -671,6 +679,28 @@ class MainLoop:
             out.setdefault(row["symbol"], set()).add(exp)
         return out
 
+    def _vix_term_structure_ratio(self) -> float | None:
+        """Latest cached VIX/VIX3M close ratio for the harvest backwardation
+        veto, or None (fail open) when either series is missing/stale. Daily
+        closes are enough: backwardation episodes persist for days, and the
+        crash day itself is caught by the per-name extreme-spread veto on
+        live quotes. Both series are already in the cache — they're in
+        MARKET_INDICES for the vix3m_to_vix feature."""
+        try:
+            end = date.today()
+            start = end - timedelta(days=14)
+            vix = self._store.get_bars("VIX", start, end)
+            vix3m = self._store.get_bars("VIX3M", start, end)
+            if vix.empty or vix3m.empty:
+                return None
+            vix3m_close = float(vix3m["close"].iloc[-1])
+            if vix3m_close <= 0:
+                return None
+            return float(vix["close"].iloc[-1]) / vix3m_close
+        except Exception as e:
+            logger.warning("VIX term-structure ratio unavailable: %s", e)
+            return None
+
     def _build_feature_rows(self) -> dict[str, pd.DataFrame]:
         """Build the latest feature row per symbol from the cache."""
         end = _last_weekday(date.today())
@@ -817,6 +847,12 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
         long_straddle_excluded_symbols=etf_symbols,
         strategy_mode=settings.strategy_mode,
         min_credit=cal.min_credit,
+        min_credit_to_width=cal.min_credit_to_width,
+        # FOMC/CPI are the "earnings" of the rate/index-linked names — the
+        # same etf+bonds set barred from long straddles. Single-name equities
+        # are not macro-gated (the VRP was fat through every macro day).
+        macro_calendar=MacroCalendar(),
+        macro_sensitive_symbols=etf_symbols,
     )
     logger.info(
         "strategy mode: %s (profile: %s, %d-name watchlist)",
