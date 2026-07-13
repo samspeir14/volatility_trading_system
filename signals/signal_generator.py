@@ -11,6 +11,7 @@ import pandas as pd
 
 from data.async_client import OptionContract
 from data.earnings_calendar import EarningsCalendar
+from data.macro_calendar import MacroCalendar
 from data.market_data import ScanResult
 from model.best_predictor import BestPredictor
 from signals.divergence_history import DivergenceHistory
@@ -20,6 +21,10 @@ logger = logging.getLogger(__name__)
 
 TRAINED_HORIZONS: tuple[int, ...] = (5, 10, 21)
 TRADING_DAYS_PER_YEAR = 252
+# Quoted (Black-Scholes) IV annualizes over calendar time, so horizon scaling
+# with a CALENDAR dte must divide by 365. Mixing calendar dte with 252
+# overstates sqrt(T) by ~20% — the old wing-placement bug.
+CALENDAR_DAYS_PER_YEAR = 365
 MIN_DTE = 4
 MAX_DTE = 45
 
@@ -152,8 +157,9 @@ def _pick_iron_condor_wings(
     underlying_price: float,
 ) -> tuple[OptionContract, OptionContract] | None:
     """Pick long call (above ATM) and long put (below ATM) at ~1σ OTM,
-    using PREDICTED iv (our view) for the σ estimate."""
-    one_sigma_move = underlying_price * predicted_iv_eq * math.sqrt(dte / TRADING_DAYS_PER_YEAR)
+    using PREDICTED iv (our view) for the σ estimate. Calendar-day dte over a
+    calendar-day year — see CALENDAR_DAYS_PER_YEAR."""
+    one_sigma_move = underlying_price * predicted_iv_eq * math.sqrt(dte / CALENDAR_DAYS_PER_YEAR)
     target_call_strike = atm_strike + one_sigma_move
     target_put_strike = atm_strike - one_sigma_move
 
@@ -204,6 +210,10 @@ class SignalGenerator:
         harvest_min_entry_dte: int = 5,
         harvest_max_entry_dte: int = 15,
         min_credit: float = 0.0,
+        min_credit_to_width: float = 0.0,
+        macro_calendar: MacroCalendar | None = None,
+        macro_sensitive_symbols: frozenset[str] | set[str] | None = None,
+        vix_backwardation_threshold: float = 1.0,
     ):
         if strategy_mode not in ("model", "harvest"):
             raise ValueError(f"strategy_mode must be 'model' or 'harvest', got {strategy_mode!r}")
@@ -264,6 +274,31 @@ class SignalGenerator:
         if min_credit < 0:
             raise ValueError(f"min_credit must be >= 0, got {min_credit}")
         self._min_credit = min_credit
+        # Relative credit floor: reject condors whose mid credit is below this
+        # fraction of the wing width. Unlike the absolute min_credit, this is
+        # a per-trade expected-value test that scales across cheap and
+        # expensive names — a condor collecting <25% of its width needs a
+        # >~75% win rate just to break even, and a chain quoting that thin is
+        # usually quoting badly. 0.0 disables (backwards compatible).
+        if min_credit_to_width < 0:
+            raise ValueError(
+                f"min_credit_to_width must be >= 0, got {min_credit_to_width}"
+            )
+        self._min_credit_to_width = min_credit_to_width
+        # Macro-event filter: for rate/index-linked symbols (TLT, SLV, index
+        # ETFs) an FOMC decision or CPI print IS their earnings — demote when
+        # one falls inside the position's window. Single-name equities are NOT
+        # gated (the 7-year VRP was fat unconditionally through every macro
+        # day; correlated exposure is the wing-risk cap's job).
+        self._macro = macro_calendar
+        self._macro_sensitive = frozenset(macro_sensitive_symbols or ())
+        # Portfolio-level crash regime gate (harvest only): VIX above VIX3M
+        # (term-structure backwardation) means the market prices MORE vol now
+        # than later — the regime where every short-vol book bleeds at once.
+        # The per-name extreme-spread veto can miss it when all names reprice
+        # together; this is its book-level sibling. Ratio comes from the
+        # caller (cached daily closes); None fails open.
+        self._vix_backwardation = vix_backwardation_threshold
 
     def generate(
         self,
@@ -271,8 +306,11 @@ class SignalGenerator:
         feature_rows: dict[str, pd.DataFrame],
         returns_by_symbol: dict[str, pd.Series],
         top_n: int = 10,
+        vix_term_ratio: float | None = None,
     ) -> tuple[list[TradeSignal], list[TradeSignal]]:
-        """Returns (actionable_top_n, all_signals)."""
+        """Returns (actionable_top_n, all_signals). vix_term_ratio is the
+        latest VIX/VIX3M close ratio (None = unavailable, fails open); at or
+        above vix_backwardation_threshold every harvest SELL is demoted."""
         today = scan.fetched_at.date()
 
         # 1. Per ticker: predict at each horizon
@@ -410,6 +448,27 @@ class SignalGenerator:
             else:
                 direction = "BUY" if c.divergence > 0 else "SELL"
 
+            # VIX term-structure veto (harvest only, portfolio-level): with
+            # VIX at or above VIX3M the whole book is in the crash regime —
+            # stop opening short vol anywhere until the curve normalizes.
+            if (self._mode == "harvest" and vix_term_ratio is not None
+                    and vix_term_ratio >= self._vix_backwardation):
+                all_signals.append(TradeSignal(
+                    symbol=c.symbol, expiration=c.expiration, dte=c.dte,
+                    horizon_lower=c.horizon_lower, horizon_upper=c.horizon_upper,
+                    weight_lower=c.weight_lower, direction=direction,
+                    underlying_price=c.underlying_price, atm_iv=c.atm_iv,
+                    predicted_iv_equivalent=c.predicted_iv_equivalent,
+                    divergence=c.divergence, cross_sectional_z=cs_z,
+                    time_series_z=ts_z, liquidity_score=0.0, legs=[],
+                    is_actionable=False,
+                    diagnostic_notes=(
+                        f"vix-term-structure veto: VIX/VIX3M={vix_term_ratio:.3f} "
+                        f">= {self._vix_backwardation} (backwardation — crash regime)"
+                    ),
+                ))
+                continue
+
             # Extreme-spread veto (harvest only): IV far above trailing
             # realized usually means the market is pricing real incoming vol,
             # not extra premium — the one sell bucket that reliably lost
@@ -502,6 +561,25 @@ class SignalGenerator:
                 ))
                 continue
 
+            # Macro-event filter: FOMC/CPI are the "earnings" of the rate/
+            # index-linked names. Same window semantics as the earnings
+            # filter (life-of-position in harvest, fixed buffer in model);
+            # non-sensitive symbols pass untouched.
+            macro_note = self._check_macro(c.symbol, today, earnings_window_end)
+            if macro_note is not None:
+                all_signals.append(TradeSignal(
+                    symbol=c.symbol, expiration=c.expiration, dte=c.dte,
+                    horizon_lower=c.horizon_lower, horizon_upper=c.horizon_upper,
+                    weight_lower=c.weight_lower, direction=direction,
+                    underlying_price=c.underlying_price, atm_iv=c.atm_iv,
+                    predicted_iv_equivalent=c.predicted_iv_equivalent,
+                    divergence=c.divergence, cross_sectional_z=cs_z,
+                    time_series_z=ts_z, liquidity_score=0.0, legs=[],
+                    is_actionable=False,
+                    diagnostic_notes=macro_note,
+                ))
+                continue
+
             # Below z threshold: emit non-actionable signal for diagnostics.
             # Model mode only — harvest sells every eligible name; there is no
             # ranking signal worth gating on (nothing ordered the premium in
@@ -587,6 +665,27 @@ class SignalGenerator:
             f"on/before window end {end.isoformat()}",
         )
 
+    def _check_macro(
+        self, symbol: str, today: date, window_end: date | None = None,
+    ) -> str | None:
+        """Diagnostic note if a scheduled macro event (FOMC/CPI) falls inside
+        the window and `symbol` is macro-sensitive, None otherwise. Window
+        matches _check_earnings: today..max(buffer, window_end). Fails open
+        when no calendar is wired or the hand-maintained table has aged out."""
+        if self._macro is None or symbol not in self._macro_sensitive:
+            return None
+        end = today + timedelta(days=self._earnings_buffer_days)
+        if window_end is not None and window_end > end:
+            end = window_end
+        event = self._macro.next_event_in_window(today, end)
+        if event is None:
+            return None
+        event_date, label = event
+        return (
+            f"macro_event_within_window: {label} on {event_date.isoformat()} "
+            f"inside window ending {end.isoformat()} ({symbol} is rate/index-linked)"
+        )
+
     def _build_legs(self, c: _Candidate, direction: str) -> tuple[list[TradeLeg], str]:
         """Construct the trade legs for the chosen structure. Returns (legs, notes).
         notes is empty on success; populated with reason on failure (signal demoted)."""
@@ -617,18 +716,30 @@ class SignalGenerator:
         for leg in legs_to_check:
             if not _passes_liquidity_filters(leg, self._min_volume, self._min_oi, self._max_rel_spread):
                 return [], f"SELL iron condor: {leg.option_type} k={leg.strike} fails liquidity"
-        if self._min_credit > 0:
+        if self._min_credit > 0 or self._min_credit_to_width > 0:
             credit_mid = (
                 (atm_call.bid + atm_call.ask) / 2.0
                 + (atm_put.bid + atm_put.ask) / 2.0
                 - (long_call.bid + long_call.ask) / 2.0
                 - (long_put.bid + long_put.ask) / 2.0
             )
-            if credit_mid < self._min_credit:
+            if self._min_credit > 0 and credit_mid < self._min_credit:
                 return [], (
                     f"SELL iron condor: mid credit ${credit_mid:.2f} below "
                     f"floor ${self._min_credit:.2f}"
                 )
+            if self._min_credit_to_width > 0:
+                wing_width = max(
+                    long_call.strike - atm_call.strike,
+                    atm_put.strike - long_put.strike,
+                )
+                if wing_width > 0 and credit_mid < self._min_credit_to_width * wing_width:
+                    return [], (
+                        f"SELL iron condor: mid credit ${credit_mid:.2f} < "
+                        f"{self._min_credit_to_width:.0%} of ${wing_width:.2f} "
+                        f"wing width (credit/width "
+                        f"{credit_mid / wing_width:.1%})"
+                    )
         return [
             TradeLeg(atm_call.strike, "call", "sell", 1, atm_call.symbol),
             TradeLeg(atm_put.strike, "put", "sell", 1, atm_put.symbol),
