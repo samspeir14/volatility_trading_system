@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -520,17 +521,38 @@ class AsyncTradierClient:
         days = hist.get("day") or []
         if isinstance(days, dict):
             days = [days]
-        return [
-            Bar(
-                date=date.fromisoformat(d["date"]),
-                open=float(d["open"]),
-                high=float(d["high"]),
-                low=float(d["low"]),
-                close=float(d["close"]),
-                volume=int(d["volume"]),
+        # Tradier occasionally returns placeholder rows with "NaN" fields
+        # (seen live: IWM 2025-03-06 with open/high/low="NaN"). float("NaN")
+        # parses fine, but sqlite binds nan as NULL, so one poisoned row
+        # aborts the whole symbol's upsert and freezes its cache — skip such
+        # rows instead. A skipped day just merges two daily returns; writing
+        # fabricated OHLC would poison the range-based vol estimators.
+        bars: list[Bar] = []
+        skipped: list[str] = []
+        for d in days:
+            try:
+                bar = Bar(
+                    date=date.fromisoformat(d["date"]),
+                    open=float(d["open"]),
+                    high=float(d["high"]),
+                    low=float(d["low"]),
+                    close=float(d["close"]),
+                    volume=int(d["volume"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                skipped.append(str(d.get("date", "?")))
+                continue
+            if not all(math.isfinite(v) for v in (bar.open, bar.high, bar.low, bar.close)):
+                skipped.append(str(d.get("date", "?")))
+                continue
+            bars.append(bar)
+        if skipped:
+            logger.warning(
+                "get_history %s: skipped %d malformed bar(s) (%s) — "
+                "NaN/missing fields from Tradier",
+                symbol, len(skipped), ", ".join(skipped[:5]),
             )
-            for d in days
-        ]
+        return bars
 
 
 def _to_float(value) -> float:
