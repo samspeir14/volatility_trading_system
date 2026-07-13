@@ -179,6 +179,7 @@ class OrderManager:
         slippage_buffer: float = 0.02,
         stale_order_threshold_minutes: int = STALE_ORDER_THRESHOLD_MINUTES_DEFAULT,
         max_close_retries: int = MAX_CLOSE_RETRIES_DEFAULT,
+        ladder_steps: tuple[float, ...] | None = None,
     ):
         self._client = client
         self._log = order_log
@@ -188,9 +189,28 @@ class OrderManager:
         self._fee_per_contract = settings.per_contract_fee
         self._poll_interval = poll_interval_seconds
         self._poll_timeout = poll_timeout_seconds
-        self._slippage = slippage_buffer
         self._stale_threshold_minutes = stale_order_threshold_minutes
         self._max_close_retries = max_close_retries
+        # Price ladder ("walk the book"): orders start AT the theoretical mid
+        # and reprice toward the far side in steps, instead of donating a
+        # fixed haircut up front. Steps are fractions of mid; each step gets
+        # an equal share of poll_timeout. The old static behavior (submit at
+        # mid -/+ slippage_buffer and wait) donated slippage_buffer on every
+        # fill that would have happened at mid. Default ladder tops out at
+        # 1.5x slippage_buffer — a worse worst-case print than the old static
+        # price, in exchange for better average fills and fewer misses; the
+        # signal-level min_credit floor still bounds entry economics.
+        if ladder_steps is None:
+            ladder_steps = (
+                0.0,
+                slippage_buffer / 2,
+                slippage_buffer,
+                slippage_buffer * 1.5,
+            )
+        if not ladder_steps:
+            raise ValueError("ladder_steps must have at least one step")
+        self._ladder_steps = tuple(ladder_steps)
+        self._ladder_step_seconds = poll_timeout_seconds / len(self._ladder_steps)
 
     def _check_production_guard(self) -> str | None:
         """Return error string if blocked, None if OK to proceed."""
@@ -226,9 +246,11 @@ class OrderManager:
                 error=signal.diagnostic_notes or "signal marked non-actionable",
             )
 
-        # 2. Build request
+        # 2. Build request at the theoretical mid (slippage 0): the price
+        # ladder walks from here toward the far side, and this same mid is
+        # recorded as arrival_mid for TCA.
         try:
-            request = signal_to_request(signal, snapshot, slippage=self._slippage, max_qty=self._max_qty)
+            request = signal_to_request(signal, snapshot, slippage=0.0, max_qty=self._max_qty)
         except ValueError as e:
             return OrderResult(
                 signal=signal, status="preview_failed", order_id=None,
@@ -295,21 +317,32 @@ class OrderManager:
         self._log.record_submission(
             signal=signal, fingerprint=fingerprint, structure=request.structure,
             submitted_price=request.price, order_id=order_id, submitted_at=now,
+            arrival_mid=request.price,
         )
-        logger.info("submitted order %d (%s %s %s) at %.2f",
-                    order_id, signal.symbol, signal.direction, request.structure, request.price)
+        logger.info("submitted order %d (%s %s %s) at mid %.2f (ladder %s)",
+                    order_id, signal.symbol, signal.direction, request.structure,
+                    request.price, self._ladder_steps)
 
-        # 7. Poll for terminal state
-        terminal_status, fill_price = await self._poll_until_terminal(order_id)
+        # 7. Walk the price ladder toward the far side until filled
+        terminal_status, fill_price, last_price = await self._run_price_ladder(
+            order_id, request.price, request.order_type,
+        )
+        if terminal_status is None:
+            # Unfilled after the full walk: cancel so the order doesn't sit at
+            # the exchange all day at a price we've stopped managing. A
+            # canceled entry is retryable next cycle (dedup ignores canceled);
+            # if the cancel fails or races a fill, fall back to the old
+            # "timeout" status, which the reconciler resolves cross-cycle.
+            terminal_status, fill_price = await self._cancel_unfilled_entry(order_id)
         if terminal_status is None:
             self._log.update_terminal_state(
                 order_id=order_id, status="timeout", fill_price=None,
-                filled_at=None, error="poll timeout",
+                filled_at=None, error="unfilled after price ladder; cancel unconfirmed",
             )
             return OrderResult(
                 signal=signal, status="timeout", order_id=order_id,
-                submitted_price=request.price, fill_price=None,
-                error="order did not reach terminal state within timeout",
+                submitted_price=last_price, fill_price=None,
+                error="order did not reach terminal state within ladder",
             )
 
         filled_at = datetime.now(timezone.utc) if terminal_status == "filled" else None
@@ -317,13 +350,54 @@ class OrderManager:
             order_id=order_id, status=terminal_status, fill_price=fill_price,
             filled_at=filled_at,
         )
+        if terminal_status == "filled":
+            self._log_fill_tca(
+                "entry", order_id, request.order_type, request.price, fill_price,
+            )
         return OrderResult(
             signal=signal, status=terminal_status, order_id=order_id,
-            submitted_price=request.price, fill_price=fill_price, error=None,
+            submitted_price=last_price, fill_price=fill_price, error=None,
         )
 
-    async def _poll_until_terminal(self, order_id: int) -> tuple[str | None, float | None]:
-        deadline = time.monotonic() + self._poll_timeout
+    async def _cancel_unfilled_entry(
+        self, order_id: int,
+    ) -> tuple[str | None, float | None]:
+        """Cancel an entry order the ladder couldn't fill. Returns the terminal
+        (status, fill_price) — 'canceled' on success, the real fill if the
+        cancel raced one, or (None, None) when the state is unknown (caller
+        falls back to 'timeout' for the reconciler to resolve)."""
+        try:
+            cancel_resp = await self._client.cancel_order(
+                self._settings.account_id, order_id,
+            )
+        except Exception as e:
+            logger.warning("cancel of unfilled entry %d failed: %r", order_id, e)
+            return None, None
+        if self._extract_error(cancel_resp) is None:
+            logger.info("canceled unfilled entry %d after ladder", order_id)
+            return "canceled", None
+        # Cancel rejected — usually a race with a fill. Re-query once.
+        try:
+            resp = await self._client.get_order_status(
+                self._settings.account_id, order_id,
+            )
+        except Exception as e:
+            logger.warning("post-cancel status query for %d failed: %r", order_id, e)
+            return None, None
+        order_node = resp.get("order") if isinstance(resp, dict) else None
+        if not isinstance(order_node, dict):
+            return None, None
+        status = (order_node.get("status") or "").lower()
+        if status in TERMINAL_STATES:
+            return status, self._extract_fill_price(order_node)
+        return None, None
+
+    async def _poll_until_terminal(
+        self, order_id: int, timeout_seconds: float | None = None,
+    ) -> tuple[str | None, float | None]:
+        deadline = time.monotonic() + (
+            timeout_seconds if timeout_seconds is not None else self._poll_timeout
+        )
         while time.monotonic() < deadline:
             await asyncio.sleep(self._poll_interval)
             resp = await self._client.get_order_status(self._settings.account_id, order_id)
@@ -339,6 +413,88 @@ class OrderManager:
                     fill_price_f = None
                 return status, fill_price_f
         return None, None
+
+    @staticmethod
+    def _ladder_price(base_mid: float, order_type: str, step: float) -> float:
+        """Price at a ladder step: credits concede downward from mid, debits
+        upward. step is a fraction of mid (0.0 = at mid)."""
+        if order_type == "credit":
+            return round(base_mid * (1 - step), 2)
+        return round(base_mid * (1 + step), 2)
+
+    async def _run_price_ladder(
+        self,
+        order_id: int,
+        base_mid: float,
+        order_type: str,
+    ) -> tuple[str | None, float | None, float]:
+        """Walk a working order's limit from mid toward the far side, one
+        modify per step, polling between. Returns (terminal_status, fill_price,
+        last_price); terminal_status None means unfilled after the full walk.
+        A failed modify is not fatal — the order keeps working at its current
+        price for the remaining step budget."""
+        current_price = self._ladder_price(base_mid, order_type, self._ladder_steps[0])
+        for i, step in enumerate(self._ladder_steps):
+            if i > 0:
+                next_price = self._ladder_price(base_mid, order_type, step)
+                # Cheap contracts round to the same cent — skip no-op modifies.
+                if next_price != current_price and next_price > 0:
+                    try:
+                        resp = await self._client.modify_order(
+                            account_id=self._settings.account_id,
+                            order_id=order_id,
+                            order_type=order_type,
+                            price=next_price,
+                        )
+                        modify_error = self._extract_error(resp)
+                    except Exception as e:
+                        modify_error = repr(e)
+                    if modify_error is not None:
+                        # Often a race: the order went terminal as we repriced.
+                        # The poll below picks that up; otherwise keep working
+                        # the old price.
+                        logger.info(
+                            "ladder modify order=%d -> %.2f failed (%s); "
+                            "holding %.2f", order_id, next_price, modify_error,
+                            current_price,
+                        )
+                    else:
+                        logger.debug(
+                            "ladder modify order=%d step=%d price %.2f -> %.2f",
+                            order_id, i, current_price, next_price,
+                        )
+                        current_price = next_price
+            status, fill_price = await self._poll_until_terminal(
+                order_id, timeout_seconds=self._ladder_step_seconds,
+            )
+            if status is not None:
+                return status, fill_price, current_price
+        return None, None, current_price
+
+    def _log_fill_tca(
+        self,
+        label: str,
+        order_id: int,
+        order_type: str,
+        arrival_mid: float,
+        fill_price: float | None,
+    ) -> None:
+        """One greppable line per fill: realized slippage vs the arrival mid
+        (positive = worse than mid). This is the number that decides whether
+        paper results survive real fills — reviewed via `grep TCA`."""
+        if fill_price is None or arrival_mid <= 0:
+            return
+        abs_fill = abs(fill_price)
+        slip = (
+            arrival_mid - abs_fill if order_type == "credit"
+            else abs_fill - arrival_mid
+        )
+        logger.info(
+            "TCA %s order=%d arrival_mid=%.2f fill=%.2f slippage=%+.2f/contract "
+            "(%+.1f%% of mid, positive=worse)",
+            label, order_id, arrival_mid, abs_fill, slip,
+            slip / arrival_mid * 100.0,
+        )
 
     @staticmethod
     def _extract_error(resp: dict | None) -> str | None:
@@ -447,14 +603,12 @@ class OrderManager:
                 "quantity": leg.quantity,
             })
 
-        # Determine close net premium and order type
+        # Determine close net premium and order type. Priced at the mark's
+        # theoretical mid; the price ladder concedes from there.
         close_cash_per_contract = mark.close_cash_flow / 100.0
-        if close_cash_per_contract >= 0:
-            order_type = "credit"
-            price = round(close_cash_per_contract * (1 - self._slippage), 2)
-        else:
-            order_type = "debit"
-            price = round(abs(close_cash_per_contract) * (1 + self._slippage), 2)
+        order_type = "credit" if close_cash_per_contract >= 0 else "debit"
+        close_mid = round(abs(close_cash_per_contract), 2)
+        price = self._ladder_price(close_mid, order_type, self._ladder_steps[0])
         if price <= 0:
             err = f"computed close price not positive: {price}"
             return OrderResult(
@@ -506,13 +660,20 @@ class OrderManager:
             exit_trigger=exit_trigger,
             order_type=order_type,
             submitted_price=price,
+            arrival_mid=close_mid,
         )
-        logger.info("submitted CLOSE %d for opening %d (%s) trigger=%s price=%.2f type=%s",
+        logger.info("submitted CLOSE %d for opening %d (%s) trigger=%s mid=%.2f type=%s (ladder %s)",
                     closing_order_id, position.tradier_order_id,
-                    position.symbol, exit_trigger, price, order_type)
+                    position.symbol, exit_trigger, close_mid, order_type,
+                    self._ladder_steps)
 
-        # Poll for fill
-        terminal_status, fill_price = await self._poll_until_terminal(closing_order_id)
+        # Walk the price ladder toward the far side until filled. Unlike
+        # entries, an unfilled close is NOT canceled here — it stays working
+        # for the stale-close reconciler, which cancels past the threshold and
+        # lets exit_manager retry next cycle at a fresh mark.
+        terminal_status, fill_price, _ = await self._run_price_ladder(
+            closing_order_id, close_mid, order_type,
+        )
         if terminal_status is None:
             # Left pending intentionally — reconcile_pending_closes will cancel
             # past the stale threshold and exit_manager will retry next cycle.
@@ -552,6 +713,9 @@ class OrderManager:
                 closed_at=terminal_at,
                 exit_trigger=exit_trigger,
                 realized_pnl=realized_pnl,
+            )
+            self._log_fill_tca(
+                "close", closing_order_id, order_type, close_mid, fill_price,
             )
             return OrderResult(
                 signal=None, status="filled", order_id=closing_order_id,

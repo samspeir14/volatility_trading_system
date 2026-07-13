@@ -256,10 +256,11 @@ class SignalGenerator:
         # money May-June; just above the fat zone keeps every position in it.
         self._harvest_min_dte = harvest_min_entry_dte
         self._harvest_max_dte = harvest_max_entry_dte
-        # SELL floor on the condor's mid-price net credit. Execution prices 2%
-        # below mid and fees take ~$1-4 per round trip, so sub-$0.25 credits
-        # ($25/contract gross, ~$12 at the +50% target) are fee-and-slippage
-        # food — a small-account problem; 0.0 keeps standard behavior.
+        # SELL floor on the condor's mid-price net credit. The execution
+        # ladder starts at mid but can concede up to 3%, and fees take ~$1-4
+        # per round trip, so sub-$0.25 credits ($25/contract gross, ~$12 at
+        # the +50% target) are fee-and-slippage food — a small-account
+        # problem; 0.0 keeps standard behavior.
         if min_credit < 0:
             raise ValueError(f"min_credit must be >= 0, got {min_credit}")
         self._min_credit = min_credit
