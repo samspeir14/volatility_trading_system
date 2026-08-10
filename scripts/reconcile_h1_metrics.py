@@ -72,6 +72,10 @@ def reconcile(payload: dict, preds_long) -> list[str]:
 
 def _alert(text: str) -> None:
     print(text, file=sys.stderr)
+    # Cron does not carry the bot's env — pull SLACK_WEBHOOK_URL from .env.
+    from dotenv import load_dotenv
+
+    load_dotenv(PROJECT_ROOT / ".env")
     webhook = os.environ.get("SLACK_WEBHOOK_URL")
     if webhook:
         from logs.slack import post_text
