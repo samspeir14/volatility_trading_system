@@ -100,16 +100,16 @@ FEATURE_COLUMNS: list[str] = (
 # (experiment 3_top20_xgb, mean-rank aggregation across walk-forward refits).
 # Frozen at integration time — do not load from CSV at runtime.
 HORIZON_FEATURE_SETS: dict[int, list[str]] = {
-    # h=1: PROVISIONAL, ordered by prior (h=5's ranking + the new deviation
-    # columns). MUST be replaced with the frozen top-20 from
-    # `python -m experiments.vol_model_lab --h1` (results/h1_feature_importance.csv)
-    # before the first production retrain.
+    # h=1: FROZEN 2026-08-10 from `python -m experiments.vol_model_lab --h1`
+    # on the EC2 box (mean-rank aggregation across walk-forward refits;
+    # results/h1_feature_importance.csv). Demeaned HAR components dominate,
+    # then VIX term structure and cross-ticker context.
     1: [
-        "dev_gk", "har_dev_5", "har_dev_22", "gk_1", "log_gk_baseline_63",
-        "parkinson_5", "gk_5", "garch_forecast_var", "ewma_vol_94",
-        "vix9d_to_vix", "intraday_range", "rv_5", "har_rv_daily",
-        "market_avg_rv21", "vix_level", "rv_10_63_ratio", "acf_sq_ret_lag1",
-        "atr_roc", "bb_width_roc", "volume_ratio",
+        "har_dev_5", "dev_gk", "vix3m_to_vix", "volume_ratio", "vix_level",
+        "market_avg_rv21", "har_dev_22", "vix9d_to_vix", "corr_spy_21",
+        "atr_roc", "ewma_94_97_ratio", "rv_10_63_ratio", "rsi_14", "rv_63",
+        "sector_avg_rv21", "log_gk_baseline_63", "har_rv_daily", "rskew_63",
+        "vix_vs_rv21_ann", "gk_1",
     ],
     5: [
         "parkinson_21", "gk_5", "gk_21", "vix9d_to_vix", "parkinson_5",
