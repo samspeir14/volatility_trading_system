@@ -1,6 +1,7 @@
-"""Tests for the small_harvest profile: STRATEGY_MODE/PER_CONTRACT_FEE parsing,
-calibration selection, the small watchlist, $10k sizing, the min-credit floor
-in SignalGenerator, and fee netting on realized P&L."""
+"""Tests for the small account profile: MODEL_PIPELINE/ACCOUNT_PROFILE/
+PER_CONTRACT_FEE parsing, calibration selection, the small watchlist, $10k
+sizing, the min-credit floor in SignalGenerator, and fee netting on realized
+P&L."""
 import os
 import sys
 import tempfile
@@ -32,31 +33,67 @@ def _settings_env(**overrides):
     return mock.patch.dict(os.environ, env, clear=True)
 
 
-def test_strategy_mode_small_harvest_normalizes_to_profile():
-    with _settings_env(STRATEGY_MODE="small_harvest"):
+def test_pipeline_and_profile_parsing():
+    with _settings_env():
         s = load_settings()
-    assert (s.strategy_mode, s.harvest_profile) == ("harvest", "small")
+    assert (s.model_pipeline, s.account_profile) == ("h1", "standard")
 
+    with _settings_env(MODEL_PIPELINE="legacy", ACCOUNT_PROFILE="small"):
+        s = load_settings()
+    assert (s.model_pipeline, s.account_profile) == ("legacy", "small")
+    print("pipeline/profile: defaults (h1, standard); env overrides parsed")
+
+
+def test_pipeline_and_profile_invalid_raise():
+    with _settings_env(MODEL_PIPELINE="bogus"):
+        try:
+            load_settings()
+        except ValueError as e:
+            assert "MODEL_PIPELINE" in str(e)
+        else:
+            raise AssertionError("MODEL_PIPELINE=bogus should raise ValueError")
+    with _settings_env(ACCOUNT_PROFILE="tiny"):
+        try:
+            load_settings()
+        except ValueError as e:
+            assert "ACCOUNT_PROFILE" in str(e)
+        else:
+            raise AssertionError("ACCOUNT_PROFILE=tiny should raise ValueError")
+    print("pipeline/profile: invalid values rejected")
+
+
+def test_strategy_mode_env_now_raises():
+    """The old knob must fail LOUDLY, not silently default — a live box with
+    STRATEGY_MODE still in .env needs to be reconfigured, not guessed at."""
     with _settings_env(STRATEGY_MODE="harvest"):
-        s = load_settings()
-    assert (s.strategy_mode, s.harvest_profile) == ("harvest", "standard")
-
-    with _settings_env(STRATEGY_MODE="model"):
-        s = load_settings()
-    assert (s.strategy_mode, s.harvest_profile) == ("model", "standard")
-    print("strategy_mode: small_harvest→(harvest, small); harvest/model→standard profile")
-
-
-def test_strategy_mode_invalid_raises():
-    with _settings_env(STRATEGY_MODE="bogus"):
         try:
             load_settings()
         except ValueError as e:
             msg = str(e)
-            assert "small_harvest" in msg and "harvest" in msg and "model" in msg
+            assert "STRATEGY_MODE" in msg and "MODEL_PIPELINE" in msg
         else:
-            raise AssertionError("STRATEGY_MODE=bogus should raise ValueError")
-    print("strategy_mode: 'bogus' rejected with all three options listed")
+            raise AssertionError("STRATEGY_MODE should raise ValueError")
+    print("strategy_mode: legacy env var raises with migration hint")
+
+
+def test_vrp_z_knobs_must_be_positive_magnitudes():
+    """VRP_Z_BUY=-1.25 (the natural misreading of "BUY needs z <= -1.25")
+    would flip the gate to z <= +1.25 — reject it loudly."""
+    with _settings_env(VRP_Z_BUY="-1.25"):
+        try:
+            load_settings()
+        except ValueError as e:
+            assert "VRP_Z" in str(e)
+        else:
+            raise AssertionError("negative VRP_Z_BUY should raise")
+    with _settings_env(VRP_Z_SELL="0"):
+        try:
+            load_settings()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("zero VRP_Z_SELL should raise")
+    print("vrp_z_knobs: non-positive magnitudes rejected")
 
 
 def test_per_contract_fee_parsing():
@@ -101,9 +138,9 @@ def _mk_settings(**overrides) -> Settings:
 
 
 def test_calibration_selected_by_profile():
-    assert trader_main._calibration(_mk_settings(harvest_profile="small")) \
+    assert trader_main._calibration(_mk_settings(account_profile="small")) \
         is trader_main.CALIBRATION_SMALL
-    assert trader_main._calibration(_mk_settings(harvest_profile="standard")) \
+    assert trader_main._calibration(_mk_settings(account_profile="standard")) \
         is trader_main.CALIBRATION_STANDARD
     # Default Settings (no profile set) must land on standard too.
     assert trader_main._calibration(_mk_settings()) is trader_main.CALIBRATION_STANDARD
@@ -306,7 +343,7 @@ def _thin_condor_generate(min_credit: float):
     feature_rows = {"X": pd.DataFrame({"a": [0.0]}, index=[date(2026, 5, 29)])}
     returns_by_symbol = {"X": _HARVEST_RETURNS}
     gen = SignalGenerator(predictors_by_horizon=predictors, history_store=None,
-                          strategy_mode="harvest", min_credit=min_credit)
+                          cross_sectional_z_threshold=0.0, min_credit=min_credit)
     return gen.generate(scan, feature_rows, returns_by_symbol, top_n=10)
 
 
@@ -389,8 +426,10 @@ def test_order_manager_wires_fee_from_settings():
 
 
 def main() -> int:
-    test_strategy_mode_small_harvest_normalizes_to_profile()
-    test_strategy_mode_invalid_raises()
+    test_pipeline_and_profile_parsing()
+    test_pipeline_and_profile_invalid_raise()
+    test_strategy_mode_env_now_raises()
+    test_vrp_z_knobs_must_be_positive_magnitudes()
     test_per_contract_fee_parsing()
     test_per_contract_fee_negative_raises()
     test_calibration_selected_by_profile()

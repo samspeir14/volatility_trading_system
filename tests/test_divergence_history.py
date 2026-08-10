@@ -19,6 +19,9 @@ class FakeSignal:
     atm_iv: float
     divergence: float
     underlying_price: float
+    is_actionable: bool = True
+    vrp_z: float | None = None
+    blocked_by: str | None = None
 
 
 def _fake(symbol: str, exp_offset: int, divergence: float) -> FakeSignal:

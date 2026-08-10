@@ -27,6 +27,25 @@ def format_summary(summary: DailySummary) -> str:
         f"{summary.signals_approved} approved",
     ]
 
+    if summary.gate_pass_rates:
+        g = dict(summary.gate_pass_rates)
+        candidates = g.pop("candidates", 0)
+        approved = g.pop("approved", 0)
+        blocked_str = " | ".join(f"{name} −{n}" for name, n in g.items())
+        line = f"Gates: {candidates} candidates"
+        if blocked_str:
+            line += f" | {blocked_str}"
+        line += f" | approved {approved}"
+        lines.append(line)
+        # A day where every candidate died at one gate is exactly the silent
+        # zero-signal deadlock this block exists to catch — flag it.
+        if candidates > 0 and approved == 0:
+            top_gate = max(g, key=g.get) if g else "?"
+            lines.append(
+                f":warning: zero signals cleared the gates today "
+                f"(largest blocker: {top_gate} × {g.get(top_gate, 0)})"
+            )
+
     if summary.risk_rejections_total > 0:
         reason_str = ", ".join(
             f"{cat} × {n}"

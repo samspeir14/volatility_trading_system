@@ -30,6 +30,28 @@ CREATE_INDEX_SQL = (
 )
 
 
+def find_stale_symbols(
+    store: "HistoricalStore",
+    symbols: list[str],
+    max_lag_bdays: int = 5,
+) -> list[str]:
+    """Symbols whose latest cached bar trails the freshest symbol by more
+    than `max_lag_bdays` business days (or that have no bars at all). A
+    frozen series (e.g. IWM, stuck at 2025-03-05) would poison pooled
+    training, so retrain and lab runs exclude these."""
+    latest = {s: store.latest_date(s) for s in symbols}
+    dates = [d for d in latest.values() if d is not None]
+    if not dates:
+        return []
+    freshest = max(dates)
+    stale: list[str] = []
+    for s in symbols:
+        d = latest[s]
+        if d is None or len(pd.bdate_range(d, freshest)) - 1 > max_lag_bdays:
+            stale.append(s)
+    return stale
+
+
 class HistoricalStore:
     def __init__(self, db_path: Path):
         db_path.parent.mkdir(parents=True, exist_ok=True)

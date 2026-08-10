@@ -157,6 +157,56 @@ def test_lagged_rv_forecast_values():
     print(f"lagged_rv_forecast: n={len(out)} values check out")
 
 
+def test_qlike_perfect_forecast_is_zero():
+    from model.evaluation import qlike
+
+    a = pd.Series([0.01, 0.04, 0.0002])
+    assert math.isclose(qlike(a, a.copy()), 0.0, abs_tol=1e-15)
+    print("qlike: perfect forecast scores 0")
+
+
+def test_qlike_penalizes_underforecast_more():
+    from model.evaluation import qlike
+
+    a = pd.Series([0.02] * 10)
+    under = qlike(a, a / 2.0)  # forecast half the variance
+    over = qlike(a, a * 2.0)   # forecast double the variance
+    assert under > over > 0.0
+    print(f"qlike: under-forecast {under:.4f} > over-forecast {over:.4f}")
+
+
+def test_qlike_drops_nan_and_nonpositive():
+    from model.evaluation import qlike
+
+    a = pd.Series([0.01, np.nan, 0.02, 0.03])
+    f = pd.Series([0.01, 0.02, 0.0, 0.03])
+    # row1 (NaN actual) and row2 (nonpositive forecast) dropped → perfect rows
+    assert math.isclose(qlike(a, f), 0.0, abs_tol=1e-15)
+    assert math.isnan(qlike(pd.Series(dtype=float), pd.Series(dtype=float)))
+    print("qlike: NaN and nonpositive rows dropped; empty → NaN")
+
+
+def test_per_ticker_r2_median():
+    from model.evaluation import per_ticker_r2_median
+
+    rng = np.random.default_rng(0)
+    idx_a = pd.MultiIndex.from_product(
+        [["A"], pd.date_range("2024-01-01", periods=50)], names=["symbol", "date"]
+    )
+    idx_b = pd.MultiIndex.from_product(
+        [["B"], pd.date_range("2024-01-01", periods=50)], names=["symbol", "date"]
+    )
+    y_a = pd.Series(rng.normal(0, 1, 50), index=idx_a)
+    y_b = pd.Series(rng.normal(0, 1, 50), index=idx_b)
+    y = pd.concat([y_a, y_b])
+    # A predicted perfectly (r2=1), B predicted by 0 (r2≈0) → median ≈ 0.5
+    pred = pd.concat([y_a, pd.Series(0.0, index=idx_b)])
+    med = per_ticker_r2_median(y, pred)
+    per_b = 1.0 - float(((y_b - 0.0) ** 2).sum() / ((y_b - y_b.mean()) ** 2).sum())
+    assert math.isclose(med, (1.0 + per_b) / 2.0, rel_tol=1e-9)
+    print(f"per_ticker_r2_median: median of (1.0, {per_b:.4f}) = {med:.4f}")
+
+
 def main() -> int:
     test_basic_metrics()
     test_perfect_prediction()
@@ -168,6 +218,10 @@ def main() -> int:
     test_within_r2_perfect_and_timing_skill()
     test_r2_vs_baseline()
     test_lagged_rv_forecast_values()
+    test_qlike_perfect_forecast_is_zero()
+    test_qlike_penalizes_underforecast_more()
+    test_qlike_drops_nan_and_nonpositive()
+    test_per_ticker_r2_median()
     print("all evaluation tests passed")
     return 0
 

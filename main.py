@@ -63,22 +63,14 @@ logger = logging.getLogger(__name__)
 # the per-cycle option-chain fan-out and exhausted the rate limiter every cycle.
 # The lower bound stays at 3 (below MIN_ENTRY_DTE) so already-open positions at
 # DTE 3 still mark off the scan; anything below that is pulled in by
-# fetch_missing_position_chains.
+# fetch_missing_position_chains. The h=1 term projection prices the whole
+# window correctly (forecast decays toward the baseline with tenor), so the
+# full (3, 45) window applies unconditionally now that harvest mode is gone.
 SCAN_EXPIRATION_WINDOW = (3, 45)
-# Harvest mode never enters above DTE 15 and its positions ride to expiry, so
-# chains past 16 are dead weight — and the narrower window is what pays the
-# rate-limiter bill for the larger watchlist (~5 calls/name at (3,45) vs ~3 at
-# (3,16), against the 180/min budget). Legacy model-mode positions above the
-# window still mark: fetch_missing_position_chains pulls any open-position
-# expiration the scan didn't cover, above or below. Side effect: while in
-# harvest mode the divergence log only accumulates DTE ≤ 16 rows — fine for
-# the prospective accuracy tests, which target the short tenor anyway.
-SCAN_EXPIRATION_WINDOW_HARVEST = (3, 16)
 
 
 def _scan_window(settings: Settings) -> tuple[int, int]:
-    return (SCAN_EXPIRATION_WINDOW_HARVEST if settings.strategy_mode == "harvest"
-            else SCAN_EXPIRATION_WINDOW)
+    return SCAN_EXPIRATION_WINDOW
 
 
 # NEW entries only submit inside this ET window. Options spreads are widest in
@@ -181,7 +173,7 @@ CALIBRATION_SMALL = RiskCalibration(
 
 
 def _calibration(settings: Settings) -> RiskCalibration:
-    return (CALIBRATION_SMALL if settings.harvest_profile == "small"
+    return (CALIBRATION_SMALL if settings.account_profile == "small"
             else CALIBRATION_STANDARD)
 
 
@@ -210,6 +202,92 @@ def _last_weekday(d: date) -> date:
     while d.weekday() >= 5:
         d -= timedelta(days=1)
     return d
+
+
+def _load_h1_predictor(
+    artifact_dir: Path,
+) -> tuple["H1DeviationPredictor", dict[str, float]]:
+    """Load the h=1 deviation predictor (LightGBM + HAR, routed by the retrain
+    acceptance gate) and the per-symbol GARCH persistence fallback table.
+    Missing/legacy/stale routing JSON degrades to route=har with a loud
+    warning — HAR is the always-valid benchmark, never a crash."""
+    from model import H1DeviationPredictor, HARRVPredictor
+
+    route = "har"
+    phi_by_symbol: dict[str, float] = {}
+    pinned: dict[str, str] = {}
+    json_path = artifact_dir / "latest_retrain_r2.json"
+    try:
+        with open(json_path) as f:
+            payload = json.load(f)
+        if payload.get("schema_version") == 2 and payload.get("pipeline") == "h1":
+            route = payload["h1"].get("route", "har")
+            pinned = payload["h1"].get("artifacts", {}) or {}
+            phi_by_symbol = {
+                str(s): float(p)
+                for s, p in payload["h1"].get("garch_persistence_by_symbol", {}).items()
+            }
+            logger.info(
+                "h1 routing loaded from %s: route=%s (trained_at=%s, acceptance=%s)",
+                json_path.name, route, payload.get("trained_at", "unknown"),
+                payload.get("h1", {}).get("acceptance"),
+            )
+        else:
+            logger.warning(
+                "%s is not an h1 schema-v2 file (schema_version=%s pipeline=%s) — "
+                "routing h=1 to HAR until the retrain runs",
+                json_path.name, payload.get("schema_version"), payload.get("pipeline"),
+            )
+    except FileNotFoundError:
+        logger.warning(
+            "%s missing — routing h=1 to HAR (run RUN_SLOW_TESTS=1 "
+            "python -m tests.test_model_retraining to refresh)", json_path.name,
+        )
+    except Exception as e:
+        logger.error("failed to read %s (%s) — routing h=1 to HAR", json_path.name, e)
+
+    def _pick(prefix: str) -> Path | None:
+        """Prefer the artifact the retrain JSON pinned (the one the acceptance
+        gate actually evaluated); fall back to newest-by-mtime with a warning
+        — an aborted retrain can leave fresh but ungated joblibs on disk."""
+        pinned_name = pinned.get(prefix.split("_")[0])
+        if pinned_name:
+            path = artifact_dir / pinned_name
+            if path.exists():
+                return path
+            logger.warning("pinned artifact %s missing — falling back to newest",
+                           pinned_name)
+        files = list(artifact_dir.glob(f"{prefix}_*.joblib"))
+        if not files:
+            return None
+        newest = max(files, key=lambda p: p.stat().st_mtime)
+        if pinned:
+            logger.warning(
+                "loading %s by mtime, NOT pinned by the retrain JSON — this "
+                "artifact may not be the one the acceptance gate evaluated",
+                newest.name,
+            )
+        return newest
+
+    lgbm = None
+    lgbm_path = _pick("lgbm_h1")
+    if lgbm_path is not None:
+        lgbm = LightGBMVolPredictor.load(lgbm_path)
+        logger.info("loaded %s", lgbm_path.name)
+
+    har = None
+    har_path = _pick("har_h1")
+    if har_path is not None:
+        har = HARRVPredictor.load(har_path)
+        logger.info("loaded %s", har_path.name)
+
+    if lgbm is None and har is None:
+        raise RuntimeError(
+            "no h=1 model artifact (lgbm_h1_* / har_h1_*) in "
+            f"{artifact_dir}; run RUN_SLOW_TESTS=1 python -m "
+            "tests.test_model_retraining to generate them"
+        )
+    return H1DeviationPredictor(lgbm=lgbm, har=har, route=route), phi_by_symbol
 
 
 def _load_routing_r2(artifact_dir: Path) -> dict[int, dict[str, float]]:
@@ -509,12 +587,14 @@ class MainLoop:
                     )
                 feature_rows.pop(sym, None)
                 returns_by_symbol.pop(sym, None)
+            daily_gk_vol = self._build_daily_gk_vol(exclude=stale_symbols)
             actionable, all_signals = self._signal_generator.generate(
                 scan=scan,
                 feature_rows=feature_rows,
                 returns_by_symbol=returns_by_symbol,
                 top_n=10,
                 vix_term_ratio=self._vix_term_structure_ratio(),
+                daily_gk_vol_by_symbol=daily_gk_vol,
             )
             signals_total = len(all_signals)
             signals_actionable = len(actionable)
@@ -715,6 +795,26 @@ class MainLoop:
                 continue
         return rows
 
+    def _build_daily_gk_vol(self, exclude: list[str] | None = None) -> dict[str, pd.Series]:
+        """Per-symbol single-day GK vol series (with Parkinson / |c2c| fallback)
+        for the tenor-matched VRP gap. Same bars the features are built from."""
+        from features.target import daily_ohlc_vol
+
+        end = _last_weekday(date.today())
+        start = end - timedelta(days=730)
+        excluded = set(exclude or [])
+        out: dict[str, pd.Series] = {}
+        for ticker in self._feature_pipeline._watchlist:
+            if ticker.symbol in excluded:
+                continue
+            try:
+                bars = self._store.get_bars(ticker.symbol, start, end)
+                if not bars.empty:
+                    out[ticker.symbol] = daily_ohlc_vol(bars)
+            except Exception as e:
+                logger.warning("could not build gk vol for %s: %s", ticker.symbol, e)
+        return out
+
     def _build_returns_dict(self) -> dict[str, pd.Series]:
         end = _last_weekday(date.today())
         start = end - timedelta(days=730)
@@ -805,7 +905,7 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
         )
 
     watchlist = (load_watchlist(SMALL_WATCHLIST_PATH)
-                 if settings.harvest_profile == "small" else load_watchlist())
+                 if settings.account_profile == "small" else load_watchlist())
     market_data = MarketData(client, watchlist)
     feature_pipeline = FeaturePipeline(
         store, watchlist,
@@ -822,22 +922,19 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
         kill_switch=kill_switch,
     )
 
-    predictors = _load_predictors(artifact_dir)
-
     # Index ETFs carry a variance-risk premium (realized < implied), so buying
     # their straddles bleeds — every SPY long straddle in the live log lost.
     # Bar them from the BUY side; they stay eligible for the SELL/iron-condor
-    # side that harvests the premium. "bonds" (TLT) is an index product with
-    # the same structural premium — same exclusion, different risk bucket for
-    # the sector-concentration gate.
+    # side. "bonds" (TLT) is an index product with the same structural premium
+    # — same exclusion, different risk bucket for the sector-concentration gate.
     etf_symbols = frozenset(
         t.symbol for t in watchlist if t.sector in ("etf", "bonds")
     )
 
     cal = _calibration(settings)
 
-    signal_generator = SignalGenerator(
-        predictors_by_horizon=predictors,
+    # Shared gate wiring for both pipelines.
+    common_signal_kwargs = dict(
         history_store=divergence_history,
         cross_sectional_z_threshold=1.5,
         max_divergence=0.25,
@@ -845,19 +942,44 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
         earnings_filter_enabled=settings.earnings_filter_enabled,
         earnings_buffer_days=settings.earnings_buffer_days,
         long_straddle_excluded_symbols=etf_symbols,
-        strategy_mode=settings.strategy_mode,
         min_credit=cal.min_credit,
         min_credit_to_width=cal.min_credit_to_width,
         # FOMC/CPI are the "earnings" of the rate/index-linked names — the
         # same etf+bonds set barred from long straddles. Single-name equities
-        # are not macro-gated (the VRP was fat through every macro day).
+        # are not macro-gated.
         macro_calendar=MacroCalendar(),
         macro_sensitive_symbols=etf_symbols,
     )
-    logger.info(
-        "strategy mode: %s (profile: %s, %d-name watchlist)",
-        settings.strategy_mode, settings.harvest_profile, len(watchlist),
-    )
+
+    h1_predictor = None
+    predictors = None
+    if settings.model_pipeline == "h1":
+        h1_predictor, phi_by_symbol = _load_h1_predictor(artifact_dir)
+        signal_generator = SignalGenerator(
+            h1_predictor=h1_predictor,
+            vrp_z_sell=settings.vrp_z_sell,
+            vrp_z_buy=settings.vrp_z_buy,
+            vrp_min_obs=settings.vrp_min_obs,
+            cost_multiple=settings.cost_multiple,
+            max_leg_spread_pct=settings.max_leg_spread_pct,
+            per_contract_fee=settings.per_contract_fee,
+            phi_by_symbol=phi_by_symbol,
+            **common_signal_kwargs,
+        )
+        logger.info(
+            "pipeline: h1 route=%s (profile: %s, %d-name watchlist)",
+            h1_predictor.active_model, settings.account_profile, len(watchlist),
+        )
+    else:
+        predictors = _load_predictors(artifact_dir)
+        signal_generator = SignalGenerator(
+            predictors_by_horizon=predictors,
+            **common_signal_kwargs,
+        )
+        logger.info(
+            "pipeline: legacy multi-horizon (profile: %s, %d-name watchlist)",
+            settings.account_profile, len(watchlist),
+        )
 
     # The rationale for both parameter sets lives on CALIBRATION_STANDARD /
     # CALIBRATION_SMALL at the top of this module.
@@ -881,13 +1003,23 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
         max_premium_per_trade=cal.max_premium_per_trade,
         stale_order_threshold_minutes=settings.stale_order_threshold_minutes,
         max_close_retries=settings.max_close_retries,
+        # Stamp each entry with the next known earnings date — the earnings
+        # exit's fail-closed store.
+        earnings_calendar=earnings_calendar,
     )
 
+    slack_url = os.environ.get("SLACK_WEBHOOK_URL")
     exit_manager = ExitManager(
         position_tracker=position_tracker,
         order_manager=order_manager,
         predictors_by_horizon=predictors,
-        thesis_exit_enabled=(settings.strategy_mode != "harvest"),
+        h1_predictor=h1_predictor,
+        earnings_calendar=earnings_calendar,
+        earnings_exit_buffer_trading_days=settings.earnings_exit_buffer_trading_days,
+        order_log=order_log,
+        # Manual-review flags (short-vol position with no verifiable earnings
+        # date) must reach a human, not just the journal.
+        alert_cb=(lambda msg: post_text(slack_url, msg)) if slack_url else None,
     )
 
     daily_summary_builder = DailySummaryBuilder(
@@ -918,7 +1050,7 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
         daily_summary_builder=daily_summary_builder,
         earnings_calendar=earnings_calendar,
         watchlist_symbols=[t.symbol for t in watchlist],
-        slack_webhook_url=os.environ.get("SLACK_WEBHOOK_URL"),
+        slack_webhook_url=slack_url,
         scan_interval_seconds=int(os.environ.get("SCAN_INTERVAL_SECONDS", "300")),
         # The kill switch that actually trips lives here, not in RiskManager
         # (whose daily_loss_kill_switch_pct is stored but never read) — wire

@@ -22,6 +22,7 @@ from features.cross_ticker import (
 from features.distribution_shape import realized_kurt, realized_skew
 from features.garch import garch_features_walk_forward
 from features.ohlc_vol import garman_klass_vol, parkinson_vol
+from features.target import daily_ohlc_vol, log_vol, rolling_log_vol_baseline
 from features.realized_vol import (
     acf_squared_returns,
     ewma_vol,
@@ -73,12 +74,25 @@ DISTRIBUTION_SHAPE_COLUMNS: list[str] = [
     "rkurt_21", "rkurt_63",
 ]
 
-# Full 45-column feature matrix produced by build_features().
+# h=1 target-side columns (added with the within-stock deviation model).
+# gk_1 is the single-day GK vol proxy (with Parkinson / |c2c return| fallback),
+# log_gk_baseline_63 is b_t (the 63-day trailing mean of log gk_1, min 40 obs),
+# dev_gk / har_dev_* are demeaned HAR components (inputs to the HAR baseline
+# and candidate LGBM features), garch_persistence is alpha+beta for the
+# term-structure projection. All trailing / point-in-time.
+H1_FEATURE_COLUMNS: list[str] = [
+    "gk_1", "log_gk_1", "log_gk_baseline_63",
+    "dev_gk", "har_dev_5", "har_dev_22",
+    "garch_persistence",
+]
+
+# Full feature matrix produced by build_features(): 45 legacy columns + 7 h=1.
 FEATURE_COLUMNS: list[str] = (
     BASELINE_FEATURE_COLUMNS
     + OHLC_VOL_COLUMNS
     + DISTRIBUTION_SHAPE_COLUMNS
     + RATIO_FEATURE_COLUMNS
+    + H1_FEATURE_COLUMNS
 )
 
 
@@ -86,6 +100,17 @@ FEATURE_COLUMNS: list[str] = (
 # (experiment 3_top20_xgb, mean-rank aggregation across walk-forward refits).
 # Frozen at integration time — do not load from CSV at runtime.
 HORIZON_FEATURE_SETS: dict[int, list[str]] = {
+    # h=1: PROVISIONAL, ordered by prior (h=5's ranking + the new deviation
+    # columns). MUST be replaced with the frozen top-20 from
+    # `python -m experiments.vol_model_lab --h1` (results/h1_feature_importance.csv)
+    # before the first production retrain.
+    1: [
+        "dev_gk", "har_dev_5", "har_dev_22", "gk_1", "log_gk_baseline_63",
+        "parkinson_5", "gk_5", "garch_forecast_var", "ewma_vol_94",
+        "vix9d_to_vix", "intraday_range", "rv_5", "har_rv_daily",
+        "market_avg_rv21", "vix_level", "rv_10_63_ratio", "acf_sq_ret_lag1",
+        "atr_roc", "bb_width_roc", "volume_ratio",
+    ],
     5: [
         "parkinson_21", "gk_5", "gk_21", "vix9d_to_vix", "parkinson_5",
         "garch_forecast_var", "market_avg_rv21", "intraday_range",
@@ -209,6 +234,7 @@ class FeaturePipeline:
         )
         df["garch_forecast_var"] = garch["garch_forecast_var"]
         df["garch_resid_lb_pvalue"] = garch["garch_resid_lb_pvalue"]
+        df["garch_persistence"] = garch["garch_persistence"]
 
         # Technical indicators
         df["bb_width"] = bollinger_width(b["close"])
@@ -233,6 +259,20 @@ class FeaturePipeline:
         df["rskew_63"] = realized_skew(r, 63)
         df["rkurt_21"] = realized_kurt(r, 21)
         df["rkurt_63"] = realized_kurt(r, 63)
+
+        # h=1 target-side columns: single-day GK vol (with fallbacks), its log,
+        # the 63-day baseline b_t, and demeaned HAR components. Computed here
+        # (not only at target build) so signal-time inference reads the exact
+        # same b_t / dev the model trained on.
+        gk1 = daily_ohlc_vol(b)
+        lv = log_vol(gk1)
+        baseline = rolling_log_vol_baseline(lv)
+        df["gk_1"] = gk1
+        df["log_gk_1"] = lv
+        df["log_gk_baseline_63"] = baseline
+        df["dev_gk"] = lv - baseline
+        df["har_dev_5"] = lv.rolling(5).mean() - baseline
+        df["har_dev_22"] = lv.rolling(22).mean() - baseline
 
         return df
 

@@ -1,6 +1,6 @@
-"""Unit tests for the harvest entry filters added 2026-07: macro-event
-calendar, VIX term-structure veto, credit-to-width floor, and the wing-sigma
-calendar-day convention."""
+"""Unit tests for the mode-agnostic entry filters (exercised via the
+legacy pipeline path): macro-event calendar, VIX term-structure veto,
+credit-to-width floor, and the wing-sigma calendar-day convention."""
 import math
 import sys
 from datetime import date, datetime, timedelta, timezone
@@ -60,7 +60,7 @@ def _gen(**kwargs) -> SignalGenerator:
     return SignalGenerator(
         predictors_by_horizon={h: _ConstPredictor() for h in (5, 10, 21)},
         history_store=None,
-        strategy_mode="harvest",
+        cross_sectional_z_threshold=0.0,  # gates under test decide, not z
         **kwargs,
     )
 
@@ -88,13 +88,13 @@ def test_macro_calendar_window_and_staleness():
 
 
 def test_macro_filter_demotes_sensitive_symbol_only():
-    """TLT (sensitive) with FOMC inside its life is demoted; an identical
-    non-sensitive name passes. Window is life-of-position in harvest: scan
-    day 2026-06-01, expiry 06-12, FOMC 06-17 is OUTSIDE -> also passes."""
+    """TLT (sensitive) with a macro event inside the entry window is demoted;
+    an identical non-sensitive name passes. Window = today + buffer days
+    (11 here so CPI 2026-06-10 falls inside 06-01..06-12)."""
     cal = MacroCalendar()
-    # CPI 2026-06-10 falls inside 06-01..06-12 for both names
     scan = _scan([("TLT", 0.20), ("XYZ", 0.20)])
-    gen = _gen(macro_calendar=cal, macro_sensitive_symbols={"TLT"})
+    gen = _gen(macro_calendar=cal, macro_sensitive_symbols={"TLT"},
+               earnings_buffer_days=11)
     actionable, all_signals = _run(gen, scan, ["TLT", "XYZ"])
     by = {s.symbol: s for s in all_signals}
 
@@ -120,7 +120,7 @@ def test_macro_filter_passes_when_window_clear():
 
 # ---------- VIX term-structure veto ----------
 
-def test_vix_backwardation_vetoes_all_harvest_sells():
+def test_vix_backwardation_vetoes_all_sells():
     scan = _scan([("A", 0.20), ("B", 0.25)])
     gen = _gen()
     # Backwardation: every SELL demoted with the veto note
@@ -193,10 +193,10 @@ def main() -> int:
     test_macro_calendar_window_and_staleness()
     test_macro_filter_demotes_sensitive_symbol_only()
     test_macro_filter_passes_when_window_clear()
-    test_vix_backwardation_vetoes_all_harvest_sells()
+    test_vix_backwardation_vetoes_all_sells()
     test_credit_to_width_floor()
     test_wing_sigma_uses_calendar_day_year()
-    print("all harvest_entry_filters tests passed")
+    print("all entry_filters tests passed")
     return 0
 
 

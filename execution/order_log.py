@@ -123,6 +123,14 @@ CLOSE_COLUMNS_MIGRATIONS = [
     # TCA: the theoretical mid at submission time (per contract). Together
     # with fill_price this yields realized slippage per fill.
     ("arrival_mid", "ALTER TABLE submitted_orders ADD COLUMN arrival_mid REAL"),
+    # Earnings-exit fail-closed store: the ticker's next earnings date as
+    # known at entry, refreshed on every healthy calendar read. When the
+    # calendar API dies, the exit manager falls back to this stored value —
+    # a short-vol position must never ride through earnings just because
+    # Finnhub was down.
+    ("next_earnings_date", "ALTER TABLE submitted_orders ADD COLUMN next_earnings_date TEXT"),
+    # VRP calibration z at entry (h=1 pipeline) — every signal record logs it.
+    ("vrp_z", "ALTER TABLE submitted_orders ADD COLUMN vrp_z REAL"),
 ]
 
 CLOSE_ATTEMPT_COLUMNS_MIGRATIONS = [
@@ -175,6 +183,7 @@ class OrderLog:
         order_id: int,
         submitted_at: datetime,
         arrival_mid: float | None = None,
+        next_earnings_date: date | None = None,
     ) -> None:
         legs_json = json.dumps([asdict(leg) for leg in signal.legs])
         self._conn.execute(
@@ -183,8 +192,8 @@ class OrderLog:
             "direction, structure, horizon_lower, horizon_upper, weight_lower, "
             "underlying_price_at_signal, atm_iv_at_signal, predicted_iv_at_signal, "
             "divergence_at_signal, cross_sectional_z, time_series_z, "
-            "submitted_price, legs_json, arrival_mid"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "submitted_price, legs_json, arrival_mid, next_earnings_date, vrp_z"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 order_id, fingerprint, submitted_at.isoformat(), signal.symbol,
                 signal.expiration.isoformat(), signal.direction, structure,
@@ -193,6 +202,23 @@ class OrderLog:
                 signal.predicted_iv_equivalent, signal.divergence,
                 signal.cross_sectional_z, signal.time_series_z,
                 submitted_price, legs_json, arrival_mid,
+                next_earnings_date.isoformat() if next_earnings_date else None,
+                getattr(signal, "vrp_z", None),
+            ),
+        )
+        self._conn.commit()
+
+    def update_next_earnings_date(
+        self, order_id: int, next_earnings_date: date | None
+    ) -> None:
+        """Refresh the fail-closed earnings store for an open position after a
+        healthy calendar read (report dates move)."""
+        self._conn.execute(
+            "UPDATE submitted_orders SET next_earnings_date = ? "
+            "WHERE tradier_order_id = ?",
+            (
+                next_earnings_date.isoformat() if next_earnings_date else None,
+                order_id,
             ),
         )
         self._conn.commit()
@@ -556,7 +582,7 @@ class OrderLog:
             "direction, structure, horizon_lower, horizon_upper, weight_lower, "
             "underlying_price_at_signal, atm_iv_at_signal, predicted_iv_at_signal, "
             "divergence_at_signal, cross_sectional_z, time_series_z, "
-            "submitted_price, legs_json, final_status, fill_price "
+            "submitted_price, legs_json, final_status, fill_price, next_earnings_date "
             "FROM submitted_orders "
             "WHERE final_status IN ('filled', 'partially_filled') "
             "AND closing_order_id IS NULL "
