@@ -6,6 +6,8 @@ exercised in the live test."""
 import math
 import sys
 from datetime import date, datetime, timezone
+
+TODAY = date(2026, 5, 12)
 from unittest import mock
 
 from data.async_client import OptionContract
@@ -83,11 +85,11 @@ def test_iron_condor_profit_target_at_50pct():
     pos = _mk_iron_condor_position(entry_credit=13.55)
     # 50% target = 0.50 × 13.55 × 100 = $677.50
     mark = _mark(pos, pnl_dollars=678.0)
-    trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=-0.08)  # thesis intact
+    trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=-0.08)  # thesis intact
     assert trigger == "profit_target"
     # Just below threshold: hold
     mark = _mark(pos, pnl_dollars=677.0)
-    trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=-0.08)
+    trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=-0.08)
     assert trigger is None
     print("iron_condor profit_target: $677.50 cutoff verified")
 
@@ -96,7 +98,7 @@ def test_long_straddle_profit_target_at_100pct():
     pos = _mk_long_straddle_position(entry_debit=4.08)
     # 100% target = 1.0 × 4.08 × 100 = $408
     mark = _mark(pos, pnl_dollars=409.0)
-    trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=0.15)  # thesis intact
+    trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=0.15)  # thesis intact
     assert trigger == "profit_target"
     print("long_straddle profit_target: $408 cutoff verified")
 
@@ -107,7 +109,7 @@ def test_iron_condor_stop_loss_at_neg_100pct():
     pos = _mk_iron_condor_position(entry_credit=13.55)
     # -100% stop = -1.0 × 13.55 × 100 = -$1355
     mark = _mark(pos, pnl_dollars=-1356.0)
-    trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=-0.08)
+    trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=-0.08)
     assert trigger == "stop_loss"
     print("iron_condor stop_loss: -$1355 cutoff verified")
 
@@ -116,7 +118,7 @@ def test_long_straddle_stop_loss_at_neg_50pct():
     pos = _mk_long_straddle_position(entry_debit=4.08)
     # -50% stop = -0.50 × 4.08 × 100 = -$204
     mark = _mark(pos, pnl_dollars=-205.0)
-    trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=0.15)
+    trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=0.15)
     assert trigger == "stop_loss"
     print("long_straddle stop_loss: -$204 cutoff verified")
 
@@ -128,11 +130,11 @@ def test_expiration_proximity_long_straddle_dte_2():
     The proximity exit applies to long straddles only — IC wings cap risk."""
     pos = _mk_long_straddle_position()
     mark = _mark(pos, pnl_dollars=0.0, dte=2)
-    trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=0.15)
+    trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=0.15)
     assert trigger == "expiration_proximity"
     # DTE=3 doesn't trigger
     mark = _mark(pos, pnl_dollars=0.0, dte=3)
-    trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=0.15)
+    trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=0.15)
     assert trigger is None
     print("expiration_proximity (long_straddle): dte<=2 fires, dte=3 holds")
 
@@ -145,7 +147,7 @@ def test_expiration_proximity_skipped_for_iron_condor():
     # dte=2 (would fire expiration_proximity for a straddle): holds — outside
     # the assignment close window, quotes present, shorts not at parity.
     mark = _mark(pos, pnl_dollars=0.0, dte=2, underlying_price=210.0)
-    trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=-0.08)
+    trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=-0.08)
     assert trigger is None, f"IC at dte=2 should hold, got {trigger}"
     print("expiration_proximity (iron_condor): dte=2 holds (assignment window starts at 1)")
 
@@ -176,7 +178,7 @@ def test_assignment_risk_expiry_day_unconditional():
     with good quotes."""
     pos = _mk_otm_condor_position()
     mark = _mark(pos, pnl_dollars=0.0, dte=0, underlying_price=210.0)
-    trigger, rationale = _exit_mgr()._evaluate_one(mark, current_divergence=-0.08)
+    trigger, rationale = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=-0.08)
     assert trigger == "assignment_risk", f"expected assignment_risk, got {trigger}"
     assert "expiration" in rationale
     print("assignment_risk (a): dte=0 closes unconditionally")
@@ -189,16 +191,16 @@ def test_assignment_risk_near_money_short_at_dte1():
     # Harvest fly: shorts at 210, spot pinned there → close.
     fly = _mk_iron_condor_position()
     mark = _mark(fly, pnl_dollars=0.0, dte=1, underlying_price=210.5)
-    trigger, _ = mgr._evaluate_one(mark, current_divergence=-0.08)
+    trigger, _ = mgr._evaluate_one(mark, today=TODAY, current_divergence=-0.08)
     assert trigger == "assignment_risk", f"expected assignment_risk, got {trigger}"
     # OTM condor: shorts at 200/220, spot 210 → both >1.5% away, let it ride.
     condor = _mk_otm_condor_position()
     mark = _mark(condor, pnl_dollars=0.0, dte=1, underlying_price=210.0)
-    trigger, _ = mgr._evaluate_one(mark, current_divergence=-0.08)
+    trigger, _ = mgr._evaluate_one(mark, today=TODAY, current_divergence=-0.08)
     assert trigger is None, f"comfortably-OTM condor at dte=1 should hold, got {trigger}"
     # Spot drifts to the call side: 218.0 >= 220 × 0.985 = 216.7 → close.
     mark = _mark(condor, pnl_dollars=0.0, dte=1, underlying_price=218.0)
-    trigger, _ = mgr._evaluate_one(mark, current_divergence=-0.08)
+    trigger, _ = mgr._evaluate_one(mark, today=TODAY, current_divergence=-0.08)
     assert trigger == "assignment_risk", f"expected assignment_risk, got {trigger}"
     print("assignment_risk (b): near-money short at dte=1 closes, comfortably-OTM holds")
 
@@ -208,12 +210,12 @@ def test_assignment_risk_missing_underlying_fails_safe():
     legs blind into expiration."""
     pos = _mk_otm_condor_position()
     mark = _mark(pos, pnl_dollars=0.0, dte=1)  # underlying_price defaults to NaN
-    trigger, rationale = _exit_mgr()._evaluate_one(mark, current_divergence=-0.08)
+    trigger, rationale = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=-0.08)
     assert trigger == "assignment_risk", f"expected assignment_risk, got {trigger}"
     assert "failing safe" in rationale
     # Outside the close window the missing quote does NOT force a close.
     mark = _mark(pos, pnl_dollars=0.0, dte=5)
-    trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=-0.08)
+    trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=-0.08)
     assert trigger is None
     print("assignment_risk (b): missing underlying fails safe inside window only")
 
@@ -231,7 +233,7 @@ def test_assignment_risk_parity_short_any_dte():
     ]
     mark = _mark(pos, pnl_dollars=0.0, dte=10, underlying_price=240.0,
                  current_legs=legs_at_parity)
-    trigger, rationale = _exit_mgr()._evaluate_one(mark, current_divergence=-0.08)
+    trigger, rationale = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=-0.08)
     assert trigger == "assignment_risk", f"expected assignment_risk, got {trigger}"
     assert "parity" in rationale
     # Same shape but with real extrinsic left (mid 31.00 → extrinsic 1.00): hold.
@@ -243,7 +245,7 @@ def test_assignment_risk_parity_short_any_dte():
     ]
     mark = _mark(pos, pnl_dollars=0.0, dte=10, underlying_price=240.0,
                  current_legs=legs_with_extrinsic)
-    trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=-0.08)
+    trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=-0.08)
     assert trigger is None, f"short with extrinsic left should hold, got {trigger}"
     print("assignment_risk (c): parity short closes at dte=10, extrinsic-rich holds")
 
@@ -253,7 +255,7 @@ def test_assignment_risk_not_for_long_straddle():
     expiration_proximity, never assignment_risk."""
     pos = _mk_long_straddle_position()
     mark = _mark(pos, pnl_dollars=0.0, dte=0, underlying_price=100.0)
-    trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=0.15)
+    trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=0.15)
     assert trigger == "expiration_proximity", f"expected expiration_proximity, got {trigger}"
     print("assignment_risk: long straddle unaffected (expiration_proximity fires)")
 
@@ -263,25 +265,22 @@ def test_stop_loss_overrides_assignment_risk():
     matches EXIT_TRIGGER_PRIORITY. Either way the position closes."""
     pos = _mk_iron_condor_position(entry_credit=13.55)
     mark = _mark(pos, pnl_dollars=-1500.0, dte=0, underlying_price=240.0)
-    trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=-0.08)
+    trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=-0.08)
     assert trigger == "stop_loss", f"expected stop_loss, got {trigger}"
     print("PRIORITY: stop_loss overrides assignment_risk when both fire")
 
 
-def test_harvest_entry_floor_clears_assignment_close_window():
-    """Invariant: the harvest entry floor must sit above the assignment close
-    window, or fresh entries would be closed within a session or two."""
-    import inspect
-    from signals.signal_generator import SignalGenerator
-    harvest_floor = inspect.signature(SignalGenerator.__init__).parameters[
-        "harvest_min_entry_dte"
-    ].default
+def test_entry_floor_clears_assignment_close_window():
+    """Invariant: the entry floor must sit above the assignment close window,
+    or fresh short-vol entries would be closed within a session or two (the
+    straddle-churn bug, condor edition)."""
+    from signals.signal_generator import MIN_ENTRY_DTE
     mgr = _exit_mgr()
-    assert harvest_floor > mgr._short_close_dte + 1, (
-        f"harvest_min_entry_dte ({harvest_floor}) must exceed short_close_dte "
+    assert MIN_ENTRY_DTE > mgr._short_close_dte + 1, (
+        f"MIN_ENTRY_DTE ({MIN_ENTRY_DTE}) must exceed short_close_dte "
         f"({mgr._short_close_dte}) by 2+ so entries aren't instant round-trips"
     )
-    print(f"invariant: harvest floor {harvest_floor} > close window {mgr._short_close_dte} ✓")
+    print(f"invariant: entry floor {MIN_ENTRY_DTE} > close window {mgr._short_close_dte} ✓")
 
 
 def test_min_dte_strictly_greater_than_expiration_proximity_dte():
@@ -303,20 +302,19 @@ def test_thesis_reversal_fires_when_sign_flips_and_magnitude_clears():
     pos = _mk_iron_condor_position()  # entry_divergence = -0.08 (we sold premium)
     # Current divergence: positive AND |≥ 0.05| → flipped + magnitude OK
     mark = _mark(pos, pnl_dollars=0.0)
-    trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=+0.06)
+    trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=+0.06)
     assert trigger == "thesis_reversed"
     # Sign flipped but magnitude too small → no trigger
-    trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=+0.001)
+    trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=+0.001)
     assert trigger is None
     # Same sign as entry → no trigger
-    trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=-0.20)
+    trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=-0.20)
     assert trigger is None
     print("thesis_reversal: sign flip + magnitude floor verified")
 
 
-def test_thesis_exit_disabled_in_harvest_mode():
-    """Harvest-mode positions are premium harvests, not divergence bets —
-    with thesis_exit_enabled=False a flipped divergence must NOT close the
+def test_thesis_exit_can_be_disabled():
+    """With thesis_exit_enabled=False a flipped divergence must NOT close the
     position, while P&L triggers keep working."""
     mgr = ExitManager(
         position_tracker=mock.MagicMock(),
@@ -327,13 +325,13 @@ def test_thesis_exit_disabled_in_harvest_mode():
     pos = _mk_iron_condor_position(entry_credit=13.55)
     # Flipped divergence, flat P&L → hold (would be thesis_reversed if enabled)
     mark = _mark(pos, pnl_dollars=0.0)
-    trigger, _ = mgr._evaluate_one(mark, current_divergence=+0.10)
+    trigger, _ = mgr._evaluate_one(mark, today=TODAY, current_divergence=+0.10)
     assert trigger is None, f"thesis exit fired while disabled: {trigger}"
     # Stop loss still works with the thesis trigger off
     mark = _mark(pos, pnl_dollars=-1500.0)
-    trigger, _ = mgr._evaluate_one(mark, current_divergence=+0.10)
+    trigger, _ = mgr._evaluate_one(mark, today=TODAY, current_divergence=+0.10)
     assert trigger == "stop_loss"
-    print("harvest: thesis exit off, stop loss intact")
+    print("thesis_disabled: thesis exit off, stop loss intact")
 
 
 # ---------- the user's flagged priority test ----------
@@ -345,10 +343,10 @@ def test_thesis_overrides_stop_loss():
     # P&L = -$1500 (well past -100% stop)
     mark = _mark(pos, pnl_dollars=-1500.0)
     # Thesis intact: stop_loss
-    trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=-0.08)
+    trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=-0.08)
     assert trigger == "stop_loss"
     # Thesis flipped: thesis_reversed (overrides stop)
-    trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=+0.10)
+    trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=+0.10)
     assert trigger == "thesis_reversed"
     print("PRIORITY: thesis_reversed overrides stop_loss when both fire")
 
@@ -360,19 +358,38 @@ def test_thesis_overrides_profit_target():
     # P&L = +$1000 (well past +50% profit target)
     mark = _mark(pos, pnl_dollars=1000.0)
     # Thesis intact: profit_target
-    trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=-0.08)
+    trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=-0.08)
     assert trigger == "profit_target"
     # Thesis flipped: thesis_reversed
-    trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=+0.10)
+    trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=+0.10)
     assert trigger == "thesis_reversed"
     print("PRIORITY: thesis_reversed overrides profit_target when both fire")
+
+
+def test_thesis_keyed_to_direction_not_entry_divergence_sign():
+    """Reviewer-flagged critical: in the h=1 pipeline a SELL can be entered
+    with POSITIVE entry_divergence (direction comes from the VRP z-gate).
+    The thesis must reverse on the POSITION's direction: a SELL closes only
+    when the model sees vol clearly ABOVE the market — never when the model
+    turns favorable to the short."""
+    pos = _mk_iron_condor_position()  # direction SELL
+    object.__setattr__(pos, "entry_divergence", +0.16)  # h1-style entry
+    mark = _mark(pos, pnl_dollars=0.0)
+    # Model now agrees with the short (divergence −0.06): NOT a reversal,
+    # even though the sign flipped vs entry.
+    trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=-0.06)
+    assert trigger is None, f"favorable move must not close the short: {trigger}"
+    # Model sees vol above the market: reversal fires.
+    trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=+0.06)
+    assert trigger == "thesis_reversed"
+    print("thesis_direction: SELL closes on +div only, regardless of entry sign")
 
 
 def test_priority_constant_matches_evaluation_order():
     """Sanity check: the EXIT_TRIGGER_PRIORITY tuple matches the order in the
     actual logic. If someone reorders one without the other, this catches it."""
     assert EXIT_TRIGGER_PRIORITY == (
-        "thesis_reversed", "stop_loss", "assignment_risk",
+        "thesis_reversed", "stop_loss", "earnings_risk", "assignment_risk",
         "expiration_proximity", "profit_target",
     )
     print(f"priority constant: {EXIT_TRIGGER_PRIORITY}")
@@ -381,7 +398,7 @@ def test_priority_constant_matches_evaluation_order():
 def test_no_trigger_returns_hold():
     pos = _mk_iron_condor_position()
     mark = _mark(pos, pnl_dollars=0.0, dte=20)
-    trigger, rationale = _exit_mgr()._evaluate_one(mark, current_divergence=-0.07)
+    trigger, rationale = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=-0.07)
     assert trigger is None
     assert rationale == "hold"
     print("no_trigger: returns ('hold')")
@@ -392,11 +409,11 @@ def test_current_divergence_none_skips_thesis_check():
     check should silently skip. Other triggers still evaluate normally."""
     pos = _mk_iron_condor_position()
     mark = _mark(pos, pnl_dollars=0.0, dte=20)
-    trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=None)
+    trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=None)
     assert trigger is None  # nothing else fires either
     # P&L stop still works
     mark = _mark(pos, pnl_dollars=-2000.0, dte=20)
-    trigger, _ = _exit_mgr()._evaluate_one(mark, current_divergence=None)
+    trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=None)
     assert trigger == "stop_loss"
     print("current_divergence None: thesis check skipped, P&L triggers still fire")
 
@@ -414,11 +431,12 @@ def main() -> int:
     test_assignment_risk_parity_short_any_dte()
     test_assignment_risk_not_for_long_straddle()
     test_stop_loss_overrides_assignment_risk()
-    test_harvest_entry_floor_clears_assignment_close_window()
+    test_entry_floor_clears_assignment_close_window()
     test_min_dte_strictly_greater_than_expiration_proximity_dte()
     test_thesis_reversal_fires_when_sign_flips_and_magnitude_clears()
     test_thesis_overrides_stop_loss()
     test_thesis_overrides_profit_target()
+    test_thesis_keyed_to_direction_not_entry_divergence_sign()
     test_priority_constant_matches_evaluation_order()
     test_no_trigger_returns_hold()
     test_current_divergence_none_skips_thesis_check()

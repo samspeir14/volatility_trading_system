@@ -143,7 +143,7 @@ async def test_full_watchlist_perf() -> None:
 
 def test_horizon_feature_sets_structure() -> None:
     """Pure unit test — no API or cache needed."""
-    assert set(HORIZON_FEATURE_SETS.keys()) == {5, 10, 21}, (
+    assert set(HORIZON_FEATURE_SETS.keys()) == {1, 5, 10, 21}, (
         f"unexpected horizons {set(HORIZON_FEATURE_SETS.keys())}"
     )
     for h, feats in HORIZON_FEATURE_SETS.items():

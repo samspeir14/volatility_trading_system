@@ -100,6 +100,10 @@ class DailySummary:
     stale_close_alerts: list[StaleCloseAlertSummary] = field(default_factory=list)
     pending_closes: list[PendingCloseSummary] = field(default_factory=list)
     position_pnl_breakdown: list[PositionPnlGroup] = field(default_factory=list)
+    # Signal-level gate pass rates for today: {"candidates": N,
+    # "<gate name>": blocked count..., "approved": M}. Surfaces a silent
+    # zero-signal deadlock (every candidate dying at one gate) immediately.
+    gate_pass_rates: dict[str, int] = field(default_factory=dict)
 
     @property
     def total_pnl(self) -> float:
@@ -195,6 +199,7 @@ class DailySummaryBuilder:
             stale_close_alerts=stale_close_alerts,
             pending_closes=pending_closes,
             position_pnl_breakdown=position_pnl_breakdown,
+            gate_pass_rates=self._divergence_history.gate_counts_today(today),
         )
         _check_reconciliation(summary)
         return summary

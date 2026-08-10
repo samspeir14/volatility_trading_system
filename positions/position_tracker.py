@@ -31,6 +31,10 @@ class OpenPosition:
     entry_horizon_upper: int
     entry_weight_lower: float
     submitted_at: datetime
+    # Fail-closed store for the earnings exit: next known earnings date,
+    # stamped at entry and refreshed by the exit manager on every healthy
+    # calendar read. Used when the calendar API is down/stale.
+    next_earnings_date: date | None = None
 
     @property
     def is_long(self) -> bool:
@@ -121,6 +125,10 @@ class PositionTracker:
                 entry_horizon_upper=row["horizon_upper"],
                 entry_weight_lower=row["weight_lower"],
                 submitted_at=datetime.fromisoformat(row["submitted_at"]),
+                next_earnings_date=(
+                    date.fromisoformat(row["next_earnings_date"])
+                    if row.get("next_earnings_date") else None
+                ),
             ))
         return positions
 

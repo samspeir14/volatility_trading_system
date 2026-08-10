@@ -180,10 +180,14 @@ class OrderManager:
         stale_order_threshold_minutes: int = STALE_ORDER_THRESHOLD_MINUTES_DEFAULT,
         max_close_retries: int = MAX_CLOSE_RETRIES_DEFAULT,
         ladder_steps: tuple[float, ...] | None = None,
+        earnings_calendar=None,
     ):
         self._client = client
         self._log = order_log
         self._settings = settings
+        # Earnings-exit fail-closed store: stamp each entry with the ticker's
+        # next known earnings date so the exit rule survives calendar outages.
+        self._earnings = earnings_calendar
         self._max_qty = max_quantity_per_leg
         self._max_premium = max_premium_per_trade
         self._fee_per_contract = settings.per_contract_fee
@@ -314,10 +318,19 @@ class OrderManager:
                 submitted_price=request.price, fill_price=None, error=err,
             )
         order_id = int(order_node["id"])
+        next_earnings = None
+        if self._earnings is not None:
+            try:
+                next_earnings = self._earnings.next_earnings_on_or_after(
+                    signal.symbol, now.date(),
+                )
+            except Exception as e:
+                logger.warning("could not stamp next earnings date for %s: %s",
+                               signal.symbol, e)
         self._log.record_submission(
             signal=signal, fingerprint=fingerprint, structure=request.structure,
             submitted_price=request.price, order_id=order_id, submitted_at=now,
-            arrival_mid=request.price,
+            arrival_mid=request.price, next_earnings_date=next_earnings,
         )
         logger.info("submitted order %d (%s %s %s) at mid %.2f (ladder %s)",
                     order_id, signal.symbol, signal.direction, request.structure,

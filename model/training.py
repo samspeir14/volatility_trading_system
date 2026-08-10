@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 
+from features.target import build_h1_deviation_target
 from model.evaluation import date_based_ts_split
 from model.lightgbm_model import LightGBMVolPredictor
 from model.xgboost_model import XGBoostVolPredictor
@@ -173,6 +174,154 @@ def _lgbm_factory(params: dict):
     return lgb_lib.LGBMRegressor(
         objective="regression", random_state=0, verbose=-1, **full,
     )
+
+
+H1_TARGET_NAME = "target_dev_h1"
+H1_BASELINE_NAME = "baseline_b"
+
+
+def build_h1_training_matrix(
+    feature_df: pd.DataFrame,
+    bars_by_symbol: dict[str, pd.DataFrame],
+    feature_subset: list[str] | None = None,
+) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
+    """Build (X, y, b) for the h=1 deviation model, pooled across tickers.
+    y[(s,t)] = log(gk_vol_{t+1}+eps) - b_t (see features.target); b is the
+    aligned baseline b_t (finite wherever y is, since y requires it).
+    Drops rows where y is NaN. Feature NaNs preserved (LightGBM handles
+    natively; HAR drops them at fit)."""
+    y, b, _lv = build_h1_deviation_target(bars_by_symbol)
+
+    if y.empty:
+        cols = feature_subset if feature_subset is not None else list(feature_df.columns)
+        return (
+            feature_df.iloc[:0].reindex(columns=cols),
+            pd.Series(dtype=float, name=H1_TARGET_NAME),
+            pd.Series(dtype=float, name=H1_BASELINE_NAME),
+        )
+
+    aligned = feature_df.join(y.rename(H1_TARGET_NAME), how="inner")
+    aligned = aligned.join(b.rename(H1_BASELINE_NAME), how="left")
+    aligned = aligned.dropna(subset=[H1_TARGET_NAME])
+
+    cols = feature_subset if feature_subset is not None else list(feature_df.columns)
+    X = aligned[cols]
+    return X, aligned[H1_TARGET_NAME], aligned[H1_BASELINE_NAME]
+
+
+def tune_h1_hyperparams(
+    X: pd.DataFrame,
+    y: pd.Series,
+    train_window_days: int = 504,
+    n_trials: int = 50,
+) -> dict:
+    """Tune LightGBM on the FIRST training window only (no lookahead into the
+    walk-forward OOS region). Slices the earliest `train_window_days` unique
+    dates from (X, y) and runs the shared random search."""
+    dates = pd.Series(X.index.get_level_values("date"))
+    unique_dates = pd.Index(np.sort(dates.unique()))
+    first_train_dates = set(unique_dates[:train_window_days])
+    mask = dates.isin(first_train_dates).to_numpy()
+    params, _ = tune_hyperparameters(
+        X.iloc[mask], y.iloc[mask],
+        n_trials=n_trials,
+        space=LGBM_HYPERPARAM_SPACE,
+        model_factory=_lgbm_factory,
+    )
+    return params
+
+
+def walk_forward_evaluate_h1(
+    feature_df: pd.DataFrame,
+    bars_by_symbol: dict[str, pd.DataFrame],
+    model_factory: Callable[[], object],
+    feature_subset: list[str] | None = None,
+    train_window_days: int = 504,
+    refit_every: int = 21,
+    artifact_dir: Path | None = None,
+    artifact_prefix: str | None = None,
+    importance_log_path: Path | None = None,
+    importance_acc: list[pd.Series] | None = None,
+) -> pd.DataFrame:
+    """Walk-forward evaluation on the h=1 deviation target. Same window
+    semantics as walk_forward_evaluate_lightgbm: strictly time-ordered, no
+    shuffle — train on the trailing `train_window_days` unique dates, predict
+    the next `refit_every` dates OOS, roll forward.
+
+    `model_factory` returns a fresh fitted-API object (fit/predict, optional
+    feature_importance/save) per refit — LightGBMVolPredictor, HARRVPredictor,
+    or anything matching that protocol.
+
+    Returns a (symbol, date)-indexed DataFrame with columns:
+    predicted_dev, actual_dev, baseline_b, actual_lv (= actual_dev + baseline_b).
+    """
+    X, y, b = build_h1_training_matrix(feature_df, bars_by_symbol, feature_subset)
+
+    dates = pd.Series(X.index.get_level_values("date"))
+    unique_dates = pd.Index(np.sort(dates.unique()))
+    n_dates = len(unique_dates)
+
+    if n_dates <= train_window_days + refit_every:
+        raise ValueError(
+            f"need >{train_window_days + refit_every} dates, got {n_dates}"
+        )
+
+    importance_rows: list[dict] = []
+    results: list[pd.DataFrame] = []
+
+    for i in range(train_window_days, n_dates, refit_every):
+        train_dates = set(unique_dates[i - train_window_days : i])
+        oos_end = min(i + refit_every, n_dates)
+        oos_dates = set(unique_dates[i:oos_end])
+
+        train_mask = dates.isin(train_dates).to_numpy()
+        oos_mask = dates.isin(oos_dates).to_numpy()
+
+        X_tr, y_tr = X.iloc[train_mask], y.iloc[train_mask]
+        X_oos, y_oos = X.iloc[oos_mask], y.iloc[oos_mask]
+        b_oos = b.iloc[oos_mask]
+
+        if len(X_tr) == 0 or len(X_oos) == 0:
+            continue
+
+        predictor = model_factory()
+        predictor.fit(X_tr, y_tr)
+        preds = predictor.predict(X_oos)
+
+        results.append(pd.DataFrame(
+            {
+                "predicted_dev": preds,
+                "actual_dev": y_oos.to_numpy(),
+                "baseline_b": b_oos.to_numpy(),
+            },
+            index=y_oos.index,
+        ))
+
+        train_end_date = max(train_dates)
+        if artifact_dir is not None and artifact_prefix is not None:
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            predictor.save(
+                artifact_dir
+                / f"{artifact_prefix}_{pd.Timestamp(train_end_date).date().isoformat()}.joblib"
+            )
+
+        if hasattr(predictor, "feature_importance"):
+            imp = predictor.feature_importance()
+            importance_rows.append({"refit_date": train_end_date, **imp.to_dict()})
+            if importance_acc is not None:
+                importance_acc.append(imp)
+
+    if importance_log_path is not None and importance_rows:
+        importance_log_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(importance_rows).to_csv(importance_log_path, index=False)
+
+    if not results:
+        return pd.DataFrame(
+            columns=["predicted_dev", "actual_dev", "baseline_b", "actual_lv"]
+        )
+    out = pd.concat(results)
+    out["actual_lv"] = out["actual_dev"] + out["baseline_b"]
+    return out
 
 
 def walk_forward_evaluate_xgboost(

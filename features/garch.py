@@ -60,7 +60,7 @@ def garch_features_walk_forward(
     """
     out = pd.DataFrame(
         index=returns.index,
-        columns=["garch_forecast_var", "garch_resid_lb_pvalue"],
+        columns=["garch_forecast_var", "garch_resid_lb_pvalue", "garch_persistence"],
         dtype=float,
     )
     fit: GarchFit | None = None
@@ -89,5 +89,8 @@ def garch_features_walk_forward(
         days_since_refit += 1
         out.loc[t, "garch_forecast_var"] = var_pct_sq / (PCT_SCALE ** 2)
         out.loc[t, "garch_resid_lb_pvalue"] = fit.resid_lb_pvalue
+        # alpha+beta from the current (point-in-time) fit — the term-structure
+        # projection's decay rate phi; only changes at refits.
+        out.loc[t, "garch_persistence"] = fit.alpha + fit.beta
 
     return out

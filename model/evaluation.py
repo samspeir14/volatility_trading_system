@@ -75,6 +75,49 @@ def within_ticker_r2(actual: pd.Series, predicted: pd.Series, level: str = "symb
     return 1.0 - ss_res / ss_within
 
 
+def qlike(actual_var: pd.Series, forecast_var: pd.Series) -> float:
+    """QLIKE loss on variances: mean( a/f − log(a/f) − 1 ). Zero when the
+    forecast is perfect; penalizes under-forecasting variance more than
+    over-forecasting, which matches the economics of short-vol positions.
+    Inputs are DAILY VARIANCES (vol²). Rows where either side is NaN or
+    nonpositive are dropped (log requires strictly positive values)."""
+    paired = pd.concat(
+        [actual_var.rename("a"), forecast_var.rename("f")], axis=1
+    ).dropna()
+    paired = paired[(paired["a"] > 0) & (paired["f"] > 0)]
+    if paired.empty:
+        return float("nan")
+    ratio = paired["a"].to_numpy() / paired["f"].to_numpy()
+    return float(np.mean(ratio - np.log(ratio) - 1.0))
+
+
+def per_ticker_r2_median(
+    actual: pd.Series, predicted: pd.Series, level: str = "symbol"
+) -> float:
+    """Median across symbols of the per-symbol R². Complements the pooled
+    deviation R²: a pooled number can be carried by a few high-variance names,
+    the median cannot. Requires a MultiIndex with `level` on both series;
+    symbols with <3 paired rows or zero within-symbol variance are skipped."""
+    paired = pd.concat(
+        [actual.rename("y"), predicted.rename("p")], axis=1
+    ).dropna()
+    if paired.empty:
+        return float("nan")
+    r2s: list[float] = []
+    for _, grp in paired.groupby(level=level):
+        if len(grp) < 3:
+            continue
+        y = grp["y"].to_numpy()
+        ss_tot = float(np.sum((y - y.mean()) ** 2))
+        if ss_tot <= 0:
+            continue
+        ss_res = float(np.sum((grp["p"].to_numpy() - y) ** 2))
+        r2s.append(1.0 - ss_res / ss_tot)
+    if not r2s:
+        return float("nan")
+    return float(np.median(r2s))
+
+
 def r2_vs_baseline(actual: pd.Series, predicted: pd.Series, baseline: pd.Series) -> float:
     """Out-of-sample R² against a competing forecast: 1 − SSE_model / SSE_baseline
     (Campbell–Thompson style). Positive = model beats the baseline; 0 = ties it.
@@ -113,6 +156,30 @@ def lagged_rv_forecast(
             )
         )
     return pd.concat(parts)
+
+
+def h1_metrics_from_predictions(preds_long: pd.DataFrame) -> dict[str, dict[str, float]]:
+    """Compute the h=1 report metrics from a long-format predictions frame
+    (columns: symbol, date, model, predicted_dev, actual_dev, baseline_b,
+    actual_lv). This is the SINGLE definition used both by the retrain job
+    (to report) and by scripts/reconcile_h1_metrics.py (to verify the stored
+    predictions reproduce the reported numbers within 1e-6)."""
+    out: dict[str, dict[str, float]] = {}
+    for model_name, grp in preds_long.groupby("model"):
+        g = grp.set_index(["symbol", "date"])
+        actual_dev = g["actual_dev"]
+        pred_dev = g["predicted_dev"]
+        actual_var = np.exp(2.0 * g["actual_lv"])
+        forecast_var = np.exp(2.0 * (g["baseline_b"] + pred_dev))
+        m = regression_metrics(actual_dev, pred_dev)
+        out[str(model_name)] = {
+            "n": m["n"],
+            "dev_r2_pooled": m["r2"],
+            "dev_r2_within": within_ticker_r2(actual_dev, pred_dev),
+            "dev_r2_ticker_median": per_ticker_r2_median(actual_dev, pred_dev),
+            "qlike_level": qlike(actual_var, forecast_var),
+        }
+    return out
 
 
 def per_horizon_metrics(

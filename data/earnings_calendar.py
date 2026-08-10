@@ -83,6 +83,14 @@ class EarningsCalendar:
         except ValueError:
             return None
 
+    def cached_row_count(self) -> int:
+        """Number of earnings rows in the cache. Zero after a refresh means
+        the feed handed back an empty/unparseable payload — consumers that
+        fail closed (the earnings exit) must treat that as UNHEALTHY, not as
+        'no earnings anywhere'."""
+        cur = self._conn.execute("SELECT COUNT(*) FROM earnings")
+        return int(cur.fetchone()[0])
+
     def has_earnings_in_window(
         self, symbol: str, start: date, end: date
     ) -> bool | None:
