@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 
@@ -48,8 +48,29 @@ CALENDAR_STALE_DAYS = 3
 def _entry_dte(pos: OpenPosition) -> int:
     """Calendar days from entry to expiration. Distinguishes a position that
     AGED into the near-expiry window (close it) from one deliberately opened
-    there by the h=1 short-dated entries (let it ride to expiry morning)."""
+    there by the h=1 short-dated entries (let it ride into expiry day)."""
     return (pos.expiration - pos.submitted_at.date()).days
+
+
+# A deliberately short-dated entry (entry_dte at/below the close windows) is
+# closed this long before the market closes on its expiration day — late
+# enough to capture nearly the whole overnight+day move it was bought/sold
+# for, early enough that the close isn't racing the bell.
+EXPIRY_CLOSE_BUFFER = timedelta(hours=2)
+
+
+def _in_expiry_close_window(
+    now_utc: datetime | None, market_close_utc: datetime | None
+) -> bool:
+    """True once now is within EXPIRY_CLOSE_BUFFER of today's market close.
+    Unknown close time (clock parse failure) fails SAFE → close immediately:
+    riding a short leg into an expiration the bot can't time-manage is the
+    one outcome this exit exists to prevent. The clock's next_change is the
+    authority, so half-days (13:00 ET close) shift the window automatically."""
+    if market_close_utc is None:
+        return True
+    now = now_utc or datetime.now(timezone.utc)
+    return now >= market_close_utc - EXPIRY_CLOSE_BUFFER
 
 
 def _trading_days_between(a: date, b: date) -> int:
@@ -155,6 +176,7 @@ class ExitManager:
         scan: ScanResult,
         feature_rows: dict[str, pd.DataFrame],
         returns_by_symbol: dict[str, pd.Series],
+        market_close_utc: datetime | None = None,
     ) -> list[ExitDecision]:
         today = scan.fetched_at.date()
         decisions: list[ExitDecision] = []
@@ -162,7 +184,9 @@ class ExitManager:
             current_div = self._compute_current_divergence(
                 mark, scan, feature_rows, returns_by_symbol,
             )
-            trigger, rationale = self._evaluate_one(mark, current_div, today)
+            trigger, rationale = self._evaluate_one(
+                mark, current_div, today, market_close_utc=market_close_utc,
+            )
             decisions.append(ExitDecision(
                 position=mark.position,
                 mark=mark,
@@ -259,6 +283,8 @@ class ExitManager:
         mark: PositionMark,
         current_divergence: float | None,
         today: date,
+        market_close_utc: datetime | None = None,
+        now_utc: datetime | None = None,
     ) -> tuple[str | None, str]:
         pos = mark.position
 
@@ -296,7 +322,9 @@ class ExitManager:
             return "earnings_risk", earnings_rationale
 
         # 4. Assignment/pin risk (positions with short legs only)
-        assignment_rationale = self._assignment_risk(mark)
+        assignment_rationale = self._assignment_risk(
+            mark, market_close_utc=market_close_utc, now_utc=now_utc,
+        )
         if assignment_rationale is not None:
             return "assignment_risk", assignment_rationale
 
@@ -305,14 +333,15 @@ class ExitManager:
         # are covered by the assignment-risk close-out above. Scoped by ENTRY
         # dte: a position deliberately opened at dte <= exp_dte (the h=1
         # short-dated entries) must not be closed the moment it opens — it
-        # rides to expiry morning instead, where dte <= 0 closes it before
-        # auto-exercise can leave a stock position.
+        # rides through expiry day and closes in the final EXPIRY_CLOSE_BUFFER
+        # before the bell, before auto-exercise can leave a stock position.
         if pos.structure != "iron_condor":
             if _entry_dte(pos) <= self._exp_dte:
-                if mark.dte <= 0:
+                if mark.dte <= 0 and _in_expiry_close_window(
+                        now_utc, market_close_utc):
                     return "expiration_proximity", (
-                        f"expiry-morning close (short-dated entry, "
-                        f"entry_dte={_entry_dte(pos)})"
+                        f"final {EXPIRY_CLOSE_BUFFER} before expiration "
+                        f"(short-dated entry, entry_dte={_entry_dte(pos)})"
                     )
             elif mark.dte <= self._exp_dte:
                 return "expiration_proximity", f"dte={mark.dte} <= {self._exp_dte}"
@@ -415,7 +444,12 @@ class ExitManager:
             )
         return None
 
-    def _assignment_risk(self, mark: PositionMark) -> str | None:
+    def _assignment_risk(
+        self,
+        mark: PositionMark,
+        market_close_utc: datetime | None = None,
+        now_utc: datetime | None = None,
+    ) -> str | None:
         """Assignment/pin-risk close-out (see the constructor comment for the
         three rules). Returns a rationale string when the position must close,
         None otherwise. No-op for positions without short legs."""
@@ -428,8 +462,14 @@ class ExitManager:
         have_underlying = math.isfinite(underlying) and underlying > 0
 
         # (a) Expiry-day backstop. Whatever premium is left is pennies against
-        # a pin that resolves AFTER the bot's last cycle of the day.
-        if mark.dte <= 0:
+        # a pin that resolves AFTER the bot's last cycle of the day. A
+        # deliberately short-dated entry holds until the final
+        # EXPIRY_CLOSE_BUFFER before the bell (rule (c)'s parity check keeps
+        # guarding it in the meantime); anything else that somehow reaches
+        # expiry day still closes on the first cycle.
+        if mark.dte <= 0 and (
+                _entry_dte(pos) > self._short_close_dte
+                or _in_expiry_close_window(now_utc, market_close_utc)):
             return (
                 f"dte={mark.dte}: short legs never ride through expiration "
                 "(pin risk resolves after the last cycle)"

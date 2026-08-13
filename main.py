@@ -71,6 +71,22 @@ def _scan_window(settings: Settings) -> tuple[int, int]:
     return (settings.min_entry_dte, SCAN_EXPIRATION_WINDOW_UPPER)
 
 
+def _parse_clock_timestamp(raw: str | None) -> datetime | None:
+    """Tradier clock timestamps ("2026-04-28T13:30:00Z" or offset-aware ISO)
+    as aware-UTC datetimes; None when absent/unparseable/naive."""
+    if not raw:
+        return None
+    try:
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        ts = datetime.fromisoformat(raw)
+    except (ValueError, TypeError):
+        return None
+    if ts.tzinfo is None:
+        return None
+    return ts.astimezone(timezone.utc)
+
+
 # NEW entries only submit inside this ET window. Options spreads are widest in
 # the opening minutes (overnight risk repricing, thin books) and erratic into
 # the close (MOC imbalances) — entering there donates edge to the market
@@ -451,6 +467,9 @@ class MainLoop:
         if state != "open":
             logger.info("market state=%s, skipping cycle", state)
             return CycleResult(market_open=False, timestamp=now)
+        # While open, next_change is today's close — the authority for the
+        # exit manager's before-the-bell close window (handles half-days).
+        market_close_utc = _parse_clock_timestamp(clock.get("next_change"))
 
         # 1b. Refresh daily bars through the last completed trading day.
         # ensure_data is incremental (latest cached date + 1 forward), so this
@@ -558,6 +577,7 @@ class MainLoop:
             returns_by_symbol = self._build_returns_dict()
             exit_decisions = self._exit_manager.evaluate(
                 snapshot.open_marks, scan, feature_rows, returns_by_symbol,
+                market_close_utc=market_close_utc,
             )
             exit_results = await self._exit_manager.execute(
                 exit_decisions, dry_run=False,

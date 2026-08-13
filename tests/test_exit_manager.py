@@ -283,12 +283,25 @@ def test_short_dated_straddle_entry_rides_to_expiry_morning():
     trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=0.15)
     assert trigger is None, f"1-DTE entry closed at entry: {trigger}"
 
+    # Expiry day: holds outside the final-2h window, closes inside it.
+    close_utc = datetime(2026, 5, 13, 20, 0, tzinfo=timezone.utc)  # 16:00 ET
     mark0 = _mark(pos, pnl_dollars=0.0, dte=0, underlying_price=100.0)
+    trigger, _ = _exit_mgr()._evaluate_one(
+        mark0, today=TODAY + timedelta(days=1), current_divergence=0.15,
+        market_close_utc=close_utc,
+        now_utc=close_utc - timedelta(hours=3))
+    assert trigger is None, f"closed 3h before the bell: {trigger}"
     trigger, rationale = _exit_mgr()._evaluate_one(
-        mark0, today=TODAY + timedelta(days=1), current_divergence=0.15)
-    assert trigger == "expiration_proximity", f"expected expiry-morning close, got {trigger}"
+        mark0, today=TODAY + timedelta(days=1), current_divergence=0.15,
+        market_close_utc=close_utc,
+        now_utc=close_utc - timedelta(hours=1, minutes=55))
+    assert trigger == "expiration_proximity", f"expected final-2h close, got {trigger}"
     assert "short-dated entry" in rationale
-    print("short-dated straddle: holds at dte=1, closes expiry morning ✓")
+    # Unknown close time fails SAFE → closes on the first expiry-day cycle.
+    trigger, _ = _exit_mgr()._evaluate_one(
+        mark0, today=TODAY + timedelta(days=1), current_divergence=0.15)
+    assert trigger == "expiration_proximity"
+    print("short-dated straddle: holds at dte=1, closes in final 2h ✓")
 
 
 def test_short_dated_condor_entry_skips_near_money_close():
@@ -304,10 +317,20 @@ def test_short_dated_condor_entry_skips_near_money_close():
     trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=-0.08)
     assert trigger is None, f"1-DTE condor closed at entry: {trigger}"
 
+    # Expiry day: rides outside the final-2h window (parity check still
+    # guards it), closes inside the window.
+    close_utc = datetime(2026, 5, 13, 20, 0, tzinfo=timezone.utc)  # 16:00 ET
     mark0 = _mark(pos, pnl_dollars=0.0, dte=0, underlying_price=209.0)
     trigger, _ = _exit_mgr()._evaluate_one(
-        mark0, today=TODAY + timedelta(days=1), current_divergence=-0.08)
-    assert trigger == "assignment_risk", f"expected expiry-morning backstop, got {trigger}"
+        mark0, today=TODAY + timedelta(days=1), current_divergence=-0.08,
+        market_close_utc=close_utc,
+        now_utc=close_utc - timedelta(hours=3))
+    assert trigger is None, f"condor closed 3h before the bell: {trigger}"
+    trigger, _ = _exit_mgr()._evaluate_one(
+        mark0, today=TODAY + timedelta(days=1), current_divergence=-0.08,
+        market_close_utc=close_utc,
+        now_utc=close_utc - timedelta(hours=1, minutes=55))
+    assert trigger == "assignment_risk", f"expected final-2h backstop, got {trigger}"
 
     # A condor that AGED into the window still gets the near-money close.
     aged = _mk_iron_condor_position()
