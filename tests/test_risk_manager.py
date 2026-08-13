@@ -195,7 +195,7 @@ def test_portfolio_wing_risk_cap_blocks_full_book():
 
 def test_portfolio_wing_risk_accumulates_within_cycle():
     """A batch of approvals in ONE cycle must count against the cap as they
-    accrue — day one of harvest mode, empty book, many actionable signals."""
+    accrue — a fresh deploy: empty book, many actionable signals at once."""
     rm = RiskManager(
         watchlist=WATCHLIST, max_per_trade_loss_pct=0.015,
         max_per_ticker_exposure_pct=1.0,     # not the limiter here

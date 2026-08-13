@@ -5,10 +5,13 @@ Covers:
 - Cache hit after seed → returns True/False per stored dates.
 - refresh_if_stale skips when last_refresh_date == today.
 - refresh_if_stale silently skips (no per-cycle WARNING) when API key is missing.
-- SignalGenerator demotes a signal whose ticker has earnings inside [today, today+buffer].
-- SignalGenerator does NOT demote when earnings fall outside the buffer
-  (life-of-position coverage moved to the earnings_risk exit).
-- earnings_buffer_days is configurable: same earnings demoted at buffer=10, allowed at buffer=3.
+- Entry gate window is the position's life [today, expiration]:
+  - a report AFTER expiry does not block a short-DTE entry (the old flat
+    7-day buffer over-blocked these);
+  - a report inside the life blocks, however far out (the old buffer
+    under-blocked 8-14 DTE entries);
+  - boundary: report == expiration blocks (that expiry's IV is all event
+    premium), report == expiration+1 passes.
 - SignalGenerator does NOT demote when no earnings data is available (fail open).
 - SignalGenerator does NOT demote when the filter is disabled via constructor flag.
 """
@@ -18,83 +21,49 @@ import asyncio
 import logging
 import sys
 import tempfile
-from datetime import date, datetime, timezone
+from datetime import date, timedelta
 from pathlib import Path
 from unittest import mock
 
-import pandas as pd
-
-from data.async_client import OptionContract
 from data.earnings_calendar import EarningsCalendar
-from data.market_data import ScanResult, TickerSnapshot
-from signals.signal_generator import SignalGenerator
+from signals import DivergenceHistory, SignalGenerator
+from tests.test_signal_generator_h1 import (
+    _FixedH1,
+    _GK_SERIES,
+    _feature_row,
+    _scan,
+    _seed_history,
+)
+
+TODAY = date(2026, 6, 1)  # matches _scan's fetched_at
 
 
-# ---------- shared fixtures ----------
-
-def _mk_contract(
-    sym: str, otype: str, strike: float, expiration: date, *,
-    bid=1.0, ask=1.05, iv=0.30, vol=200, oi=1000,
-) -> OptionContract:
-    return OptionContract(
-        symbol=f"{sym}_{otype[0].upper()}{int(strike)}",
-        underlying=sym, expiration=expiration, strike=strike,
-        option_type=otype, bid=bid, ask=ask, last=(bid + ask) / 2,
-        volume=vol, open_interest=oi,
-        delta=0.5 if otype == "call" else -0.5,
-        gamma=0.01, theta=-0.05, vega=0.20, iv=iv,
-        fetched_at=datetime.now(timezone.utc),
-    )
-
-
-def _mk_snapshot_for(sym: str, expiration: date) -> TickerSnapshot:
-    return TickerSnapshot(
-        symbol=sym, sector="tech",
-        underlying={"symbol": sym, "last": 100.0},
-        contracts=[
-            _mk_contract(sym, "call", 100, expiration),
-            _mk_contract(sym, "put", 100, expiration),
-            _mk_contract(sym, "call", 110, expiration, bid=0.20, ask=0.22, vol=150, oi=600),
-            _mk_contract(sym, "put", 90, expiration, bid=0.20, ask=0.22, vol=150, oi=600),
-        ],
-    )
-
-
-def _mk_scan(today: date, expiration: date, symbols: list[str]) -> ScanResult:
-    snapshots = {sym: _mk_snapshot_for(sym, expiration) for sym in symbols}
-    return ScanResult(
-        fetched_at=datetime(today.year, today.month, today.day, 16, 0, tzinfo=timezone.utc),
-        snapshots=snapshots,
-    )
-
-
-class _FixedPredictor:
-    """Returns daily vol matching the IV used in fixtures so divergence ≈ 0."""
-    def __init__(self, daily_vol: float = 0.0189):
-        self._v = daily_vol
-
-    def predict_forward_rv(self, returns_history, X_row=None):
-        return self._v
-
-
-def _build_generator(
+def _generate(
     *,
     earnings: EarningsCalendar | None,
+    expiration: date,
     enabled: bool = True,
-    buffer_days: int = 7,
-) -> SignalGenerator:
-    predictors = {h: _FixedPredictor() for h in (5, 10, 21)}
-    return SignalGenerator(
-        predictors_by_horizon=predictors,
-        history_store=None,
-        cross_sectional_z_threshold=0.0,  # any signal passes the z gate
-        max_divergence=0.50,              # well above the synthetic divergence
-        max_entry_dte=45,                 # these tests use DTE-16 fixtures; the
-                                          # entry window is tested elsewhere
-        earnings_calendar=earnings,
-        earnings_filter_enabled=enabled,
-        earnings_buffer_days=buffer_days,
-    )
+):
+    """One RICH (iv=0.30 → SELL) candidate for NVDA at `expiration`, run
+    through the full h=1 gate ladder with the given earnings calendar."""
+    with tempfile.TemporaryDirectory() as d:
+        history = DivergenceHistory(Path(d) / "h.db")
+        dte = (expiration - TODAY).days
+        _seed_history(history, ["NVDA"], dtes=(dte,))
+        gen = SignalGenerator(
+            h1_predictor=_FixedH1(0.0),
+            history_store=history,
+            earnings_calendar=earnings,
+            earnings_filter_enabled=enabled,
+        )
+        actionable, all_signals = gen.generate(
+            _scan([("NVDA", 0.30)], expirations=[expiration]),
+            feature_rows={"NVDA": _feature_row("NVDA")},
+            daily_gk_vol_by_symbol={"NVDA": _GK_SERIES},
+        )
+        history.close()
+    sig = next(s for s in all_signals if s.symbol == "NVDA")
+    return actionable, sig
 
 
 # ---------- EarningsCalendar cache tests ----------
@@ -159,129 +128,94 @@ def test_refresh_silently_skips_when_api_key_missing():
     print("refresh_skip_no_key: missing API key skips silently, lookups fail open")
 
 
-# ---------- SignalGenerator filter tests ----------
+# ---------- SignalGenerator filter tests (life-of-position window) ----------
 
-def test_signal_demoted_when_earnings_inside_buffer():
-    """Earnings 4 days out, default buffer 7 → demoted."""
-    today = date(2026, 5, 6)
-    expiration = date(2026, 5, 22)  # DTE=16
+def test_short_dte_entry_passes_when_report_lands_after_expiry():
+    """The over-block regression: a 2-DTE entry expiring BEFORE the report
+    must trade. The old flat 7-day buffer blocked every short-DTE entry for
+    a week around each report — exactly the tenors the h=1 model exists to
+    trade."""
+    expiration = TODAY + timedelta(days=2)          # 6/3
+    report = expiration + timedelta(days=2)         # 6/5 — after expiry
     with tempfile.TemporaryDirectory() as tmp:
         cal = EarningsCalendar(Path(tmp) / "earnings.db", api_key=None)
-        cal._seed_for_testing([("NVDA", date(2026, 5, 10))], today=today)
-        gen = _build_generator(earnings=cal)  # default buffer_days=7
+        cal._seed_for_testing([("NVDA", report)], today=TODAY)
+        actionable, sig = _generate(earnings=cal, expiration=expiration)
+        cal.close()
+    assert sig.blocked_by != "earnings", sig.diagnostic_notes
+    assert sig.is_actionable, sig.diagnostic_notes
+    assert [s.symbol for s in actionable] == ["NVDA"]
+    print("life_of_position: 2-DTE entry with report 2d after expiry → trades")
 
-        scan = _mk_scan(today, expiration, ["NVDA"])
-        feature_rows = {"NVDA": pd.DataFrame({"a": [0.0]}, index=[date(2026, 5, 5)])}
-        returns_by_symbol = {"NVDA": pd.Series([0.001] * 100)}
 
-        actionable, all_signals = gen.generate(
-            scan, feature_rows, returns_by_symbol, top_n=10,
+def test_report_inside_position_life_blocks():
+    """A report anywhere inside [today, expiration] blocks, however far out.
+    The old 7-day buffer passed a 14-DTE entry whose report landed on day
+    8-14 and left the fail-closed EXIT to clean it up — in a 1-14 DTE book
+    the entry gate itself must refuse the event trade."""
+    expiration = TODAY + timedelta(days=14)         # 6/15
+    report = TODAY + timedelta(days=12)             # 6/13 — inside the life
+    with tempfile.TemporaryDirectory() as tmp:
+        cal = EarningsCalendar(Path(tmp) / "earnings.db", api_key=None)
+        cal._seed_for_testing([("NVDA", report)], today=TODAY)
+        actionable, sig = _generate(earnings=cal, expiration=expiration)
+        cal.close()
+    assert sig.blocked_by == "earnings", (sig.blocked_by, sig.diagnostic_notes)
+    assert "earnings_within_position_life" in sig.diagnostic_notes
+    assert report.isoformat() in sig.diagnostic_notes
+    assert actionable == []
+    print("life_of_position: report on day 12 of a 14-DTE entry → blocked")
+
+
+def test_report_on_expiration_day_boundary():
+    """Inclusive upper bound: report == expiration blocks (that expiry's IV
+    is all event premium); report == expiration + 1 passes (the position no
+    longer exists when the report hits)."""
+    expiration = TODAY + timedelta(days=10)         # 6/11
+    with tempfile.TemporaryDirectory() as tmp:
+        cal = EarningsCalendar(Path(tmp) / "earnings.db", api_key=None)
+        cal._seed_for_testing([("NVDA", expiration)], today=TODAY)
+        _, sig_on = _generate(earnings=cal, expiration=expiration)
+        cal.close()
+    assert sig_on.blocked_by == "earnings", sig_on.diagnostic_notes
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cal = EarningsCalendar(Path(tmp) / "earnings.db", api_key=None)
+        cal._seed_for_testing(
+            [("NVDA", expiration + timedelta(days=1))], today=TODAY,
         )
-        nvda_signals = [s for s in all_signals if s.symbol == "NVDA"]
-        assert nvda_signals, "expected a signal for NVDA"
-        sig = nvda_signals[0]
-        assert not sig.is_actionable, "NVDA must be demoted by earnings filter"
-        assert "earnings_within_window" in sig.diagnostic_notes
-        assert "2026-05-10" in sig.diagnostic_notes
-        assert "2026-05-13" in sig.diagnostic_notes  # window end = today + 7
-        assert "NVDA" not in [s.symbol for s in actionable]
+        _, sig_after = _generate(earnings=cal, expiration=expiration)
         cal.close()
-    print("filter_demote: NVDA earnings 5/10 (4d out) within 7-day buffer → demoted")
-
-
-def test_signal_passes_when_earnings_outside_buffer_but_inside_expiration():
-    """Earnings 14 days out, default buffer 7 → passes at entry. The
-    buffer-only rule exists so a 45-DTE divergence trade isn't blocked by a
-    report a month out with no IV ramp yet (9364f85). A report landing later
-    in a short-vol position's life is handled by the earnings_risk EXIT
-    (fail-closed), not the entry filter."""
-    today = date(2026, 5, 6)
-    expiration = date(2026, 5, 22)  # earnings 5/20 is BEFORE expiration
-    with tempfile.TemporaryDirectory() as tmp:
-        cal = EarningsCalendar(Path(tmp) / "earnings.db", api_key=None)
-        cal._seed_for_testing([("NVDA", date(2026, 5, 20))], today=today)
-        gen = _build_generator(earnings=cal)  # default buffer_days=7
-
-        scan = _mk_scan(today, expiration, ["NVDA"])
-        feature_rows = {"NVDA": pd.DataFrame({"a": [0.0]}, index=[date(2026, 5, 5)])}
-        returns_by_symbol = {"NVDA": pd.Series([0.001] * 100)}
-
-        _, all_signals = gen.generate(scan, feature_rows, returns_by_symbol, top_n=10)
-        sig = next(s for s in all_signals if s.symbol == "NVDA")
-        assert "earnings_within_window" not in sig.diagnostic_notes
-        cal.close()
-    print("filter_pass_outside_buffer: earnings 5/20 (14d out) outside 7-day buffer → not demoted")
-
-
-def test_custom_buffer_days_changes_demotion():
-    """A 6-days-out earnings: demoted with buffer=10, allowed with buffer=3."""
-    today = date(2026, 5, 6)
-    expiration = date(2026, 5, 22)
-    earnings_date = date(2026, 5, 12)  # 6 days out
-    feature_rows = {"NVDA": pd.DataFrame({"a": [0.0]}, index=[date(2026, 5, 5)])}
-    returns_by_symbol = {"NVDA": pd.Series([0.001] * 100)}
-
-    with tempfile.TemporaryDirectory() as tmp:
-        cal = EarningsCalendar(Path(tmp) / "earnings.db", api_key=None)
-        cal._seed_for_testing([("NVDA", earnings_date)], today=today)
-
-        # buffer=10: 6 days out is inside → demoted
-        gen_wide = _build_generator(earnings=cal, buffer_days=10)
-        scan = _mk_scan(today, expiration, ["NVDA"])
-        _, sigs_wide = gen_wide.generate(scan, feature_rows, returns_by_symbol, top_n=10)
-        sig_wide = next(s for s in sigs_wide if s.symbol == "NVDA")
-        assert "earnings_within_window" in sig_wide.diagnostic_notes
-        assert "2026-05-16" in sig_wide.diagnostic_notes  # window end = today + 10
-
-        # buffer=3: 6 days out is outside → allowed
-        gen_narrow = _build_generator(earnings=cal, buffer_days=3)
-        scan = _mk_scan(today, expiration, ["NVDA"])
-        _, sigs_narrow = gen_narrow.generate(scan, feature_rows, returns_by_symbol, top_n=10)
-        sig_narrow = next(s for s in sigs_narrow if s.symbol == "NVDA")
-        assert "earnings_within_window" not in sig_narrow.diagnostic_notes
-        cal.close()
-    print("custom_buffer: 6d-out earnings demoted at buffer=10, allowed at buffer=3")
+    assert sig_after.blocked_by != "earnings", sig_after.diagnostic_notes
+    assert sig_after.is_actionable
+    print("boundary: report==expiration blocks, report==expiration+1 passes")
 
 
 def test_signal_passes_when_no_earnings_data_available():
     """Fail-open: if the cache has no record (cache never refreshed), the
     filter must allow the trade rather than block all activity."""
-    today = date(2026, 5, 6)
-    expiration = date(2026, 5, 22)
+    expiration = TODAY + timedelta(days=10)
     with tempfile.TemporaryDirectory() as tmp:
         cal = EarningsCalendar(Path(tmp) / "earnings.db", api_key=None)
         # Do NOT seed — cache has never been refreshed
-        gen = _build_generator(earnings=cal)
-
-        scan = _mk_scan(today, expiration, ["NVDA"])
-        feature_rows = {"NVDA": pd.DataFrame({"a": [0.0]}, index=[date(2026, 5, 5)])}
-        returns_by_symbol = {"NVDA": pd.Series([0.001] * 100)}
-
-        _, all_signals = gen.generate(scan, feature_rows, returns_by_symbol, top_n=10)
-        sig = next(s for s in all_signals if s.symbol == "NVDA")
-        assert "earnings_within_window" not in sig.diagnostic_notes
+        _, sig = _generate(earnings=cal, expiration=expiration)
         cal.close()
+    assert sig.blocked_by != "earnings", sig.diagnostic_notes
     print("filter_fail_open: empty cache → trade allowed (fail open)")
 
 
 def test_filter_disabled_via_flag_skips_lookup():
     """Even when the calendar has data, earnings_filter_enabled=False must
     bypass the check. Useful for debugging without flushing the cache."""
-    today = date(2026, 5, 6)
-    expiration = date(2026, 5, 22)
+    expiration = TODAY + timedelta(days=10)
     with tempfile.TemporaryDirectory() as tmp:
         cal = EarningsCalendar(Path(tmp) / "earnings.db", api_key=None)
-        cal._seed_for_testing([("NVDA", date(2026, 5, 15))], today=today)
-        gen = _build_generator(earnings=cal, enabled=False)
-
-        scan = _mk_scan(today, expiration, ["NVDA"])
-        feature_rows = {"NVDA": pd.DataFrame({"a": [0.0]}, index=[date(2026, 5, 5)])}
-        returns_by_symbol = {"NVDA": pd.Series([0.001] * 100)}
-
-        _, all_signals = gen.generate(scan, feature_rows, returns_by_symbol, top_n=10)
-        sig = next(s for s in all_signals if s.symbol == "NVDA")
-        assert "earnings_within_window" not in sig.diagnostic_notes
+        cal._seed_for_testing(
+            [("NVDA", TODAY + timedelta(days=5))], today=TODAY,
+        )
+        _, sig = _generate(earnings=cal, expiration=expiration, enabled=False)
         cal.close()
+    assert sig.blocked_by != "earnings", sig.diagnostic_notes
     print("filter_disabled: flag=False bypasses earnings check entirely")
 
 
@@ -312,9 +246,9 @@ def main() -> int:
     test_seeded_cache_returns_true_for_in_window()
     test_refresh_skips_when_already_refreshed_today()
     test_refresh_silently_skips_when_api_key_missing()
-    test_signal_demoted_when_earnings_inside_buffer()
-    test_signal_passes_when_earnings_outside_buffer_but_inside_expiration()
-    test_custom_buffer_days_changes_demotion()
+    test_short_dte_entry_passes_when_report_lands_after_expiry()
+    test_report_inside_position_life_blocks()
+    test_report_on_expiration_day_boundary()
     test_signal_passes_when_no_earnings_data_available()
     test_filter_disabled_via_flag_skips_lookup()
     test_payload_parsing_filters_to_watchlist_and_skips_malformed()

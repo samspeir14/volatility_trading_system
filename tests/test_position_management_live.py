@@ -13,22 +13,15 @@ import time
 from datetime import date, timedelta
 from pathlib import Path
 
-import pandas as pd
-
 from config import load_settings, load_watchlist
 from data import (
     AsyncTradierClient,
     HistoricalStore,
     MarketData,
-    compute_log_returns,
 )
 from execution import OrderLog, OrderManager
 from features import FeaturePipeline
-from model import (
-    BestPredictor,
-    GARCHBaseline,
-    XGBoostVolPredictor,
-)
+from main import _load_h1_predictor
 from positions import ExitManager, PositionTracker
 
 
@@ -36,21 +29,6 @@ def _last_weekday(d: date) -> date:
     while d.weekday() >= 5:
         d -= timedelta(days=1)
     return d
-
-
-def _load_predictors(artifact_dir: Path):
-    predictors = {}
-    for h in (5, 10, 21):
-        existing = list(artifact_dir.glob(f"xgb_h{h}_*.joblib"))
-        if not existing:
-            raise RuntimeError(f"no model artifact for h={h}; run slow tuning test first")
-        newest = max(existing, key=lambda p: p.stat().st_mtime)
-        xgb = XGBoostVolPredictor.load(newest)
-        garch = GARCHBaseline(refit_every=21, min_history=100)
-        bp = BestPredictor(garch, xgb, horizon=h)
-        bp.update_from_eval(garch_r2=-0.1, xgb_r2=0.2)
-        predictors[h] = bp
-    return predictors
 
 
 async def main_async() -> int:
@@ -75,10 +53,6 @@ async def main_async() -> int:
             store, tickers, garch_min_history=100, garch_refit_every=21,
         )
         feature_df = pipeline.build_features(start, end)
-        returns_by_symbol = {
-            sym: compute_log_returns(store.get_bars(sym, start, end)["close"])
-            for sym in symbols
-        }
         feature_rows = {}
         for sym in symbols:
             try:
@@ -87,13 +61,13 @@ async def main_async() -> int:
             except KeyError:
                 continue
 
-        predictors = _load_predictors(artifact_dir)
+        h1_predictor, _phi_by_symbol = _load_h1_predictor(artifact_dir)
 
         # Live scan — wide window so we have prices for any open position
         async with AsyncTradierClient(settings) as client:
             md = MarketData(client, tickers)
             t0 = time.monotonic()
-            scan = await md.scan(expiration_window=(3, 45))
+            scan = await md.scan(expiration_window=(1, 45))
             scan_elapsed = time.monotonic() - t0
             print(f"scan: {scan.total_contracts} contracts in {scan_elapsed:.1f}s")
 
@@ -104,7 +78,7 @@ async def main_async() -> int:
             )
             exit_manager = ExitManager(
                 position_tracker=tracker, order_manager=order_manager,
-                predictors_by_horizon=predictors,
+                h1_predictor=h1_predictor,
                 # explicit defaults from the plan:
                 straddle_profit_target_pct=1.00,
                 straddle_stop_loss_pct=-0.50,
@@ -150,7 +124,7 @@ async def main_async() -> int:
                   f"theta={port['theta']:+.2f} vega={port['vega']:+.2f}")
 
             # 5. Evaluate exit triggers
-            decisions = exit_manager.evaluate(marks, scan, feature_rows, returns_by_symbol)
+            decisions = exit_manager.evaluate(marks, scan, feature_rows)
             print(f"\n=== Exit decisions ===")
             print(f"{'order_id':>10s} {'sym':5s} {'action':6s}  {'trigger':>22s}  rationale")
             print("-" * 100)

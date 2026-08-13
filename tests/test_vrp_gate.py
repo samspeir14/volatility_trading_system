@@ -81,12 +81,13 @@ def test_per_day_averaging_across_tenors():
 
 def test_dte_band_separation():
     """A candidate is scored only against gap history from its own tenor
-    band — short-tenor (harvest-era) history must not calibrate a DTE-40
-    candidate."""
+    band. One band spans the whole tradeable entry window (DTE 1-14); the
+    catch-all above it exists purely so an out-of-window dte can never
+    borrow short-tenor history."""
     from signals.divergence_history import vrp_dte_band
 
-    assert vrp_dte_band(7) == vrp_dte_band(14) != vrp_dte_band(18)
-    assert vrp_dte_band(18) != vrp_dte_band(40)
+    assert vrp_dte_band(1) == vrp_dte_band(7) == vrp_dte_band(14)
+    assert vrp_dte_band(14) != vrp_dte_band(15)
     with tempfile.TemporaryDirectory() as d:
         h = DivergenceHistory(Path(d) / "h.db")
         _seed(h, "X", [0.1, 0.3] * 65, dte=10)      # 130 short-band days

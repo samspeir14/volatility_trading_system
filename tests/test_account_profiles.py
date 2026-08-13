@@ -1,5 +1,6 @@
-"""Tests for the small account profile: MODEL_PIPELINE/ACCOUNT_PROFILE/
-PER_CONTRACT_FEE parsing, calibration selection, the small watchlist, $10k
+"""Tests for the account profiles: ACCOUNT_PROFILE/PER_CONTRACT_FEE parsing,
+retired-env-var rejections (STRATEGY_MODE, MODEL_PIPELINE=legacy,
+EARNINGS_BUFFER_DAYS), calibration selection, the small watchlist, $10k
 sizing, the min-credit floor in SignalGenerator, and fee netting on realized
 P&L."""
 import os
@@ -9,16 +10,15 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-import pandas as pd
-
 import main as trader_main
 from config import SMALL_WATCHLIST_PATH, Settings, Ticker, load_settings, load_watchlist
 from data.async_client import OptionContract
 from data.market_data import ScanResult, TickerSnapshot
 from execution import OrderLog, OrderManager
 from risk import PortfolioSnapshot, RiskManager
-from signals import SignalGenerator
+from signals import DivergenceHistory, SignalGenerator
 from signals.signal_generator import TradeLeg, TradeSignal
+from tests.test_signal_generator_h1 import _FixedH1, _GK_SERIES, _feature_row, _seed_history
 
 
 # ---------- settings parsing ----------
@@ -33,25 +33,15 @@ def _settings_env(**overrides):
     return mock.patch.dict(os.environ, env, clear=True)
 
 
-def test_pipeline_and_profile_parsing():
+def test_account_profile_parsing():
     with _settings_env():
         s = load_settings()
-    assert (s.model_pipeline, s.account_profile) == ("h1", "standard")
+    assert s.account_profile == "standard"
 
-    with _settings_env(MODEL_PIPELINE="legacy", ACCOUNT_PROFILE="small"):
+    with _settings_env(ACCOUNT_PROFILE="small"):
         s = load_settings()
-    assert (s.model_pipeline, s.account_profile) == ("legacy", "small")
-    print("pipeline/profile: defaults (h1, standard); env overrides parsed")
+    assert s.account_profile == "small"
 
-
-def test_pipeline_and_profile_invalid_raise():
-    with _settings_env(MODEL_PIPELINE="bogus"):
-        try:
-            load_settings()
-        except ValueError as e:
-            assert "MODEL_PIPELINE" in str(e)
-        else:
-            raise AssertionError("MODEL_PIPELINE=bogus should raise ValueError")
     with _settings_env(ACCOUNT_PROFILE="tiny"):
         try:
             load_settings()
@@ -59,7 +49,25 @@ def test_pipeline_and_profile_invalid_raise():
             assert "ACCOUNT_PROFILE" in str(e)
         else:
             raise AssertionError("ACCOUNT_PROFILE=tiny should raise ValueError")
-    print("pipeline/profile: invalid values rejected")
+    print("account_profile: default standard; small parsed; invalid rejected")
+
+
+def test_model_pipeline_h1_accepted_legacy_rejected():
+    """MODEL_PIPELINE=h1 (the old default, possibly still in a box's .env)
+    must boot silently; anything else fails LOUDLY — the legacy multi-horizon
+    path was deleted, not re-routed."""
+    with _settings_env(MODEL_PIPELINE="h1"):
+        load_settings()  # must not raise
+
+    for retired in ("legacy", "bogus"):
+        with _settings_env(MODEL_PIPELINE=retired):
+            try:
+                load_settings()
+            except ValueError as e:
+                assert "MODEL_PIPELINE" in str(e) and "removed" in str(e)
+            else:
+                raise AssertionError(f"MODEL_PIPELINE={retired} should raise")
+    print("model_pipeline: h1 boots silently, legacy/bogus rejected")
 
 
 def test_strategy_mode_env_now_raises():
@@ -70,10 +78,25 @@ def test_strategy_mode_env_now_raises():
             load_settings()
         except ValueError as e:
             msg = str(e)
-            assert "STRATEGY_MODE" in msg and "MODEL_PIPELINE" in msg
+            assert "STRATEGY_MODE" in msg and "ACCOUNT_PROFILE" in msg
         else:
             raise AssertionError("STRATEGY_MODE should raise ValueError")
     print("strategy_mode: legacy env var raises with migration hint")
+
+
+def test_earnings_buffer_days_env_now_raises():
+    """The entry gate's window is the position's life — the old buffer knob
+    must fail loudly so a stale .env is reconfigured, not silently ignored."""
+    with _settings_env(EARNINGS_BUFFER_DAYS="7"):
+        try:
+            load_settings()
+        except ValueError as e:
+            msg = str(e)
+            assert "EARNINGS_BUFFER_DAYS" in msg
+            assert "EARNINGS_EXIT_BUFFER_DAYS" in msg
+        else:
+            raise AssertionError("EARNINGS_BUFFER_DAYS should raise ValueError")
+    print("earnings_buffer_days: retired env var raises with pointer to exit knob")
 
 
 def test_vrp_z_knobs_must_be_positive_magnitudes():
@@ -227,7 +250,7 @@ def _mk_condor_signal(wing: float) -> TradeSignal:
     ]
     return TradeSignal(
         symbol="NVDA", expiration=date(2026, 5, 22), dte=8,
-        horizon_lower=5, horizon_upper=10, weight_lower=0.4,
+        horizon_lower=1, horizon_upper=1, weight_lower=1.0,
         direction="SELL", underlying_price=210.0, atm_iv=0.40,
         predicted_iv_equivalent=0.32, divergence=-0.08,
         cross_sectional_z=-2.0, time_series_z=None,
@@ -302,49 +325,47 @@ def test_small_profile_per_trade_budget_at_10k():
 
 # ---------- min_credit floor in SignalGenerator ----------
 
-class _ConstPredictor:
-    """Returns a fixed daily RV for every horizon (annualizes to ~0.19)."""
-    def predict_forward_rv(self, returns_history, X_row=None):
-        return 0.012
-
-
-# Alternating ±1.2% daily returns → trail63 ≈ 0.012 × √252 ≈ 0.19 annualized,
-# close to atm_iv=0.20 below so the harvest extreme-spread veto stays quiet.
-_HARVEST_RETURNS = pd.Series([0.012, -0.012] * 50)
-
-
-def _thin_condor_chain(sym: str, expiration: date, *, iv=0.20):
-    """ATM call+put and OTM wings, all liquid, priced so the condor's mid
-    credit is exactly $0.20: (0.30 + 0.30) − (0.20 + 0.20)."""
-    def _c(strike, otype, bid, ask, delta):
+def _thin_condor_chain(sym: str, expiration: date, *, iv=0.30):
+    """ATM call+put and OTM wings, all liquid and tighter than the 5% cost-gate
+    leg-spread cap, priced so the condor's mid credit is exactly $0.20:
+    (0.30 + 0.30) − (0.20 + 0.20)."""
+    def _c(strike, otype, bid, ask, delta, vega):
         return OptionContract(
             symbol=f"{sym}_{otype[0].upper()}{strike:.0f}_{expiration.isoformat()}",
             underlying=sym, expiration=expiration, strike=strike, option_type=otype,
             bid=bid, ask=ask, last=(bid + ask) / 2, volume=200, open_interest=1000,
-            delta=delta, gamma=0.01, theta=-0.05, vega=0.2, iv=iv,
+            delta=delta, gamma=0.01, theta=-0.05, vega=vega, iv=iv,
             fetched_at=datetime.now(timezone.utc),
         )
     return [
-        _c(100, "call", 0.29, 0.31, 0.5),
-        _c(100, "put", 0.29, 0.31, -0.5),
-        _c(110, "call", 0.19, 0.21, 0.2),   # OTM wing
-        _c(90, "put", 0.19, 0.21, -0.2),    # OTM wing
+        _c(100, "call", 0.295, 0.305, 0.5, 0.20),
+        _c(100, "put", 0.295, 0.305, -0.5, 0.20),
+        _c(110, "call", 0.198, 0.202, 0.2, 0.10),   # OTM wing
+        _c(90, "put", 0.198, 0.202, -0.2, 0.10),    # OTM wing
     ]
 
 
 def _thin_condor_generate(min_credit: float):
-    exp = date(2026, 6, 12)  # DTE 11 from the scan date — inside harvest window
+    """One SELL candidate (iv=0.30 vs seeded gap history → z≈+3.5) whose
+    condor mid credit is $0.20, run through the h=1 ladder."""
+    exp = date(2026, 6, 12)  # DTE 11 from the scan date — inside the window
     snap = TickerSnapshot(symbol="X", sector="tech",
                           underlying={"symbol": "X", "last": 100.0},
                           contracts=_thin_condor_chain("X", exp))
     scan = ScanResult(fetched_at=datetime(2026, 6, 1, 16, 0, tzinfo=timezone.utc),
                       snapshots={"X": snap})
-    predictors = {h: _ConstPredictor() for h in (5, 10, 21)}
-    feature_rows = {"X": pd.DataFrame({"a": [0.0]}, index=[date(2026, 5, 29)])}
-    returns_by_symbol = {"X": _HARVEST_RETURNS}
-    gen = SignalGenerator(predictors_by_horizon=predictors, history_store=None,
-                          cross_sectional_z_threshold=0.0, min_credit=min_credit)
-    return gen.generate(scan, feature_rows, returns_by_symbol, top_n=10)
+    with tempfile.TemporaryDirectory() as d:
+        history = DivergenceHistory(Path(d) / "h.db")
+        _seed_history(history, ["X"])
+        gen = SignalGenerator(h1_predictor=_FixedH1(0.0), history_store=history,
+                              min_credit=min_credit)
+        out = gen.generate(
+            scan,
+            feature_rows={"X": _feature_row("X")},
+            daily_gk_vol_by_symbol={"X": _GK_SERIES},
+        )
+        history.close()
+    return out
 
 
 def test_min_credit_demotes_thin_condor():
@@ -354,8 +375,10 @@ def test_min_credit_demotes_thin_condor():
     by = {s.symbol: s for s in all_signals}
     assert "X" in by, "signal missing entirely"
     sig = by["X"]
+    assert sig.direction == "SELL"
     assert not sig.is_actionable, "thin condor should be demoted"
     assert sig.legs == [], "demoted signal must carry no legs"
+    assert sig.blocked_by == "legs"
     assert "below floor" in sig.diagnostic_notes, sig.diagnostic_notes
     assert "$0.20" in sig.diagnostic_notes and "$0.25" in sig.diagnostic_notes, \
         sig.diagnostic_notes
@@ -374,9 +397,8 @@ def test_min_credit_zero_leaves_behavior_unchanged():
 
 
 def test_min_credit_negative_rejected():
-    predictors = {h: _ConstPredictor() for h in (5, 10, 21)}
     try:
-        SignalGenerator(predictors_by_horizon=predictors, min_credit=-0.1)
+        SignalGenerator(h1_predictor=_FixedH1(), min_credit=-0.1)
     except ValueError as e:
         assert "min_credit" in str(e)
     else:
@@ -426,9 +448,10 @@ def test_order_manager_wires_fee_from_settings():
 
 
 def main() -> int:
-    test_pipeline_and_profile_parsing()
-    test_pipeline_and_profile_invalid_raise()
+    test_account_profile_parsing()
+    test_model_pipeline_h1_accepted_legacy_rejected()
     test_strategy_mode_env_now_raises()
+    test_earnings_buffer_days_env_now_raises()
     test_vrp_z_knobs_must_be_positive_magnitudes()
     test_per_contract_fee_parsing()
     test_per_contract_fee_negative_raises()
@@ -442,7 +465,7 @@ def main() -> int:
     test_min_credit_negative_rejected()
     test_close_pnl_fee_netting_both_branches()
     test_order_manager_wires_fee_from_settings()
-    print("all small_harvest tests passed")
+    print("all account_profiles tests passed")
     return 0
 
 

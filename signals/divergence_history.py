@@ -56,10 +56,13 @@ VRP_LOOKBACK_DAYS = 252
 VRP_MIN_OBS = 120
 
 # The VRP gap is tenor-dependent (fattest at short DTE), so z-scores compare a
-# candidate only against gap history from the SAME tenor band. Without this,
-# a DTE-40 candidate scored against a mean built from harvest-era DTE<=16 rows
-# would read persistently cheap and spray spurious BUY signals.
-VRP_DTE_BANDS: tuple[tuple[int, int], ...] = ((0, 14), (15, 25), (26, 10_000))
+# candidate only against gap history from the SAME tenor band. One band covers
+# the whole tradeable entry window (DTE 1-14) — finer sub-bands would split
+# the gap history and silence the shortest tenors for months at VRP_MIN_OBS
+# (rows below ~7 DTE only started accruing at the 2026-08 pivot; study
+# offline on vrp_log before any live re-band). The catch-all keeps any
+# out-of-window dte from ever borrowing short-tenor history.
+VRP_DTE_BANDS: tuple[tuple[int, int], ...] = ((0, 14), (15, 10_000))
 
 
 def vrp_dte_band(dte: int) -> tuple[int, int]:

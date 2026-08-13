@@ -67,8 +67,8 @@ OHLC_VOL_COLUMNS: list[str] = [
     "gk_5", "gk_10", "gk_21",
 ]
 
-# Distribution shape — only h=21 selects these in HORIZON_FEATURE_SETS, but the
-# pipeline computes them so the same matrix supports all horizons.
+# Distribution shape — not in the h=1 top-20 (rskew_63 aside), but the
+# pipeline computes them so offline feature studies see the full matrix.
 DISTRIBUTION_SHAPE_COLUMNS: list[str] = [
     "rskew_21", "rskew_63",
     "rkurt_21", "rkurt_63",
@@ -96,43 +96,18 @@ FEATURE_COLUMNS: list[str] = (
 )
 
 
-# Per-horizon top-20 feature sets, derived from experiments/results/feature_importance.csv
-# (experiment 3_top20_xgb, mean-rank aggregation across walk-forward refits).
-# Frozen at integration time — do not load from CSV at runtime.
+# The production h=1 feature set (top-20 by mean rank across walk-forward
+# refits). FROZEN 2026-08-10 from `python -m experiments.vol_model_lab` on the
+# EC2 box (results/h1_feature_importance.csv). Demeaned HAR components
+# dominate, then VIX term structure and cross-ticker context. Frozen at
+# integration time — do not load from CSV at runtime.
 HORIZON_FEATURE_SETS: dict[int, list[str]] = {
-    # h=1: FROZEN 2026-08-10 from `python -m experiments.vol_model_lab --h1`
-    # on the EC2 box (mean-rank aggregation across walk-forward refits;
-    # results/h1_feature_importance.csv). Demeaned HAR components dominate,
-    # then VIX term structure and cross-ticker context.
     1: [
         "har_dev_5", "dev_gk", "vix3m_to_vix", "volume_ratio", "vix_level",
         "market_avg_rv21", "har_dev_22", "vix9d_to_vix", "corr_spy_21",
         "atr_roc", "ewma_94_97_ratio", "rv_10_63_ratio", "rsi_14", "rv_63",
         "sector_avg_rv21", "log_gk_baseline_63", "har_rv_daily", "rskew_63",
         "vix_vs_rv21_ann", "gk_1",
-    ],
-    5: [
-        "parkinson_21", "gk_5", "gk_21", "vix9d_to_vix", "parkinson_5",
-        "garch_forecast_var", "market_avg_rv21", "intraday_range",
-        "rv_10_63_ratio", "vix3m_to_vix", "rv21_vs_market", "rv_63",
-        "vix_level", "ewma_vol_97", "rsi_14", "acf_sq_ret_lag5",
-        "sector_avg_rv21", "bb_width", "ewma_vol_94", "parkinson_10",
-    ],
-    10: [
-        "gk_21", "parkinson_21", "garch_forecast_var", "vix9d_to_vix",
-        "gk_10", "acf_sq_ret_lag5", "vix3m_to_vix", "gk_5",
-        "rv21_vs_market", "rv21_vs_sector", "market_avg_rv21",
-        "ewma_vol_97", "rv_63", "rsi_14", "rv_10_63_ratio", "rv_10",
-        "acf_sq_ret_lag1", "parkinson_5", "vix_vs_rv21_ann",
-        "intraday_range",
-    ],
-    21: [
-        "gk_21", "gk_10", "parkinson_21", "garch_forecast_var",
-        "market_avg_rv21", "parkinson_10", "vix9d_to_vix",
-        "rv21_vs_market", "rkurt_21", "acf_sq_ret_lag1", "vix3m_to_vix",
-        "rv_63", "acf_sq_ret_lag5", "sector_avg_rv21", "rkurt_63",
-        "rv21_vs_sector", "garch_resid_lb_pvalue", "corr_spy_21",
-        "rskew_63", "ewma_vol_97",
     ],
 }
 
@@ -172,7 +147,7 @@ class FeaturePipeline:
 
         Returns a MultiIndex (symbol, date) DataFrame with FEATURE_COLUMNS:
         the 28 baseline columns + 6 OHLC vol + 4 distribution shape + 7 ratios = 45.
-        Per-horizon production models pull subsets via HORIZON_FEATURE_SETS.
+        The production h=1 model pulls its frozen subset via HORIZON_FEATURE_SETS[1].
         """
         watchlist_symbols = [t.symbol for t in self._watchlist]
         all_symbols = watchlist_symbols + list(self._indices)
