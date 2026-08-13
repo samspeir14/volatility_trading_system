@@ -45,6 +45,13 @@ EXIT_TRIGGER_PRIORITY = (
 CALENDAR_STALE_DAYS = 3
 
 
+def _entry_dte(pos: OpenPosition) -> int:
+    """Calendar days from entry to expiration. Distinguishes a position that
+    AGED into the near-expiry window (close it) from one deliberately opened
+    there by the h=1 short-dated entries (let it ride to expiry morning)."""
+    return (pos.expiration - pos.submitted_at.date()).days
+
+
 def _trading_days_between(a: date, b: date) -> int:
     """Weekdays strictly between a and b (a < d < b). Holidays are counted as
     trading days — the approximation only ever closes a position one weekday
@@ -295,9 +302,20 @@ class ExitManager:
 
         # 5. Expiration proximity (long straddles: wings don't apply, but the
         # position bleeds its remaining premium into expiry). Short structures
-        # are covered by the assignment-risk close-out above.
-        if pos.structure != "iron_condor" and mark.dte <= self._exp_dte:
-            return "expiration_proximity", f"dte={mark.dte} <= {self._exp_dte}"
+        # are covered by the assignment-risk close-out above. Scoped by ENTRY
+        # dte: a position deliberately opened at dte <= exp_dte (the h=1
+        # short-dated entries) must not be closed the moment it opens — it
+        # rides to expiry morning instead, where dte <= 0 closes it before
+        # auto-exercise can leave a stock position.
+        if pos.structure != "iron_condor":
+            if _entry_dte(pos) <= self._exp_dte:
+                if mark.dte <= 0:
+                    return "expiration_proximity", (
+                        f"expiry-morning close (short-dated entry, "
+                        f"entry_dte={_entry_dte(pos)})"
+                    )
+            elif mark.dte <= self._exp_dte:
+                return "expiration_proximity", f"dte={mark.dte} <= {self._exp_dte}"
 
         # 6. Profit target
         pt_threshold = self._profit_target_threshold(pos)
@@ -446,7 +464,13 @@ class ExitManager:
         # the money. Missing underlying fails SAFE — for the harvest structure
         # a short leg is nearly always near the money here, so closing blind
         # is almost always what the check would have decided anyway.
-        if mark.dte <= self._short_close_dte:
+        # Scoped by ENTRY dte: a condor deliberately opened at
+        # dte <= short_close_dte places its wings ~1 daily sigma out — inside
+        # the near-money buffer by construction — so this rule would close it
+        # at entry. Such positions rely on (a)'s expiry-morning close and
+        # (c)'s parity check instead.
+        if (mark.dte <= self._short_close_dte
+                and _entry_dte(mark.position) > self._short_close_dte):
             if not have_underlying:
                 return (
                     f"dte={mark.dte} <= {self._short_close_dte} and underlying "

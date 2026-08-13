@@ -54,6 +54,13 @@ class Settings:
     # max_leg_spread_pct of mid blocks entry outright.
     cost_multiple: float = 2.0
     max_leg_spread_pct: float = 0.05
+    # Entry DTE window for new positions. Floor 1 (one overnight of vol
+    # exposure — the purest test of the h=1 forecast; 0 is forbidden, the
+    # expiry-day assignment backstop would close it at entry). Cap 14: beyond
+    # that the term-projected forecast decays to the stock's mean vol and the
+    # trade degenerates into the retired VRP-level bet.
+    min_entry_dte: int = 1
+    max_entry_dte: int = 14
     # Exit rule: close every short-vol position at least this many trading
     # days before the ticker's earnings report.
     earnings_exit_buffer_trading_days: int = 1
@@ -133,6 +140,13 @@ def load_settings() -> Settings:
             f"COST_MULT and MAX_SPREAD_PCT must be > 0, got "
             f"{cost_multiple}/{max_leg_spread_pct}"
         )
+    min_entry_dte = _parse_int(os.environ.get("MIN_ENTRY_DTE"), default=1)
+    max_entry_dte = _parse_int(os.environ.get("MAX_ENTRY_DTE"), default=14)
+    if not 1 <= min_entry_dte <= max_entry_dte:
+        raise ValueError(
+            f"need 1 <= MIN_ENTRY_DTE <= MAX_ENTRY_DTE, got "
+            f"{min_entry_dte}/{max_entry_dte}"
+        )
     earnings_exit_buffer_trading_days = _parse_int(
         os.environ.get("EARNINGS_EXIT_BUFFER_DAYS"), default=1,
     )
@@ -168,6 +182,8 @@ def load_settings() -> Settings:
         vrp_min_obs=vrp_min_obs,
         cost_multiple=cost_multiple,
         max_leg_spread_pct=max_leg_spread_pct,
+        min_entry_dte=min_entry_dte,
+        max_entry_dte=max_entry_dte,
         earnings_exit_buffer_trading_days=earnings_exit_buffer_trading_days,
         per_contract_fee=per_contract_fee,
     )

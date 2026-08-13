@@ -223,18 +223,25 @@ def _straddle_chain(sym, expiration, atm_iv, underlying=100.0):
     ]
 
 
-def test_entry_dte_gate_skips_near_expiry():
-    """A candidate below MIN_ENTRY_DTE never becomes a signal; one above does.
-    Guards the weekend-compression churn: a fresh straddle opened at DTE 4 would
-    be force-closed by the expiration_proximity exit the next session."""
+def test_entry_dte_window_bounds_legacy():
+    """The legacy path honors the same entry window as h=1: DTE 21 (beyond
+    MAX_ENTRY_DTE) never becomes a signal. DTE 1 additionally drops out via
+    interpolate_horizon — the legacy models have no horizon short enough to
+    price it (the h=1 path's 1-DTE coverage is tested in
+    test_signal_generator_h1)."""
     from datetime import datetime
     from data.market_data import ScanResult, TickerSnapshot
-    from signals import MIN_ENTRY_DTE
+    from signals import MAX_ENTRY_DTE, MIN_ENTRY_DTE
+
+    assert MIN_ENTRY_DTE == 1 and MAX_ENTRY_DTE == 14
 
     # scan.fetched_at below is 2026-06-01, which generate() uses as "today".
-    near = date(2026, 6, 5)    # DTE 4  (< MIN_ENTRY_DTE)
-    far = date(2026, 6, 12)    # DTE 11 (>= MIN_ENTRY_DTE)
-    contracts = _straddle_chain("X", near, 0.20) + _straddle_chain("X", far, 0.20)
+    overnight = date(2026, 6, 2)   # DTE 1  (below the legacy horizon floor)
+    mid = date(2026, 6, 12)        # DTE 11 (in window)
+    beyond = date(2026, 6, 22)     # DTE 21 (> MAX_ENTRY_DTE)
+    contracts = (_straddle_chain("X", overnight, 0.20)
+                 + _straddle_chain("X", mid, 0.20)
+                 + _straddle_chain("X", beyond, 0.20))
     snap = TickerSnapshot(symbol="X", sector="tech",
                           underlying={"symbol": "X", "last": 100.0}, contracts=contracts)
     scan = ScanResult(fetched_at=datetime(2026, 6, 1, 16, 0, tzinfo=timezone.utc),
@@ -249,10 +256,8 @@ def test_entry_dte_gate_skips_near_expiry():
     _, all_signals = gen.generate(scan, feature_rows, returns_by_symbol, top_n=10)
 
     dtes = sorted({s.dte for s in all_signals})
-    assert all(s.dte >= MIN_ENTRY_DTE for s in all_signals), f"got DTEs {dtes}"
-    assert any(s.dte == 11 for s in all_signals), f"expected DTE-11 signal, got {dtes}"
-    assert not any(s.dte == 4 for s in all_signals), f"DTE-4 leaked through gate: {dtes}"
-    print(f"entry_dte_gate: DTE-4 skipped, DTE-11 kept (MIN_ENTRY_DTE={MIN_ENTRY_DTE})")
+    assert dtes == [11], f"expected DTEs [11], got {dtes}"
+    print("entry_dte_window (legacy): DTE 21 capped, DTE 1 horizon-floored")
 
 
 def test_long_straddle_exclusion_demotes_etf_buy_only():

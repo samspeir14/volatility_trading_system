@@ -37,18 +37,27 @@ CALENDAR_DAYS_PER_YEAR = 365
 MIN_DTE = 4
 MAX_DTE = 45
 
-# Lowest DTE at which a NEW position may be opened. This is deliberately higher
-# than MIN_DTE (the horizon-mapping floor used by interpolate_horizon, which the
-# exit manager also relies on to mark aged positions). A fresh straddle opened
-# near MIN_DTE gets force-closed by the expiration_proximity exit (dte <= 2)
-# within a session or two — and a weekend collapses the gap entirely (a Friday
-# DTE-4 entry is at DTE 1 the next session). Requiring >= 7 calendar days keeps
-# at least three trading sessions before the proximity exit can fire, so the
-# entry isn't an instant round-trip into bid/ask + theta. Entry-side only; it
-# does NOT gate horizon mapping for existing positions. The h=1 term projection
-# makes short DTEs *comparable* to the forecast, not *tradable* — the floor
-# stays (the 2026-06 straddle-churn lesson).
-MIN_ENTRY_DTE = 7
+# Entry DTE window for NEW positions, [MIN_ENTRY_DTE, MAX_ENTRY_DTE] inclusive.
+# Entry-side only; neither bound gates horizon mapping or exits for existing
+# positions.
+#
+# Floor = 1: the h=1 model's purest expression is the shortest-dated option —
+# a 1-DTE entry is one overnight of vol exposure, closed on expiry morning.
+# The old floor of 7 dated from the 2026-06 straddle-churn bug, where the
+# expiration_proximity exit (dte <= 2) force-closed fresh near-expiry entries
+# within a session. The exit manager now scopes that exit (and the
+# assignment-risk near-money close) by ENTRY dte, so a deliberately
+# short-dated entry rides to its expiry-morning close instead of
+# round-tripping into bid/ask + theta. Floor of 0 stays forbidden: the
+# expiry-day assignment backstop (dte <= 0) would close a same-day entry on
+# the spot.
+#
+# Cap = 14: the 1-day forecast decays toward the stock's 63-day mean vol at
+# the GARCH persistence rate, so by ~1 month the projection is mostly "IV vs
+# this stock's normal level" — the VRP-level trade that 7 years of research
+# refuted and Sam retired. Trade only where the timing signal survives.
+MIN_ENTRY_DTE = 1
+MAX_ENTRY_DTE = 14
 
 # Fallback GARCH persistence when the feature row has none (fresh symbol, GARCH
 # warm-up) and no per-symbol value came from the retrain JSON.
@@ -261,7 +270,16 @@ class SignalGenerator:
         max_leg_spread_pct: float = 0.05,
         per_contract_fee: float = 0.0,
         phi_by_symbol: dict[str, float] | None = None,
+        min_entry_dte: int = MIN_ENTRY_DTE,
+        max_entry_dte: int = MAX_ENTRY_DTE,
     ):
+        if not 1 <= min_entry_dte <= max_entry_dte:
+            raise ValueError(
+                f"need 1 <= min_entry_dte <= max_entry_dte, got "
+                f"{min_entry_dte}/{max_entry_dte}"
+            )
+        self._min_entry_dte = min_entry_dte
+        self._max_entry_dte = max_entry_dte
         # Exactly one prediction source: the h=1 deviation predictor (active
         # pipeline) or the legacy multi-horizon BestPredictors.
         if (h1_predictor is None) == (predictors_by_horizon is None):
@@ -417,10 +435,9 @@ class SignalGenerator:
 
             for expiration, chain in chains_by_exp.items():
                 dte = (expiration - today).days
-                # Entry floor: below MIN_ENTRY_DTE a fresh position is
-                # force-closed by the expiration_proximity exit before the
-                # thesis plays out (straddle-churn bug). Skip silently.
-                if dte < MIN_ENTRY_DTE or dte > MAX_DTE:
+                # Entry DTE window (see MIN_ENTRY_DTE/MAX_ENTRY_DTE above).
+                # MAX_DTE stays as the horizon-mapping ceiling. Skip silently.
+                if not self._min_entry_dte <= dte <= min(self._max_entry_dte, MAX_DTE):
                     continue
 
                 forecast_d = project_term_vol(b_t, dev_hat, phi, dte)
@@ -727,7 +744,10 @@ class SignalGenerator:
 
             for expiration, chain in chains_by_exp.items():
                 dte = (expiration - today).days
-                if dte < MIN_ENTRY_DTE:
+                # Same entry window as the h1 path; DTEs below MIN_DTE are
+                # additionally dropped by interpolate_horizon (the legacy
+                # models have no horizon short enough to price them).
+                if not self._min_entry_dte <= dte <= min(self._max_entry_dte, MAX_DTE):
                     continue
                 horizon_pair = interpolate_horizon(dte)
                 if horizon_pair is None:

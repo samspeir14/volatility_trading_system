@@ -1,6 +1,7 @@
 from signals.divergence_history import DivergenceHistory
 from signals.signal_generator import (
     MAX_DTE,
+    MAX_ENTRY_DTE,
     MIN_DTE,
     MIN_ENTRY_DTE,
     TRADING_DAYS_PER_YEAR,
@@ -17,6 +18,7 @@ from signals.signal_generator import (
 __all__ = [
     "DivergenceHistory",
     "MAX_DTE",
+    "MAX_ENTRY_DTE",
     "MIN_DTE",
     "MIN_ENTRY_DTE",
     "SignalGenerator",

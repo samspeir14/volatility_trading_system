@@ -5,7 +5,8 @@ and the threshold math. The full evaluate() with re-derived divergence is
 exercised in the live test."""
 import math
 import sys
-from datetime import date, datetime, timezone
+from dataclasses import replace
+from datetime import date, datetime, timedelta, timezone
 
 TODAY = date(2026, 5, 12)
 from unittest import mock
@@ -270,17 +271,50 @@ def test_stop_loss_overrides_assignment_risk():
     print("PRIORITY: stop_loss overrides assignment_risk when both fire")
 
 
-def test_entry_floor_clears_assignment_close_window():
-    """Invariant: the entry floor must sit above the assignment close window,
-    or fresh short-vol entries would be closed within a session or two (the
-    straddle-churn bug, condor edition)."""
-    from signals.signal_generator import MIN_ENTRY_DTE
-    mgr = _exit_mgr()
-    assert MIN_ENTRY_DTE > mgr._short_close_dte + 1, (
-        f"MIN_ENTRY_DTE ({MIN_ENTRY_DTE}) must exceed short_close_dte "
-        f"({mgr._short_close_dte}) by 2+ so entries aren't instant round-trips"
-    )
-    print(f"invariant: entry floor {MIN_ENTRY_DTE} > close window {mgr._short_close_dte} ✓")
+def test_short_dated_straddle_entry_rides_to_expiry_morning():
+    """A straddle deliberately opened at entry_dte=1 (h=1 overnight trade) is
+    NOT proximity-closed at dte=1 (that would be an instant round-trip), but
+    IS closed on expiry morning (dte=0) before auto-exercise can leave stock."""
+    pos = _mk_long_straddle_position()
+    pos = replace(pos, expiration=TODAY + timedelta(days=1),
+                  submitted_at=datetime(2026, 5, 12, 15, 0, tzinfo=timezone.utc))
+
+    mark = _mark(pos, pnl_dollars=0.0, dte=1, underlying_price=100.0)
+    trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=0.15)
+    assert trigger is None, f"1-DTE entry closed at entry: {trigger}"
+
+    mark0 = _mark(pos, pnl_dollars=0.0, dte=0, underlying_price=100.0)
+    trigger, rationale = _exit_mgr()._evaluate_one(
+        mark0, today=TODAY + timedelta(days=1), current_divergence=0.15)
+    assert trigger == "expiration_proximity", f"expected expiry-morning close, got {trigger}"
+    assert "short-dated entry" in rationale
+    print("short-dated straddle: holds at dte=1, closes expiry morning ✓")
+
+
+def test_short_dated_condor_entry_skips_near_money_close():
+    """A condor opened at entry_dte=1 has wings ~1 daily sigma out — inside the
+    near-money buffer by construction. Rule (b) must not close it at entry;
+    rule (a) still closes it on expiry morning."""
+    pos = _mk_iron_condor_position()
+    pos = replace(pos, expiration=TODAY + timedelta(days=1),
+                  submitted_at=datetime(2026, 5, 12, 15, 0, tzinfo=timezone.utc))
+
+    # Underlying sits within the 1.5% buffer of the short 210 strike.
+    mark = _mark(pos, pnl_dollars=0.0, dte=1, underlying_price=209.0)
+    trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=-0.08)
+    assert trigger is None, f"1-DTE condor closed at entry: {trigger}"
+
+    mark0 = _mark(pos, pnl_dollars=0.0, dte=0, underlying_price=209.0)
+    trigger, _ = _exit_mgr()._evaluate_one(
+        mark0, today=TODAY + timedelta(days=1), current_divergence=-0.08)
+    assert trigger == "assignment_risk", f"expected expiry-morning backstop, got {trigger}"
+
+    # A condor that AGED into the window still gets the near-money close.
+    aged = _mk_iron_condor_position()
+    aged_mark = _mark(aged, pnl_dollars=0.0, dte=1, underlying_price=209.0)
+    trigger, _ = _exit_mgr()._evaluate_one(aged_mark, today=TODAY, current_divergence=-0.08)
+    assert trigger == "assignment_risk", f"aged condor kept near the money: {trigger}"
+    print("short-dated condor: rides at dte=1, expiry-morning backstop + aged close intact ✓")
 
 
 def test_min_dte_strictly_greater_than_expiration_proximity_dte():
