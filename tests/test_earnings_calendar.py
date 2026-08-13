@@ -89,6 +89,8 @@ def _build_generator(
         history_store=None,
         cross_sectional_z_threshold=0.0,  # any signal passes the z gate
         max_divergence=0.50,              # well above the synthetic divergence
+        max_entry_dte=45,                 # these tests use DTE-16 fixtures; the
+                                          # entry window is tested elsewhere
         earnings_calendar=earnings,
         earnings_filter_enabled=enabled,
         earnings_buffer_days=buffer_days,

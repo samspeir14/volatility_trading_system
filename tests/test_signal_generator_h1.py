@@ -218,7 +218,7 @@ def test_cost_gate_blocks_thin_edge():
 def test_ranking_by_abs_z_and_symbol_dedupe():
     """Stronger |z| ranks first; a symbol with two passing expirations gets
     one actionable slot."""
-    exp2 = date(2026, 6, 19)  # DTE 18
+    exp2 = date(2026, 6, 9)  # DTE 8 — inside the entry window alongside EXP
     actionable, all_signals, _ = _run(
         [("HOT", 0.36), ("WARM", 0.27)],
         expirations=[EXP, exp2],
@@ -272,6 +272,27 @@ def test_model_disagreement_blocks_sell_against_forecast():
     print(f"model_disagrees: SELL at divergence {s.divergence:+.3f} blocked")
 
 
+def test_entry_dte_window():
+    """The h=1 path prices a 1-DTE option (the model's purest tenor: one
+    overnight of vol exposure) and drops anything beyond MAX_ENTRY_DTE, where
+    the term-projected forecast has decayed into the retired VRP-level bet."""
+    exp_overnight = date(2026, 6, 2)   # DTE 1 — floor, allowed
+    exp_beyond = date(2026, 6, 22)     # DTE 21 — beyond the 14-day cap
+    _, all_signals, _ = _run(
+        [("RICH", 0.30)], expirations=[exp_overnight, EXP, exp_beyond],
+    )
+    dtes = sorted({s.dte for s in all_signals})
+    assert dtes == [1, 11], f"expected DTEs [1, 11], got {dtes}"
+
+    # Window is constructor-tunable: floor 7 re-excludes the overnight entry.
+    _, sigs7, _ = _run(
+        [("RICH", 0.30)], expirations=[exp_overnight, EXP, exp_beyond],
+        min_entry_dte=7,
+    )
+    assert sorted({s.dte for s in sigs7}) == [11]
+    print("entry_dte_window: DTE 1 priced, 21 capped, floor=7 honored")
+
+
 def main() -> int:
     test_direction_from_vrp_z()
     test_no_history_emits_no_signal()
@@ -282,6 +303,7 @@ def main() -> int:
     test_ranking_by_abs_z_and_symbol_dedupe()
     test_missing_baseline_skips_symbol()
     test_model_disagreement_blocks_sell_against_forecast()
+    test_entry_dte_window()
     print("all signal_generator_h1 tests passed")
     return 0
 

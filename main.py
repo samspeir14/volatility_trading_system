@@ -57,20 +57,34 @@ from signals import DivergenceHistory, SignalGenerator
 
 logger = logging.getLogger(__name__)
 
-# Scan only the expirations that can actually produce a trade. The signal
-# generator won't open a new position below DTE MIN_ENTRY_DTE (7) or above
-# MAX_DTE (45) — so fetching chains out to 60 DTE was pure waste that bloated
-# the per-cycle option-chain fan-out and exhausted the rate limiter every cycle.
-# The lower bound stays at 3 (below MIN_ENTRY_DTE) so already-open positions at
-# DTE 3 still mark off the scan; anything below that is pulled in by
-# fetch_missing_position_chains. The h=1 term projection prices the whole
-# window correctly (forecast decays toward the baseline with tenor), so the
-# full (3, 45) window applies unconditionally now that harvest mode is gone.
-SCAN_EXPIRATION_WINDOW = (3, 45)
+# Scan only the expirations that can actually produce a trade. The lower bound
+# tracks the entry floor (settings.min_entry_dte, default 1 — the h=1 model's
+# shortest tradeable tenor); anything below it is pulled in by
+# fetch_missing_position_chains for still-open positions. The upper bound
+# stays at 45 even though entries cap at settings.max_entry_dte (default 14):
+# the VRP gap history for the mid/long DTE bands keeps accruing off the scan,
+# so re-widening the entry window later doesn't restart a 60-day warmup.
+SCAN_EXPIRATION_WINDOW_UPPER = 45
 
 
 def _scan_window(settings: Settings) -> tuple[int, int]:
-    return SCAN_EXPIRATION_WINDOW
+    return (settings.min_entry_dte, SCAN_EXPIRATION_WINDOW_UPPER)
+
+
+def _parse_clock_timestamp(raw: str | None) -> datetime | None:
+    """Tradier clock timestamps ("2026-04-28T13:30:00Z" or offset-aware ISO)
+    as aware-UTC datetimes; None when absent/unparseable/naive."""
+    if not raw:
+        return None
+    try:
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        ts = datetime.fromisoformat(raw)
+    except (ValueError, TypeError):
+        return None
+    if ts.tzinfo is None:
+        return None
+    return ts.astimezone(timezone.utc)
 
 
 # NEW entries only submit inside this ET window. Options spreads are widest in
@@ -453,6 +467,9 @@ class MainLoop:
         if state != "open":
             logger.info("market state=%s, skipping cycle", state)
             return CycleResult(market_open=False, timestamp=now)
+        # While open, next_change is today's close — the authority for the
+        # exit manager's before-the-bell close window (handles half-days).
+        market_close_utc = _parse_clock_timestamp(clock.get("next_change"))
 
         # 1b. Refresh daily bars through the last completed trading day.
         # ensure_data is incremental (latest cached date + 1 forward), so this
@@ -493,11 +510,9 @@ class MainLoop:
             logger.error("stale-close reconcile failed: %s — continuing", e)
 
         # 2d. Pull chains for any still-open position whose expiration has aged
-        # below the scan's lower window bound. The scan only fetches expirations
-        # in SCAN_EXPIRATION_WINDOW, so a position at DTE < 3 has no legs in it —
-        # it
-        # silently drops out of mark-to-market and never reaches the
-        # expiration-proximity exit. Augment the scan in place (after reconcile,
+        # below the scan's lower window bound (_scan_window's floor). Such a
+        # position has no legs in the scan — it silently drops out of
+        # mark-to-market and never reaches the expiration-proximity exit. Augment the scan in place (after reconcile,
         # so freshly-expired positions are excluded) and let the single scan
         # object flow to snapshot, exits, and signals alike.
         try:
@@ -562,6 +577,7 @@ class MainLoop:
             returns_by_symbol = self._build_returns_dict()
             exit_decisions = self._exit_manager.evaluate(
                 snapshot.open_marks, scan, feature_rows, returns_by_symbol,
+                market_close_utc=market_close_utc,
             )
             exit_results = await self._exit_manager.execute(
                 exit_decisions, dry_run=False,
@@ -949,6 +965,8 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
         # are not macro-gated.
         macro_calendar=MacroCalendar(),
         macro_sensitive_symbols=etf_symbols,
+        min_entry_dte=settings.min_entry_dte,
+        max_entry_dte=settings.max_entry_dte,
     )
 
     h1_predictor = None
