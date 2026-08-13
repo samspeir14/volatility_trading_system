@@ -142,27 +142,21 @@ async def test_full_watchlist_perf() -> None:
 
 
 def test_horizon_feature_sets_structure() -> None:
-    """Pure unit test — no API or cache needed."""
-    assert set(HORIZON_FEATURE_SETS.keys()) == {1, 5, 10, 21}, (
+    """Pure unit test — no API or cache needed. h=1 is the only production
+    model; its frozen top-20 must stay a valid subset of FEATURE_COLUMNS."""
+    assert set(HORIZON_FEATURE_SETS.keys()) == {1}, (
         f"unexpected horizons {set(HORIZON_FEATURE_SETS.keys())}"
     )
-    for h, feats in HORIZON_FEATURE_SETS.items():
-        assert len(feats) == 20, f"h={h}: expected 20 features, got {len(feats)}"
-        assert len(set(feats)) == 20, f"h={h}: duplicate feature names"
-        # Every selected feature must exist in the full FEATURE_COLUMNS set
-        unknown = [f for f in feats if f not in FEATURE_COLUMNS]
-        assert not unknown, f"h={h}: features not in FEATURE_COLUMNS: {unknown}"
-
-    # h=5 and h=10 must NOT use distribution-shape features (per spec)
-    for h in (5, 10):
-        dist_overlap = set(HORIZON_FEATURE_SETS[h]) & set(DISTRIBUTION_SHAPE_COLUMNS)
-        assert not dist_overlap, (
-            f"h={h} unexpectedly includes distribution-shape features: {dist_overlap}"
-        )
-    # h=21 must include at least one rskew or rkurt
-    h21_dist = set(HORIZON_FEATURE_SETS[21]) & set(DISTRIBUTION_SHAPE_COLUMNS)
-    assert h21_dist, "h=21 must include at least one rskew/rkurt feature"
-    print(f"horizon_feature_sets: 20-feature subsets per horizon, h=21 dist features = {sorted(h21_dist)}")
+    feats = HORIZON_FEATURE_SETS[1]
+    assert len(feats) == 20, f"expected 20 features, got {len(feats)}"
+    assert len(set(feats)) == 20, "duplicate feature names"
+    # Every selected feature must exist in the full FEATURE_COLUMNS set
+    unknown = [f for f in feats if f not in FEATURE_COLUMNS]
+    assert not unknown, f"features not in FEATURE_COLUMNS: {unknown}"
+    # The frozen list carries rskew_63 from DISTRIBUTION_SHAPE_COLUMNS — the
+    # rest of that family is computed for offline studies only.
+    assert set(feats) & set(DISTRIBUTION_SHAPE_COLUMNS) == {"rskew_63"}
+    print("horizon_feature_sets: h=1 frozen top-20 is a valid FEATURE_COLUMNS subset")
 
 
 async def main() -> int:

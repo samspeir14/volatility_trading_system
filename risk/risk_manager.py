@@ -70,7 +70,7 @@ class RiskManager:
     ) -> list[RiskDecision]:
         # All signals in a cycle are gated against the same snapshot, so
         # earlier approvals must be carried forward here — otherwise a batch
-        # of 15 harvest signals each sees an empty book and the portfolio,
+        # of 15 approved signals each sees an empty book and the portfolio,
         # ticker, and sector caps are only enforced against *yesterday's*
         # positions. (Greeks are not accumulated intra-cycle; the loss-based
         # caps bind far earlier for defined-risk structures.)

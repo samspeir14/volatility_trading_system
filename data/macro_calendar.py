@@ -6,8 +6,8 @@ that dominates the distribution. The single-name earnings filter has no
 analogue for them, so a premium seller holds short gamma straight through the
 release. Scope is deliberately narrow: single-name equities are NOT gated on
 macro dates — the 7-year VRP result was fat unconditionally *including* every
-FOMC/CPI day, and macro releases are exactly the diversifiable ambient vol the
-harvest exists to sell. Correlated-crash exposure across the book is bounded
+FOMC/CPI day, and macro releases are exactly the diversifiable ambient vol a
+premium seller is paid to hold. Correlated-crash exposure across the book is bounded
 by the portfolio wing-risk cap, not by skipping entries.
 
 MAINTAINED BY HAND — extend once a year:

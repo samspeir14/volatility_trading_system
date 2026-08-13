@@ -111,7 +111,6 @@ def _run(rows, *, seed_symbols=None, vix_term_ratio=None, dev=0.0,
         actionable, all_signals = gen.generate(
             scan,
             feature_rows={sym: _feature_row(sym) for sym, _ in rows},
-            returns_by_symbol={},
             top_n=top_n,
             vix_term_ratio=vix_term_ratio,
             daily_gk_vol_by_symbol={sym: _GK_SERIES for sym, _ in rows},
@@ -203,7 +202,6 @@ def test_cost_gate_blocks_thin_edge():
         actionable, all_signals = gen.generate(
             _scan([("X", 0.195)]),
             feature_rows={"X": _feature_row("X")},
-            returns_by_symbol={},
             daily_gk_vol_by_symbol={"X": _GK_SERIES},
         )
         history.close()
@@ -238,7 +236,6 @@ def test_missing_baseline_skips_symbol():
         actionable, all_signals = gen.generate(
             _scan([("NOBASE", 0.30)]),
             feature_rows={"NOBASE": _feature_row("NOBASE", b_t=float("nan"))},
-            returns_by_symbol={},
             daily_gk_vol_by_symbol={"NOBASE": _GK_SERIES},
         )
         history.close()
@@ -260,7 +257,6 @@ def test_model_disagreement_blocks_sell_against_forecast():
         actionable, all_signals = gen.generate(
             _scan([("DECAY", 0.30)]),
             feature_rows={"DECAY": _feature_row("DECAY", b_t=math.log(0.025))},
-            returns_by_symbol={},
             daily_gk_vol_by_symbol={"DECAY": _GK_SERIES},
         )
         history.close()

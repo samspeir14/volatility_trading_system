@@ -25,23 +25,16 @@ class Settings:
     # staying clear of the 200 ceiling.
     rate_limit_per_min: int = 180
     scan_interval_seconds: int = 300
-    expiration_window_days: tuple[int, int] = (14, 45)
     historical_lookback_years: int = 3
     cache_db_path: Path = field(
         default_factory=lambda: PROJECT_ROOT / "data" / "cache" / "market_data.db"
     )
     finnhub_api_key: str | None = None
     earnings_filter_enabled: bool = True
-    earnings_buffer_days: int = 7
     stale_order_threshold_minutes: int = 15
     max_close_retries: int = 3
-    # "h1": the within-stock next-day deviation model (the only trading
-    # strategy — VRP harvest was retired 2026-08). "legacy": the old
-    # multi-horizon (5/10/21) RV models, kept runnable for comparison only.
-    model_pipeline: str = "h1"
     # "standard": the ~$100k calibration the watchlist/risk numbers were tuned
     # on. "small": ~$10k bankroll — cheap-ticker watchlist, retuned risk caps.
-    # Decoupled from any strategy choice.
     account_profile: str = "standard"
     # VRP calibration gate: SELL needs z >= vrp_z_sell, BUY needs
     # z <= -vrp_z_buy (long-vol loss is bounded, so the bar is lower).
@@ -95,9 +88,13 @@ def load_settings() -> Settings:
     earnings_filter_enabled = _parse_bool(
         os.environ.get("EARNINGS_FILTER_ENABLED"), default=True,
     )
-    earnings_buffer_days = _parse_int(
-        os.environ.get("EARNINGS_BUFFER_DAYS"), default=7,
-    )
+    if os.environ.get("EARNINGS_BUFFER_DAYS"):
+        raise ValueError(
+            "EARNINGS_BUFFER_DAYS was removed (2026-08): the earnings entry "
+            "gate now blocks any report inside the position's life "
+            "[today, expiration] — no buffer knob. The exit-side buffer is "
+            "EARNINGS_EXIT_BUFFER_DAYS."
+        )
     stale_order_threshold_minutes = _parse_int(
         os.environ.get("STALE_ORDER_THRESHOLD_MINUTES"), default=15,
     )
@@ -107,13 +104,16 @@ def load_settings() -> Settings:
     if os.environ.get("STRATEGY_MODE"):
         raise ValueError(
             "STRATEGY_MODE was removed (VRP harvest retired 2026-08). "
-            "Use MODEL_PIPELINE=h1|legacy for the model path and "
-            "ACCOUNT_PROFILE=standard|small for risk calibration/watchlist."
+            "Use ACCOUNT_PROFILE=standard|small for risk calibration/watchlist."
         )
+    # The h=1 next-day deviation model is the only pipeline. "h1" is accepted
+    # silently so a box with the old default set still boots.
     model_pipeline = os.environ.get("MODEL_PIPELINE", "h1").strip().lower()
-    if model_pipeline not in ("h1", "legacy"):
+    if model_pipeline != "h1":
         raise ValueError(
-            f"MODEL_PIPELINE must be 'h1' or 'legacy', got {model_pipeline!r}"
+            "MODEL_PIPELINE=legacy was removed (multi-horizon 5/10/21 models "
+            "retired 2026-08; the h=1 pipeline is the only model path). "
+            "Unset MODEL_PIPELINE."
         )
     account_profile = os.environ.get("ACCOUNT_PROFILE", "standard").strip().lower()
     if account_profile not in ("standard", "small"):
@@ -172,10 +172,8 @@ def load_settings() -> Settings:
         env=env,
         finnhub_api_key=finnhub_api_key,
         earnings_filter_enabled=earnings_filter_enabled,
-        earnings_buffer_days=earnings_buffer_days,
         stale_order_threshold_minutes=stale_order_threshold_minutes,
         max_close_retries=max_close_retries,
-        model_pipeline=model_pipeline,
         account_profile=account_profile,
         vrp_z_sell=vrp_z_sell,
         vrp_z_buy=vrp_z_buy,

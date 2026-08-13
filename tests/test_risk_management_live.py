@@ -10,22 +10,16 @@ import time
 from datetime import date, timedelta
 from pathlib import Path
 
-import pandas as pd
-
 from config import load_settings, load_watchlist
 from data import (
     AsyncTradierClient,
     HistoricalStore,
     MarketData,
-    compute_log_returns,
 )
 from execution import OrderLog
 from features import FeaturePipeline
-from model import (
-    BestPredictor,
-    GARCHBaseline,
-    XGBoostVolPredictor,
-)
+from features.target import daily_ohlc_vol
+from main import _load_h1_predictor
 from positions import PositionTracker
 from risk import DailyKillSwitch, PortfolioStateBuilder, RiskManager
 from signals import DivergenceHistory, SignalGenerator
@@ -35,21 +29,6 @@ def _last_weekday(d: date) -> date:
     while d.weekday() >= 5:
         d -= timedelta(days=1)
     return d
-
-
-def _load_predictors(artifact_dir: Path):
-    predictors = {}
-    for h in (5, 10, 21):
-        existing = list(artifact_dir.glob(f"xgb_h{h}_*.joblib"))
-        if not existing:
-            raise RuntimeError(f"no model artifact for h={h}")
-        newest = max(existing, key=lambda p: p.stat().st_mtime)
-        xgb = XGBoostVolPredictor.load(newest)
-        garch = GARCHBaseline(refit_every=21, min_history=100)
-        bp = BestPredictor(garch, xgb, horizon=h)
-        bp.update_from_eval(garch_r2=-0.1, xgb_r2=0.2)
-        predictors[h] = bp
-    return predictors
 
 
 async def main_async() -> int:
@@ -77,10 +56,6 @@ async def main_async() -> int:
                 store, tickers, garch_min_history=100, garch_refit_every=21,
             )
             feature_df = pipeline.build_features(start, end)
-            returns_by_symbol = {
-                sym: compute_log_returns(store.get_bars(sym, start, end)["close"])
-                for sym in symbols
-            }
             feature_rows = {}
             for sym in symbols:
                 try:
@@ -89,12 +64,18 @@ async def main_async() -> int:
                 except KeyError:
                     continue
 
-            predictors = _load_predictors(artifact_dir)
+            gk_vol_by_symbol = {}
+            for sym in symbols:
+                bars = store.get_bars(sym, start, end)
+                if not bars.empty:
+                    gk_vol_by_symbol[sym] = daily_ohlc_vol(bars)
+
+            h1_predictor, phi_by_symbol = _load_h1_predictor(artifact_dir)
 
             async with AsyncTradierClient(settings) as client:
                 md = MarketData(client, tickers)
                 t0 = time.monotonic()
-                scan = await md.scan(expiration_window=(3, 45))
+                scan = await md.scan(expiration_window=(1, 14))
                 scan_elapsed = time.monotonic() - t0
                 print(f"scan: {scan.total_contracts} contracts in {scan_elapsed:.1f}s")
 
@@ -126,14 +107,14 @@ async def main_async() -> int:
                 # Run signal generation
                 div_history = DivergenceHistory(settings.cache_db_path.parent / "divergence_history.db")
                 generator = SignalGenerator(
-                    predictors_by_horizon=predictors,
+                    h1_predictor=h1_predictor,
+                    phi_by_symbol=phi_by_symbol,
                     history_store=div_history,
-                    cross_sectional_z_threshold=1.5,
                     max_divergence=0.25,
                 )
                 actionable, all_signals = generator.generate(
-                    scan=scan, feature_rows=feature_rows,
-                    returns_by_symbol=returns_by_symbol, top_n=10,
+                    scan=scan, feature_rows=feature_rows, top_n=10,
+                    daily_gk_vol_by_symbol=gk_vol_by_symbol,
                 )
                 div_history.close()
                 print(f"\nsignals: {len(all_signals)} total, {len(actionable)} actionable")

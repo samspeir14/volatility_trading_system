@@ -31,17 +31,11 @@ from data import (
     HistoricalStore,
     MacroCalendar,
     MarketData,
-    compute_log_returns,
 )
 from execution import OrderLog, OrderManager
 from features import FeaturePipeline
 from logs import DailySummary, DailySummaryBuilder, post_text, post_to_slack, setup_logging
-from model import (
-    BestPredictor,
-    GARCHBaseline,
-    LightGBMVolPredictor,
-    XGBoostVolPredictor,
-)
+from model import LightGBMVolPredictor
 from positions import ExitManager, PositionReconciler, PositionTracker
 from risk import (
     BarsFreshnessGuard,
@@ -57,18 +51,17 @@ from signals import DivergenceHistory, SignalGenerator
 
 logger = logging.getLogger(__name__)
 
-# Scan only the expirations that can actually produce a trade. The lower bound
-# tracks the entry floor (settings.min_entry_dte, default 1 — the h=1 model's
-# shortest tradeable tenor); anything below it is pulled in by
-# fetch_missing_position_chains for still-open positions. The upper bound
-# stays at 45 even though entries cap at settings.max_entry_dte (default 14):
-# the VRP gap history for the mid/long DTE bands keeps accruing off the scan,
-# so re-widening the entry window later doesn't restart a 60-day warmup.
-SCAN_EXPIRATION_WINDOW_UPPER = 45
-
-
+# Scan only the expirations that can actually produce a trade: the entry DTE
+# window itself. Positions whose expiration has aged below the floor (or that
+# predate a window change) are pulled in by fetch_missing_position_chains, so
+# marks never depend on this window. The ceiling used to sit at 45 "so VRP
+# history keeps accruing for mid/long DTE bands" — that has been false since
+# the entry-window filter landed: _generate_h1 drops every expiration outside
+# the window BEFORE candidates exist, and VRP rows are logged per candidate,
+# so the 15-45 DTE chains were fetched and discarded (~2-3x the option-chain
+# API budget for nothing).
 def _scan_window(settings: Settings) -> tuple[int, int]:
-    return (settings.min_entry_dte, SCAN_EXPIRATION_WINDOW_UPPER)
+    return (settings.min_entry_dte, settings.max_entry_dte)
 
 
 def _parse_clock_timestamp(raw: str | None) -> datetime | None:
@@ -105,7 +98,7 @@ def _within_entry_window(now_utc: datetime) -> bool:
 @dataclass(frozen=True)
 class RiskCalibration:
     """The equity-relative risk knobs plus the few absolute-dollar backstops,
-    bundled so the two harvest profiles stay side-by-side and comparable."""
+    bundled so the two account profiles stay side-by-side and comparable."""
     max_per_trade_loss_pct: float
     max_per_ticker_exposure_pct: float
     max_per_sector_positions: int
@@ -156,7 +149,7 @@ CALIBRATION_STANDARD = RiskCalibration(
     max_contracts_per_trade=10,
 )
 
-# small_harvest: same strategy, ~$10k bankroll, watchlist_small.yaml. Orders
+# small profile: same strategy, ~$10k bankroll, watchlist_small.yaml. Orders
 # are 1-lot, so the per-trade pct is an eligibility gate, not a size: at 2.5%
 # the $250 budget admits the whole cheap watchlist's 1σ condors ($40-$220 max
 # loss) with the pricier names (BAC/SLV/B) fitting at the short-DTE end only.
@@ -302,87 +295,6 @@ def _load_h1_predictor(
             "tests.test_model_retraining to generate them"
         )
     return H1DeviationPredictor(lgbm=lgbm, har=har, route=route), phi_by_symbol
-
-
-def _load_routing_r2(artifact_dir: Path) -> dict[int, dict[str, float]]:
-    """Read per-horizon OOS R² from latest_retrain_r2.json (written by
-    tests/test_model_retraining.py). Falls back to a conservative table that
-    routes to LightGBM at short horizons and treats h=21 as a tie if the JSON
-    is missing or malformed — keeps the bot bootable while a retrain is
-    pending."""
-    fallback = {
-        5:  {"lgbm": 0.25, "xgb": 0.23, "garch": -0.27},
-        10: {"lgbm": 0.33, "xgb": 0.29, "garch": -0.06},
-        21: {"lgbm": 0.23, "xgb": 0.29, "garch":  0.03},
-    }
-    json_path = artifact_dir / "latest_retrain_r2.json"
-    if not json_path.exists():
-        logger.warning(
-            "%s missing; using fallback routing R² (run tests.test_model_retraining to refresh)",
-            json_path.name,
-        )
-        return fallback
-    try:
-        with open(json_path) as f:
-            payload = json.load(f)
-        out: dict[int, dict[str, float]] = {}
-        for h_str, r2s in payload["r2_by_horizon"].items():
-            out[int(h_str)] = {
-                "lgbm": float(r2s["lgbm"]),
-                "xgb": float(r2s["xgb"]),
-                "garch": float(r2s["garch"]),
-            }
-        # Guard against partial files: must contain all 3 horizons.
-        if {5, 10, 21} - set(out.keys()):
-            raise ValueError(f"missing horizons in {json_path.name}: {set(out.keys())}")
-        logger.info(
-            "routing R² loaded from %s (trained_at=%s)",
-            json_path.name, payload.get("trained_at", "unknown"),
-        )
-        return out
-    except Exception as e:
-        logger.error("failed to read %s (%s); using fallback routing R²", json_path.name, e)
-        return fallback
-
-
-def _load_predictors(artifact_dir: Path) -> dict[int, BestPredictor]:
-    """Load the best available predictor per horizon. Priority: LightGBM,
-    then XGBoost, then GARCH-only. The bot keeps running on the previous
-    artifact if a future cron retraining fails."""
-    routing_r2 = _load_routing_r2(artifact_dir)
-    predictors: dict[int, BestPredictor] = {}
-    for h in (5, 10, 21):
-        lgbm_files = list(artifact_dir.glob(f"lgbm_h{h}_*.joblib"))
-        xgb_files = list(artifact_dir.glob(f"xgb_h{h}_*.joblib"))
-
-        lgbm_pred: LightGBMVolPredictor | None = None
-        xgb_pred: XGBoostVolPredictor | None = None
-
-        if lgbm_files:
-            newest = max(lgbm_files, key=lambda p: p.stat().st_mtime)
-            lgbm_pred = LightGBMVolPredictor.load(newest)
-            logger.info("loaded %s for h=%d", newest.name, h)
-        if xgb_files:
-            newest = max(xgb_files, key=lambda p: p.stat().st_mtime)
-            xgb_pred = XGBoostVolPredictor.load(newest)
-            logger.info("loaded %s for h=%d", newest.name, h)
-
-        if lgbm_pred is None and xgb_pred is None:
-            raise RuntimeError(
-                f"no model artifact for h={h}; "
-                f"run `python -m tests.test_model_retraining` to generate one"
-            )
-
-        garch = GARCHBaseline(refit_every=21, min_history=100)
-        bp = BestPredictor(lgbm=lgbm_pred, xgb=xgb_pred, garch=garch, horizon=h)
-        latest_r2 = routing_r2.get(h, {})
-        bp.update_from_eval(
-            lgbm_r2=latest_r2.get("lgbm", float("nan")) if lgbm_pred is not None else float("nan"),
-            xgb_r2=latest_r2.get("xgb", float("nan")) if xgb_pred is not None else float("nan"),
-            garch_r2=latest_r2.get("garch", -0.1),
-        )
-        predictors[h] = bp
-    return predictors
 
 
 class MainLoop:
@@ -574,9 +486,8 @@ class MainLoop:
         exits_closed = 0
         if snapshot.open_marks:
             feature_rows = self._build_feature_rows()
-            returns_by_symbol = self._build_returns_dict()
             exit_decisions = self._exit_manager.evaluate(
-                snapshot.open_marks, scan, feature_rows, returns_by_symbol,
+                snapshot.open_marks, scan, feature_rows,
                 market_close_utc=market_close_utc,
             )
             exit_results = await self._exit_manager.execute(
@@ -591,23 +502,20 @@ class MainLoop:
         submissions_filled = submissions_failed = 0
         if not entry_blocks:
             feature_rows = self._build_feature_rows()
-            returns_by_symbol = self._build_returns_dict()
             # Individually-stale symbols (below the systemic block threshold)
             # are dropped from the ENTRY universe only — their bars are old,
             # so their predictions and spread vetoes would be fiction. Exits
             # above already handled them off live marks.
             for sym in stale_symbols:
-                if sym in feature_rows or sym in returns_by_symbol:
+                if sym in feature_rows:
                     logger.warning(
                         "excluding %s from entries: daily bars stale", sym,
                     )
                 feature_rows.pop(sym, None)
-                returns_by_symbol.pop(sym, None)
             daily_gk_vol = self._build_daily_gk_vol(exclude=stale_symbols)
             actionable, all_signals = self._signal_generator.generate(
                 scan=scan,
                 feature_rows=feature_rows,
-                returns_by_symbol=returns_by_symbol,
                 top_n=10,
                 vix_term_ratio=self._vix_term_structure_ratio(),
                 daily_gk_vol_by_symbol=daily_gk_vol,
@@ -776,7 +684,7 @@ class MainLoop:
         return out
 
     def _vix_term_structure_ratio(self) -> float | None:
-        """Latest cached VIX/VIX3M close ratio for the harvest backwardation
+        """Latest cached VIX/VIX3M close ratio for the SELL-side backwardation
         veto, or None (fail open) when either series is missing/stale. Daily
         closes are enough: backwardation episodes persist for days, and the
         crash day itself is caught by the per-name extreme-spread veto on
@@ -829,19 +737,6 @@ class MainLoop:
                     out[ticker.symbol] = daily_ohlc_vol(bars)
             except Exception as e:
                 logger.warning("could not build gk vol for %s: %s", ticker.symbol, e)
-        return out
-
-    def _build_returns_dict(self) -> dict[str, pd.Series]:
-        end = _last_weekday(date.today())
-        start = end - timedelta(days=730)
-        out = {}
-        for ticker in self._feature_pipeline._watchlist:
-            try:
-                bars = self._store.get_bars(ticker.symbol, start, end)
-                if not bars.empty:
-                    out[ticker.symbol] = compute_log_returns(bars["close"])
-            except Exception as e:
-                logger.warning("could not build returns for %s: %s", ticker.symbol, e)
         return out
 
     def _log_cycle(self, result: CycleResult) -> None:
@@ -949,14 +844,11 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
 
     cal = _calibration(settings)
 
-    # Shared gate wiring for both pipelines.
     common_signal_kwargs = dict(
         history_store=divergence_history,
-        cross_sectional_z_threshold=1.5,
         max_divergence=0.25,
         earnings_calendar=earnings_calendar,
         earnings_filter_enabled=settings.earnings_filter_enabled,
-        earnings_buffer_days=settings.earnings_buffer_days,
         long_straddle_excluded_symbols=etf_symbols,
         min_credit=cal.min_credit,
         min_credit_to_width=cal.min_credit_to_width,
@@ -969,35 +861,22 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
         max_entry_dte=settings.max_entry_dte,
     )
 
-    h1_predictor = None
-    predictors = None
-    if settings.model_pipeline == "h1":
-        h1_predictor, phi_by_symbol = _load_h1_predictor(artifact_dir)
-        signal_generator = SignalGenerator(
-            h1_predictor=h1_predictor,
-            vrp_z_sell=settings.vrp_z_sell,
-            vrp_z_buy=settings.vrp_z_buy,
-            vrp_min_obs=settings.vrp_min_obs,
-            cost_multiple=settings.cost_multiple,
-            max_leg_spread_pct=settings.max_leg_spread_pct,
-            per_contract_fee=settings.per_contract_fee,
-            phi_by_symbol=phi_by_symbol,
-            **common_signal_kwargs,
-        )
-        logger.info(
-            "pipeline: h1 route=%s (profile: %s, %d-name watchlist)",
-            h1_predictor.active_model, settings.account_profile, len(watchlist),
-        )
-    else:
-        predictors = _load_predictors(artifact_dir)
-        signal_generator = SignalGenerator(
-            predictors_by_horizon=predictors,
-            **common_signal_kwargs,
-        )
-        logger.info(
-            "pipeline: legacy multi-horizon (profile: %s, %d-name watchlist)",
-            settings.account_profile, len(watchlist),
-        )
+    h1_predictor, phi_by_symbol = _load_h1_predictor(artifact_dir)
+    signal_generator = SignalGenerator(
+        h1_predictor=h1_predictor,
+        vrp_z_sell=settings.vrp_z_sell,
+        vrp_z_buy=settings.vrp_z_buy,
+        vrp_min_obs=settings.vrp_min_obs,
+        cost_multiple=settings.cost_multiple,
+        max_leg_spread_pct=settings.max_leg_spread_pct,
+        per_contract_fee=settings.per_contract_fee,
+        phi_by_symbol=phi_by_symbol,
+        **common_signal_kwargs,
+    )
+    logger.info(
+        "pipeline: h1 route=%s (profile: %s, %d-name watchlist)",
+        h1_predictor.active_model, settings.account_profile, len(watchlist),
+    )
 
     # The rationale for both parameter sets lives on CALIBRATION_STANDARD /
     # CALIBRATION_SMALL at the top of this module.
@@ -1030,7 +909,6 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
     exit_manager = ExitManager(
         position_tracker=position_tracker,
         order_manager=order_manager,
-        predictors_by_horizon=predictors,
         h1_predictor=h1_predictor,
         earnings_calendar=earnings_calendar,
         earnings_exit_buffer_trading_days=settings.earnings_exit_buffer_trading_days,

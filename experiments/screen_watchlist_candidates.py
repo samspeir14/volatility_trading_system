@@ -1,4 +1,4 @@
-"""Screen watchlist-expansion candidates for harvest mode.
+"""Screen watchlist-expansion candidates for the short-DTE condor/straddle book.
 
 Per candidate: price (batched quote), weekly-expiration availability, and for
 the nearest 5-15 DTE expiration the ATM relative spread / OI / IV, then the

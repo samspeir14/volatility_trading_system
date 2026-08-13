@@ -76,7 +76,6 @@ def _exit_mgr() -> ExitManager:
     return ExitManager(
         position_tracker=mock.MagicMock(),
         order_manager=mock.MagicMock(),
-        predictors_by_horizon={5: mock.MagicMock(), 10: mock.MagicMock(), 21: mock.MagicMock()},
     )
 
 
@@ -156,7 +155,7 @@ def test_expiration_proximity_skipped_for_iron_condor():
 # ---------- assignment risk ----------
 
 def _mk_otm_condor_position(*, entry_credit=2.10) -> OpenPosition:
-    """A true condor (OTM shorts), unlike the harvest fly whose shorts sit ATM.
+    """A true condor (OTM shorts), unlike the ATM-body condor whose shorts sit ATM.
     Exercises the near-money buffer as a real decision, not a tautology."""
     legs = [
         TradeLeg(220.0, "call", "sell", 1, "NVDA260522C00220000"),
@@ -189,7 +188,7 @@ def test_assignment_risk_near_money_short_at_dte1():
     """Rule (b): dte=1 closes when a short leg is in/near the money, holds when
     both shorts are comfortably OTM."""
     mgr = _exit_mgr()
-    # Harvest fly: shorts at 210, spot pinned there → close.
+    # ATM-body condor: shorts at 210, spot pinned there → close.
     fly = _mk_iron_condor_position()
     mark = _mark(fly, pnl_dollars=0.0, dte=1, underlying_price=210.5)
     trigger, _ = mgr._evaluate_one(mark, today=TODAY, current_divergence=-0.08)
@@ -340,19 +339,6 @@ def test_short_dated_condor_entry_skips_near_money_close():
     print("short-dated condor: rides at dte=1, expiry-morning backstop + aged close intact ✓")
 
 
-def test_min_dte_strictly_greater_than_expiration_proximity_dte():
-    """Trade window must leave a buffer between open and forced close.
-    Otherwise h=5 trades open at MIN_DTE and immediately exit on the next
-    scan via expiration_proximity (the bug this guards against)."""
-    from signals.signal_generator import MIN_DTE
-    mgr = _exit_mgr()
-    assert MIN_DTE > mgr._exp_dte, (
-        f"MIN_DTE ({MIN_DTE}) must be > expiration_proximity_dte "
-        f"({mgr._exp_dte}) so opened trades aren't immediately exit-eligible"
-    )
-    print(f"min_dte_invariant: MIN_DTE={MIN_DTE} > exp_dte={mgr._exp_dte} ✓")
-
-
 # ---------- thesis reversal ----------
 
 def test_thesis_reversal_fires_when_sign_flips_and_magnitude_clears():
@@ -376,7 +362,6 @@ def test_thesis_exit_can_be_disabled():
     mgr = ExitManager(
         position_tracker=mock.MagicMock(),
         order_manager=mock.MagicMock(),
-        predictors_by_horizon={5: mock.MagicMock(), 10: mock.MagicMock(), 21: mock.MagicMock()},
         thesis_exit_enabled=False,
     )
     pos = _mk_iron_condor_position(entry_credit=13.55)
@@ -489,7 +474,6 @@ def main() -> int:
     test_assignment_risk_not_for_long_straddle()
     test_stop_loss_overrides_assignment_risk()
     test_entry_floor_clears_assignment_close_window()
-    test_min_dte_strictly_greater_than_expiration_proximity_dte()
     test_thesis_reversal_fires_when_sign_flips_and_magnitude_clears()
     test_thesis_overrides_stop_loss()
     test_thesis_overrides_profit_target()

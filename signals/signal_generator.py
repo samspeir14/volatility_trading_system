@@ -4,7 +4,7 @@ import logging
 import math
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date
 
 import numpy as np
 import pandas as pd
@@ -14,7 +14,6 @@ from data.earnings_calendar import EarningsCalendar
 from data.macro_calendar import MacroCalendar
 from data.market_data import ScanResult
 from features.target import GK_EPS
-from model.best_predictor import BestPredictor
 from model.h1_predictor import H1DeviationPredictor
 from model.term_structure import project_term_vol
 from signals.cost_gate import evaluate_cost_gate
@@ -23,10 +22,6 @@ from signals.divergence_history import DivergenceHistory
 logger = logging.getLogger(__name__)
 
 
-# Legacy-only (MODEL_PIPELINE=legacy): the multi-horizon models the h=1
-# pipeline replaced. interpolate_horizon / blend_prediction below serve only
-# that path.
-TRAINED_HORIZONS: tuple[int, ...] = (5, 10, 21)
 TRADING_DAYS_PER_YEAR = 252
 # Quoted (Black-Scholes) IV annualizes over calendar time, so horizon scaling
 # with a CALENDAR dte must divide by 365. Mixing calendar dte with 252
@@ -34,8 +29,6 @@ TRADING_DAYS_PER_YEAR = 252
 # projection (model.term_structure) converts calendar DTE to trading days
 # internally for the same reason.
 CALENDAR_DAYS_PER_YEAR = 365
-MIN_DTE = 4
-MAX_DTE = 45
 
 # Entry DTE window for NEW positions, [MIN_ENTRY_DTE, MAX_ENTRY_DTE] inclusive.
 # Entry-side only; neither bound gates horizon mapping or exits for existing
@@ -82,6 +75,8 @@ class TradeSignal:
     symbol: str
     expiration: date
     dte: int
+    # Vestigial columns from the retired multi-horizon pipeline, kept so the
+    # divergence/order SQLite schemas need no migration. h=1 writes (1, 1, 1.0).
     horizon_lower: int
     horizon_upper: int
     weight_lower: float
@@ -96,47 +91,11 @@ class TradeSignal:
     legs: list[TradeLeg]
     is_actionable: bool
     diagnostic_notes: str = ""
-    # h=1 gate fields (None on legacy-pipeline signals)
+    # h=1 gate fields
     vrp_z: float | None = None
     expected_edge_usd: float | None = None
     total_cost_usd: float | None = None
     blocked_by: str | None = None   # gate name; None/"" = cleared all gates
-
-    @property
-    def is_interpolated(self) -> bool:
-        return self.horizon_lower != self.horizon_upper
-
-
-def interpolate_horizon(dte: int) -> tuple[int, int, float] | None:
-    """LEGACY PIPELINE ONLY: map DTE to (horizon_lower, horizon_upper,
-    weight_lower) over the (5, 10, 21) model grid. The h=1 path projects a
-    single next-day forecast along the GARCH persistence term structure
-    instead. Returns None if DTE is outside [MIN_DTE, MAX_DTE]."""
-    if dte < MIN_DTE or dte > MAX_DTE:
-        return None
-    if dte <= 5:
-        return (5, 5, 1.0)
-    if dte == 10:
-        return (10, 10, 1.0)
-    if dte >= 21:
-        return (21, 21, 1.0)
-    if dte < 10:  # 6-9: between 5 and 10
-        weight_lower = (10 - dte) / 5.0
-        return (5, 10, weight_lower)
-    # 11-20: between 10 and 21
-    weight_lower = (21 - dte) / 11.0
-    return (10, 21, weight_lower)
-
-
-def blend_prediction(
-    preds_by_horizon: dict[int, float],
-    horizon_lower: int,
-    horizon_upper: int,
-    weight_lower: float,
-) -> float:
-    if horizon_lower == horizon_upper:
-        return preds_by_horizon[horizon_lower]
-    return weight_lower * preds_by_horizon[horizon_lower] + (1.0 - weight_lower) * preds_by_horizon[horizon_upper]
 
 
 def find_atm_iv(
@@ -247,16 +206,13 @@ class SignalGenerator:
     def __init__(
         self,
         h1_predictor: H1DeviationPredictor | None = None,
-        predictors_by_horizon: dict[int, BestPredictor] | None = None,
         history_store: DivergenceHistory | None = None,
         min_volume: int = 10,
         min_open_interest: int = 50,
         max_relative_spread: float = 0.10,
-        cross_sectional_z_threshold: float = 1.5,
         max_divergence: float = 0.25,
         earnings_calendar: EarningsCalendar | None = None,
         earnings_filter_enabled: bool = True,
-        earnings_buffer_days: int = 7,
         long_straddle_excluded_symbols: frozenset[str] | set[str] | None = None,
         min_credit: float = 0.0,
         min_credit_to_width: float = 0.0,
@@ -280,23 +236,13 @@ class SignalGenerator:
             )
         self._min_entry_dte = min_entry_dte
         self._max_entry_dte = max_entry_dte
-        # Exactly one prediction source: the h=1 deviation predictor (active
-        # pipeline) or the legacy multi-horizon BestPredictors.
-        if (h1_predictor is None) == (predictors_by_horizon is None):
-            raise ValueError(
-                "provide exactly one of h1_predictor / predictors_by_horizon"
-            )
-        if predictors_by_horizon is not None:
-            for h in TRAINED_HORIZONS:
-                if h not in predictors_by_horizon:
-                    raise ValueError(f"missing predictor for horizon {h}")
+        if h1_predictor is None:
+            raise ValueError("h1_predictor is required")
         self._h1 = h1_predictor
-        self._predictors = predictors_by_horizon
         self._history = history_store
         self._min_volume = min_volume
         self._min_oi = min_open_interest
         self._max_rel_spread = max_relative_spread
-        self._z_threshold = cross_sectional_z_threshold
         # Divergences above this absolute magnitude are almost certainly event-driven
         # (earnings, FDA, FOMC, product launch) — the model can't distinguish event
         # premium from vol mispricing. Hard block on SELL (unbounded loss if the
@@ -304,7 +250,6 @@ class SignalGenerator:
         self._max_divergence = max_divergence
         self._earnings = earnings_calendar
         self._earnings_filter_enabled = earnings_filter_enabled
-        self._earnings_buffer_days = earnings_buffer_days
         # Symbols barred from the long-straddle (BUY) side. Index ETFs (SPY/QQQ)
         # carry a structural variance-risk premium — realized vol sits below
         # implied, so buying their premium bleeds. They stay eligible for the
@@ -325,7 +270,7 @@ class SignalGenerator:
         self._min_credit_to_width = min_credit_to_width
         # Macro-event filter: for rate/index-linked symbols (TLT, SLV, index
         # ETFs) an FOMC decision or CPI print IS their earnings — demote when
-        # one falls inside the entry window.
+        # one falls inside the position's life.
         self._macro = macro_calendar
         self._macro_sensitive = frozenset(macro_sensitive_symbols or ())
         # Mode-agnostic SELL guard: VIX at or above VIX3M (term-structure
@@ -353,7 +298,6 @@ class SignalGenerator:
         self,
         scan: ScanResult,
         feature_rows: dict[str, pd.DataFrame],
-        returns_by_symbol: dict[str, pd.Series],
         top_n: int = 10,
         vix_term_ratio: float | None = None,
         daily_gk_vol_by_symbol: dict[str, pd.Series] | None = None,
@@ -361,15 +305,11 @@ class SignalGenerator:
         """Returns (actionable_top_n, all_signals). vix_term_ratio is the
         latest VIX/VIX3M close ratio (None = unavailable, fails open); at or
         above vix_backwardation_threshold every SELL is demoted.
-        daily_gk_vol_by_symbol (h=1 pipeline) carries each symbol's
-        single-day GK vol series for the tenor-matched VRP gap."""
-        if self._h1 is not None:
-            return self._generate_h1(
-                scan, feature_rows, top_n, vix_term_ratio,
-                daily_gk_vol_by_symbol or {},
-            )
-        return self._generate_legacy(
-            scan, feature_rows, returns_by_symbol, top_n, vix_term_ratio,
+        daily_gk_vol_by_symbol carries each symbol's single-day GK vol series
+        for the tenor-matched VRP gap."""
+        return self._generate_h1(
+            scan, feature_rows, top_n, vix_term_ratio,
+            daily_gk_vol_by_symbol or {},
         )
 
     # ------------------------------------------------------------- h=1 path
@@ -436,8 +376,8 @@ class SignalGenerator:
             for expiration, chain in chains_by_exp.items():
                 dte = (expiration - today).days
                 # Entry DTE window (see MIN_ENTRY_DTE/MAX_ENTRY_DTE above).
-                # MAX_DTE stays as the horizon-mapping ceiling. Skip silently.
-                if not self._min_entry_dte <= dte <= min(self._max_entry_dte, MAX_DTE):
+                # Skip silently.
+                if not self._min_entry_dte <= dte <= self._max_entry_dte:
                     continue
 
                 forecast_d = project_term_vol(b_t, dev_hat, phi, dte)
@@ -613,10 +553,13 @@ class SignalGenerator:
                 ))
                 continue
 
-            # Gate 6 — earnings entry block (fixed 7-day buffer; the
-            # earnings_risk EXIT closes short vol before any report that
-            # lands later in the position's life).
-            earnings_demote = self._check_earnings(c.symbol, today)
+            # Gate 6 — earnings entry block over the position's whole life
+            # ([today, expiration]): short DTE means the report either falls
+            # inside the life (block — it's an event trade, not a vol trade)
+            # or after expiry (pass — the position never sees it). The
+            # fail-closed earnings EXIT stays as the backstop for date drift
+            # after entry.
+            earnings_demote = self._check_earnings(c.symbol, today, c.expiration)
             if earnings_demote is not None:
                 _earnings_date, note = earnings_demote
                 all_signals.append(_signal(
@@ -624,8 +567,9 @@ class SignalGenerator:
                 ))
                 continue
 
-            # Gate 7 — macro events for rate/index-linked names.
-            macro_note = self._check_macro(c.symbol, today)
+            # Gate 7 — macro events for rate/index-linked names, same
+            # life-of-position window.
+            macro_note = self._check_macro(c.symbol, today, c.expiration)
             if macro_note is not None:
                 all_signals.append(_signal(
                     direction, blocked_by="macro", notes=macro_note,
@@ -696,213 +640,22 @@ class SignalGenerator:
                 deduped.append(s)
         return deduped[:top_n], all_signals
 
-    # ---------------------------------------------------------- legacy path
-
-    def _generate_legacy(
-        self,
-        scan: ScanResult,
-        feature_rows: dict[str, pd.DataFrame],
-        returns_by_symbol: dict[str, pd.Series],
-        top_n: int,
-        vix_term_ratio: float | None,
-    ) -> tuple[list[TradeSignal], list[TradeSignal]]:
-        """MODEL_PIPELINE=legacy: the multi-horizon divergence flow (z-gated,
-        both directions), kept runnable for comparison. Harvest mode is gone;
-        the VIX backwardation veto now guards SELLs here too."""
-        today = scan.fetched_at.date()
-
-        preds: dict[str, dict[int, float]] = {}
-        for symbol in scan.snapshots:
-            if symbol not in feature_rows or symbol not in returns_by_symbol:
-                continue
-            preds[symbol] = {}
-            for h, predictor in self._predictors.items():
-                try:
-                    p = predictor.predict_forward_rv(
-                        returns_history=returns_by_symbol[symbol],
-                        X_row=feature_rows[symbol],
-                    )
-                    preds[symbol][h] = float(p)
-                except Exception as e:
-                    logger.warning("prediction failed for %s @ h=%d: %s", symbol, h, e)
-                    preds[symbol][h] = float("nan")
-
-        candidates: list[_Candidate] = []
-        for symbol, snap in scan.snapshots.items():
-            if symbol not in preds:
-                continue
-            try:
-                underlying_price = float(snap.underlying.get("last") or 0.0)
-            except (TypeError, ValueError):
-                underlying_price = 0.0
-            if underlying_price <= 0:
-                continue
-
-            chains_by_exp: dict[date, list[OptionContract]] = defaultdict(list)
-            for c in snap.contracts:
-                chains_by_exp[c.expiration].append(c)
-
-            for expiration, chain in chains_by_exp.items():
-                dte = (expiration - today).days
-                # Same entry window as the h1 path; DTEs below MIN_DTE are
-                # additionally dropped by interpolate_horizon (the legacy
-                # models have no horizon short enough to price them).
-                if not self._min_entry_dte <= dte <= min(self._max_entry_dte, MAX_DTE):
-                    continue
-                horizon_pair = interpolate_horizon(dte)
-                if horizon_pair is None:
-                    continue
-                h_lo, h_up, w_lo = horizon_pair
-                if any(math.isnan(preds[symbol].get(h, float("nan"))) for h in (h_lo, h_up)):
-                    continue
-
-                pred_rv_daily = blend_prediction(preds[symbol], h_lo, h_up, w_lo)
-                predicted_iv_eq = pred_rv_daily * math.sqrt(TRADING_DAYS_PER_YEAR)
-
-                atm_pair = find_atm_iv(chain, underlying_price)
-                if atm_pair is None:
-                    continue
-                atm_call, atm_put = atm_pair
-                ivs = [iv for iv in (atm_call.iv, atm_put.iv) if iv > 0]
-                if not ivs:
-                    continue
-                atm_iv = sum(ivs) / len(ivs)
-
-                candidates.append(_Candidate(
-                    symbol=symbol,
-                    expiration=expiration,
-                    dte=dte,
-                    horizon_lower=h_lo,
-                    horizon_upper=h_up,
-                    weight_lower=w_lo,
-                    underlying_price=underlying_price,
-                    atm_call=atm_call,
-                    atm_put=atm_put,
-                    chain=chain,
-                    predicted_iv_equivalent=predicted_iv_eq,
-                    atm_iv=atm_iv,
-                    divergence=predicted_iv_eq - atm_iv,
-                ))
-
-        buckets: dict[tuple[int, int], list[_Candidate]] = defaultdict(list)
-        for c in candidates:
-            buckets[(c.horizon_lower, c.horizon_upper)].append(c)
-        z_by_id: dict[int, float] = {}
-        for _bucket, members in buckets.items():
-            divs = np.array([m.divergence for m in members])
-            mean = divs.mean()
-            std = divs.std(ddof=0)
-            for m in members:
-                z = (m.divergence - mean) / std if std > 0 else 0.0
-                z_by_id[id(m)] = float(z)
-
-        all_signals: list[TradeSignal] = []
-        for c in candidates:
-            cs_z = z_by_id[id(c)]
-            ts_z: float | None = None
-            if self._history is not None:
-                ts_z = self._history.time_series_z_score(
-                    c.symbol, c.horizon_lower, c.horizon_upper, c.divergence,
-                )
-
-            direction = "BUY" if c.divergence > 0 else "SELL"
-
-            def _demoted(note: str, blocked_by: str) -> TradeSignal:
-                return TradeSignal(
-                    symbol=c.symbol, expiration=c.expiration, dte=c.dte,
-                    horizon_lower=c.horizon_lower, horizon_upper=c.horizon_upper,
-                    weight_lower=c.weight_lower, direction=direction,
-                    underlying_price=c.underlying_price, atm_iv=c.atm_iv,
-                    predicted_iv_equivalent=c.predicted_iv_equivalent,
-                    divergence=c.divergence, cross_sectional_z=cs_z,
-                    time_series_z=ts_z, liquidity_score=0.0, legs=[],
-                    is_actionable=False, diagnostic_notes=note,
-                    blocked_by=blocked_by,
-                )
-
-            if (direction == "SELL" and vix_term_ratio is not None
-                    and vix_term_ratio >= self._vix_backwardation):
-                all_signals.append(_demoted(
-                    f"vix-term-structure veto: VIX/VIX3M={vix_term_ratio:.3f} "
-                    f">= {self._vix_backwardation} (backwardation — crash regime)",
-                    "vix_backwardation",
-                ))
-                continue
-
-            if direction == "BUY" and c.symbol in self._no_long_straddle:
-                all_signals.append(_demoted(
-                    f"long-straddle excluded for {c.symbol} "
-                    f"(index ETF / variance-risk premium)",
-                    "long_straddle_excluded",
-                ))
-                continue
-
-            if abs(c.divergence) > self._max_divergence:
-                all_signals.append(_demoted(
-                    f"event-suspect: |divergence|={abs(c.divergence):.3f} "
-                    f"> cap {self._max_divergence}",
-                    "divergence_cap",
-                ))
-                continue
-
-            earnings_demote = self._check_earnings(c.symbol, today)
-            if earnings_demote is not None:
-                _earnings_date, note = earnings_demote
-                all_signals.append(_demoted(note, "earnings"))
-                continue
-
-            macro_note = self._check_macro(c.symbol, today)
-            if macro_note is not None:
-                all_signals.append(_demoted(macro_note, "macro"))
-                continue
-
-            if abs(cs_z) < self._z_threshold:
-                all_signals.append(_demoted(
-                    f"|z|={abs(cs_z):.2f} below threshold {self._z_threshold}",
-                    "cross_sectional_z",
-                ))
-                continue
-
-            legs, notes = self._build_legs(c, direction)
-            actionable = bool(legs) and not notes
-            liquidity = composite_liquidity(c.atm_call, c.atm_put) if c.atm_call and c.atm_put else 0.0
-
-            all_signals.append(TradeSignal(
-                symbol=c.symbol, expiration=c.expiration, dte=c.dte,
-                horizon_lower=c.horizon_lower, horizon_upper=c.horizon_upper,
-                weight_lower=c.weight_lower, direction=direction,
-                underlying_price=c.underlying_price, atm_iv=c.atm_iv,
-                predicted_iv_equivalent=c.predicted_iv_equivalent,
-                divergence=c.divergence, cross_sectional_z=cs_z,
-                time_series_z=ts_z, liquidity_score=liquidity, legs=legs,
-                is_actionable=actionable, diagnostic_notes=notes,
-                blocked_by=None if actionable else "legs",
-            ))
-
-        if self._history is not None and all_signals:
-            self._history.log_signals(all_signals, today)
-
-        actionable = [s for s in all_signals if s.is_actionable]
-        actionable.sort(key=lambda s: (-abs(s.cross_sectional_z), -s.liquidity_score))
-        return actionable[:top_n], all_signals
-
     # -------------------------------------------------------------- filters
 
     def _check_earnings(
-        self, symbol: str, today: date, window_end: date | None = None
+        self, symbol: str, today: date, expiration: date
     ) -> tuple[date, str] | None:
-        """Return (earnings_date, diagnostic_note) if the signal should be demoted
-        for earnings risk, None if it should pass. The window runs from today to
-        the fixed buffer (or `window_end` if later). Fails open: missing
-        calendar, no API key, or no data for the symbol all return None — the
-        earnings_risk EXIT (which fails closed via the stored date) is the
-        backstop for positions."""
+        """Return (earnings_date, diagnostic_note) if the signal should be
+        demoted for earnings risk, None if it should pass. The window is the
+        position's whole life, [today, expiration] inclusive: a report inside
+        it means the position carries event premium the model can't price (a
+        report the day AFTER expiry is fine — the position no longer exists).
+        Fails open: missing calendar, no API key, or no data for the symbol
+        all return None — the earnings_risk EXIT (which fails closed via the
+        stored date) is the backstop for positions."""
         if not self._earnings_filter_enabled or self._earnings is None:
             return None
-        end = today + timedelta(days=self._earnings_buffer_days)
-        if window_end is not None and window_end > end:
-            end = window_end
-        result = self._earnings.has_earnings_in_window(symbol, today, end)
+        result = self._earnings.has_earnings_in_window(symbol, today, expiration)
         if result is None:
             # No information — fail open. The calendar logs a single WARNING on
             # refresh failure; no need to spam per signal.
@@ -914,29 +667,28 @@ class SignalGenerator:
             return None
         return (
             earnings_date,
-            f"earnings_within_window: {symbol} reports {earnings_date.isoformat()} "
-            f"on/before window end {end.isoformat()}",
+            f"earnings_within_position_life: {symbol} reports "
+            f"{earnings_date.isoformat()} on/before expiration "
+            f"{expiration.isoformat()}",
         )
 
     def _check_macro(
-        self, symbol: str, today: date, window_end: date | None = None,
+        self, symbol: str, today: date, expiration: date,
     ) -> str | None:
         """Diagnostic note if a scheduled macro event (FOMC/CPI) falls inside
-        the window and `symbol` is macro-sensitive, None otherwise. Window
-        matches _check_earnings. Fails open when no calendar is wired or the
-        hand-maintained table has aged out."""
+        the position's life ([today, expiration], matching _check_earnings)
+        and `symbol` is macro-sensitive, None otherwise. Fails open when no
+        calendar is wired or the hand-maintained table has aged out."""
         if self._macro is None or symbol not in self._macro_sensitive:
             return None
-        end = today + timedelta(days=self._earnings_buffer_days)
-        if window_end is not None and window_end > end:
-            end = window_end
-        event = self._macro.next_event_in_window(today, end)
+        event = self._macro.next_event_in_window(today, expiration)
         if event is None:
             return None
         event_date, label = event
         return (
-            f"macro_event_within_window: {label} on {event_date.isoformat()} "
-            f"inside window ending {end.isoformat()} ({symbol} is rate/index-linked)"
+            f"macro_event_within_position_life: {label} on "
+            f"{event_date.isoformat()} on/before expiration "
+            f"{expiration.isoformat()} ({symbol} is rate/index-linked)"
         )
 
     def _build_legs(self, c: _Candidate, direction: str) -> tuple[list[TradeLeg], str]:

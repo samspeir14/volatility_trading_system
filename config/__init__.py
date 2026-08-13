@@ -6,7 +6,7 @@ import yaml
 from config.settings import Settings, load_settings
 
 WATCHLIST_PATH = Path(__file__).parent / "watchlist.yaml"
-# Cheap-ticker universe for the small_harvest profile: names priced so a
+# Cheap-ticker universe for the small account profile: names priced so a
 # 1-sigma-wing condor's max loss fits a ~$10k account's per-trade budget.
 SMALL_WATCHLIST_PATH = Path(__file__).parent / "watchlist_small.yaml"
 

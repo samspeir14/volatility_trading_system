@@ -11,18 +11,10 @@ from data.earnings_calendar import EarningsCalendar
 from data.market_data import ScanResult
 from execution.order_log import OrderLog
 from execution.order_manager import OrderManager, OrderResult
-from features import FeaturePipeline
-from model.best_predictor import BestPredictor
 from model.h1_predictor import H1DeviationPredictor
 from model.term_structure import project_term_vol
 from positions.position_tracker import OpenPosition, PositionMark, PositionTracker
-from signals.signal_generator import (
-    DEFAULT_PHI,
-    TRADING_DAYS_PER_YEAR,
-    blend_prediction,
-    find_atm_iv,
-    interpolate_horizon,
-)
+from signals.signal_generator import DEFAULT_PHI, find_atm_iv
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +95,6 @@ class ExitManager:
         self,
         position_tracker: PositionTracker,
         order_manager: OrderManager,
-        predictors_by_horizon: dict[int, BestPredictor] | None = None,
         h1_predictor: H1DeviationPredictor | None = None,
         straddle_profit_target_pct: float = 1.00,
         straddle_stop_loss_pct: float = -0.50,
@@ -122,10 +113,8 @@ class ExitManager:
     ):
         self._tracker = position_tracker
         self._order_manager = order_manager
-        # Divergence source: h=1 term-projected forecast (active pipeline) or
-        # the legacy multi-horizon predictors. Either may be None; divergence
-        # then reports None and the thesis exit simply never fires.
-        self._predictors = predictors_by_horizon
+        # Divergence source: the h=1 term-projected forecast. May be None;
+        # divergence then reports None and the thesis exit simply never fires.
         self._h1 = h1_predictor
         self._straddle_pt = straddle_profit_target_pct
         self._straddle_sl = straddle_stop_loss_pct
@@ -160,9 +149,9 @@ class ExitManager:
         #       extrinsic <= short_extrinsic_floor makes early exercise
         #       rational for the counterparty (dividend capture on calls,
         #       cost-of-carry on puts).
-        # Note the harvest structure's shorts sit at the entry ATM strike, so
+        # Note the ATM-body condor's shorts sit at the entry ATM strike, so
         # near expiry one of them is almost always in the money: in practice
-        # (b) closes harvest positions at dte = short_close_dte, one day
+        # (b) closes such positions at dte = short_close_dte, one day
         # earlier than the ride-to-expiry backtest assumed. That is the
         # intended trade: the last day of theta is not worth carrying
         # assignment risk the bot cannot manage after its final cycle.
@@ -175,14 +164,13 @@ class ExitManager:
         marks: list[PositionMark],
         scan: ScanResult,
         feature_rows: dict[str, pd.DataFrame],
-        returns_by_symbol: dict[str, pd.Series],
         market_close_utc: datetime | None = None,
     ) -> list[ExitDecision]:
         today = scan.fetched_at.date()
         decisions: list[ExitDecision] = []
         for mark in marks:
             current_div = self._compute_current_divergence(
-                mark, scan, feature_rows, returns_by_symbol,
+                mark, scan, feature_rows,
             )
             trigger, rationale = self._evaluate_one(
                 mark, current_div, today, market_close_utc=market_close_utc,
@@ -202,7 +190,6 @@ class ExitManager:
         mark: PositionMark,
         scan: ScanResult,
         feature_rows: dict[str, pd.DataFrame],
-        returns_by_symbol: dict[str, pd.Series],
     ) -> float | None:
         pos = mark.position
         snap = scan.snapshots.get(pos.symbol)
@@ -253,30 +240,7 @@ class ExitManager:
             forecast = project_term_vol(b_t, dev_hat, phi, max(1, mark.dte))
             return forecast - current_atm_iv
 
-        # Legacy pipeline: re-derive horizon mix from CURRENT DTE.
-        if self._predictors is None or pos.symbol not in returns_by_symbol:
-            return None
-        horizon_pair = interpolate_horizon(mark.dte)
-        if horizon_pair is None:
-            return None
-        h_lo, h_up, w_lo = horizon_pair
-
-        preds: dict[int, float] = {}
-        for h in (h_lo, h_up):
-            if h not in self._predictors:
-                return None
-            try:
-                preds[h] = float(self._predictors[h].predict_forward_rv(
-                    returns_history=returns_by_symbol[pos.symbol],
-                    X_row=feature_rows[pos.symbol],
-                ))
-            except Exception as e:
-                logger.warning("prediction failed for %s @ h=%d: %s", pos.symbol, h, e)
-                return None
-
-        pred_rv_daily = blend_prediction(preds, h_lo, h_up, w_lo)
-        predicted_iv_eq = pred_rv_daily * math.sqrt(TRADING_DAYS_PER_YEAR)
-        return predicted_iv_eq - current_atm_iv
+        return None
 
     def _evaluate_one(
         self,
@@ -501,7 +465,7 @@ class ExitManager:
                     )
 
         # (b) Close window: dte <= short_close_dte with a short leg in or near
-        # the money. Missing underlying fails SAFE — for the harvest structure
+        # the money. Missing underlying fails SAFE — for the ATM-body condor
         # a short leg is nearly always near the money here, so closing blind
         # is almost always what the check would have decided anyway.
         # Scoped by ENTRY dte: a condor deliberately opened at
