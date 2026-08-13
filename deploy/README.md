@@ -59,7 +59,7 @@ When stopped, open positions persist in the Tradier sandbox. Restart picks up wh
 
 ## 6. Weekly model retraining (cron)
 
-Retrain the h=1 within-stock deviation model every Sunday at 3am UTC: pooled LightGBM (top-20 features) + the HAR-RV benchmark, scored against GARCH/EWMA/persistence baselines on identical walk-forward OOS rows. The job applies the **acceptance gate** (LightGBM must beat HAR on out-of-sample QLIKE, else `route=har`), writes `lgbm_h1_<date>.joblib` + `har_h1_<date>.joblib` + `h1_oos_predictions.parquet` + a schema-v2 `latest_retrain_r2.json` (previous JSON kept as `.bak`), then restarts the bot so the routing takes effect. With `MODEL_PIPELINE=legacy` the old multi-horizon (5/10/21) retrain runs instead.
+Retrain the h=1 within-stock deviation model every Sunday at 3am UTC: pooled LightGBM (top-20 features) + the HAR-RV benchmark, scored against GARCH/EWMA/persistence baselines on identical walk-forward OOS rows. The job applies the **acceptance gate** (LightGBM must beat HAR on out-of-sample QLIKE, else `route=har`), writes `lgbm_h1_<date>.joblib` + `har_h1_<date>.joblib` + `h1_oos_predictions.parquet` + a schema-v2 `latest_retrain_r2.json` (previous JSON kept as `.bak`), then restarts the bot so the routing takes effect.
 
 ### 6a. NOPASSWD sudoers entry for the restart
 
@@ -80,10 +80,10 @@ sudo visudo -c -f /etc/sudoers.d/options-trader-restart   # validate before sudo
 
 ```bash
 sudo tee /etc/cron.d/options-trader-retrain >/dev/null <<'EOF'
-# Weekly model retraining: tunes LightGBM (primary) and XGBoost (fallback)
-# across all 3 horizons, writes new artifacts + latest_retrain_r2.json, then
-# restarts the bot so the new R² values drive routing immediately. The &&
-# chain means the restart only fires if the retrain succeeded.
+# Weekly h=1 retrain: tunes the pooled LightGBM, refits the HAR-RV benchmark,
+# applies the QLIKE acceptance gate, writes new artifacts +
+# latest_retrain_r2.json, then restarts the bot so the routing takes effect.
+# The && chain means the restart only fires if the retrain succeeded.
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 RUN_SLOW_TESTS=1
@@ -102,14 +102,14 @@ The `&&` between retraining and restart is load-bearing: if the retrain crashes 
 
 A nightly cron (`scripts/reconcile_h1_metrics.py`, e.g. `30 3 * * 2-6`) recomputes every reported h=1 metric from the stored `h1_oos_predictions.parquet` and alerts to Slack if any drifts from the JSON by more than 1e-6 — the routing decision can't silently detach from the predictions it was based on.
 
-The JSON also carries a `diagnostics_by_horizon` block (informational only — routing ignores it): per-model **within-ticker R²** (per-symbol vol levels stripped out, so it scores timing skill rather than "TSLA is more volatile than KO") and **R² vs a lagged-RV random walk** ("next h days = last h days" — positive means the model beats naive persistence, which is the minimum bar for beating implied vol). Pooled `r2_by_horizon` will read higher than both; that gap is cross-sectional level credit, not tradeable skill.
+The JSON's `h1` block carries per-model **pooled**, **within-ticker**, and **ticker-median deviation R²** plus **level QLIKE** (the acceptance-gate metric). Within-ticker is the one that matters: it strips per-symbol vol levels, so it scores timing skill rather than "TSLA is more volatile than KO". Pooled will read higher; that gap is cross-sectional level credit, not tradeable skill.
 
-## 6d. Pipeline and account profile
+## 6d. The strategy and the account profile
 
-Harvest mode was retired 2026-08 — the bot trades only its volatility predictions. Two `.env` knobs replace `STRATEGY_MODE` (which now raises a clear startup error if still set; restart to apply):
+The h=1 within-stock deviation model is the only pipeline (VRP harvest retired 2026-08; the legacy multi-horizon 5/10/21 path deleted 2026-08 — `STRATEGY_MODE` and `MODEL_PIPELINE=legacy` both raise a clear startup error if still set; restart to apply).
 
-- `MODEL_PIPELINE` — `h1` (default): the within-stock next-day deviation model. Forecast = 63-day log-GK-vol baseline + predicted deviation, term-projected along each ticker's GARCH persistence to the option's DTE, compared to that expiration's ATM IV. Entry gate ladder (each block is labeled in the signal log and tallied in the daily Gates report): **VRP calibration gate** (per-ticker rolling 252-day history of g = log(IV) − log(tenor-matched realized vol); SELL needs z ≥ +1.5, BUY needs z ≤ −1.25, tickers with <120 gap days emit nothing), **VIX term-structure veto** on every SELL (VIX ≥ VIX3M = crash regime), **0.25 divergence cap** (hard block on SELL, event-suspect demote on BUY), **earnings entry block** (7-day buffer), **macro-event filter** (rate/index-linked names), **SPY/QQQ long-straddle exclusion**, liquidity + credit floors, and a **cost gate** (expected edge |forecast − IV| × net vega must cover `COST_MULT`× the sum of half-spreads + fees; any leg quoted wider than `MAX_SPREAD_PCT` of mid blocks outright). `legacy` keeps the old multi-horizon (5/10/21) path runnable for comparison.
-- `ACCOUNT_PROFILE` — `standard` (~$100k calibration, main watchlist) or `small` (~$10k: `watchlist_small.yaml`, `CALIBRATION_SMALL` risk caps, $0.25 min credit, 1-lot sizing). Decoupled from any strategy choice.
+- **The strategy:** forecast next-day GK vol as a 63-day log-vol baseline + predicted deviation, term-projected along each ticker's GARCH persistence to the option's DTE, compared to that expiration's ATM IV. Entries only at **DTE 1-14** (`MIN_ENTRY_DTE`/`MAX_ENTRY_DTE`) — the shortest-dated options, where a 1-day timing forecast still carries signal; the option-chain scan covers exactly that window. Entry gate ladder (each block is labeled in the signal log and tallied in the daily Gates report): **VRP calibration gate** (per-ticker rolling 252-day history of g = log(IV) − log(tenor-matched realized vol); SELL needs z ≥ +1.5, BUY needs z ≤ −1.25, tickers with <120 gap days emit nothing), **VIX term-structure veto** on every SELL (VIX ≥ VIX3M = crash regime), **model-agreement gate**, **0.25 divergence cap** (hard block on SELL, event-suspect demote on BUY), **earnings entry block** (report anywhere inside the position's life `[today, expiration]`), **macro-event filter** (rate/index-linked names, same life-of-position window), **SPY/QQQ long-straddle exclusion**, liquidity + credit floors, and a **cost gate** (expected edge |forecast − IV| × net vega must cover `COST_MULT`× the sum of half-spreads + fees; any leg quoted wider than `MAX_SPREAD_PCT` of mid blocks outright).
+- `ACCOUNT_PROFILE` — `standard` (~$100k calibration, main watchlist) or `small` (~$10k: `watchlist_small.yaml`, `CALIBRATION_SMALL` risk caps, $0.25 min credit, 1-lot sizing).
 
 **Earnings exit (fail-closed):** the exit manager closes every short-vol position at least `EARNINGS_EXIT_BUFFER_DAYS` (default 1) trading days before the ticker's next earnings report — no short-vol position holds through earnings. The next earnings date is stamped on each position at entry and refreshed on every healthy calendar read; if the Finnhub calendar goes stale (>3 days since a successful refresh) the STORED date decides, with a loud journal error. A position with neither a live calendar nor a stored date is flagged for manual review every cycle.
 
