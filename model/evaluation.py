@@ -118,6 +118,46 @@ def per_ticker_r2_median(
     return float(np.median(r2s))
 
 
+def sign_hit_rate(actual: pd.Series, predicted: pd.Series) -> float:
+    """Fraction of rows where the forecast gets the deviation's SIGN right.
+    The cost gate monetizes direction-plus-threshold, not squared error, so
+    this is the report-only trade-aligned complement to within-ticker R².
+    Rows with zero actual (no direction to call) or NaN on either side are
+    dropped."""
+    paired = pd.concat(
+        [actual.rename("y"), predicted.rename("p")], axis=1
+    ).dropna()
+    paired = paired[paired["y"] != 0.0]
+    if paired.empty:
+        return float("nan")
+    hits = np.sign(paired["y"].to_numpy()) == np.sign(paired["p"].to_numpy())
+    return float(hits.mean())
+
+
+def per_ticker_spearman_median(
+    actual: pd.Series, predicted: pd.Series, level: str = "symbol"
+) -> float:
+    """Median across symbols of the within-symbol Spearman rank correlation
+    between forecast and actual deviation — pure time-ordering skill, immune
+    to scale and outliers. Report-only diagnostic. Symbols with <3 paired
+    rows are skipped."""
+    paired = pd.concat(
+        [actual.rename("y"), predicted.rename("p")], axis=1
+    ).dropna()
+    if paired.empty:
+        return float("nan")
+    rhos: list[float] = []
+    for _, grp in paired.groupby(level=level):
+        if len(grp) < 3:
+            continue
+        rho = grp["y"].rank().corr(grp["p"].rank())
+        if np.isfinite(rho):
+            rhos.append(float(rho))
+    if not rhos:
+        return float("nan")
+    return float(np.median(rhos))
+
+
 def r2_vs_baseline(actual: pd.Series, predicted: pd.Series, baseline: pd.Series) -> float:
     """Out-of-sample R² against a competing forecast: 1 − SSE_model / SSE_baseline
     (Campbell–Thompson style). Positive = model beats the baseline; 0 = ties it.
@@ -178,6 +218,8 @@ def h1_metrics_from_predictions(preds_long: pd.DataFrame) -> dict[str, dict[str,
             "dev_r2_within": within_ticker_r2(actual_dev, pred_dev),
             "dev_r2_ticker_median": per_ticker_r2_median(actual_dev, pred_dev),
             "qlike_level": qlike(actual_var, forecast_var),
+            "sign_hit_rate": sign_hit_rate(actual_dev, pred_dev),
+            "dev_spearman_median": per_ticker_spearman_median(actual_dev, pred_dev),
         }
     return out
 

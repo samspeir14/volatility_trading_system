@@ -74,6 +74,28 @@ DISTRIBUTION_SHAPE_COLUMNS: list[str] = [
     "rkurt_21", "rkurt_63",
 ]
 
+# Signed-return / leverage-effect features (added 2026-08-14). Everything
+# above is magnitude-only; the classic asymmetry — negative returns predict
+# higher next-day vol — needs the sign.
+LEVERAGE_COLUMNS: list[str] = [
+    "ret_1", "ret_5", "ret_21", "ret_1_neg",
+]
+
+# Overnight/intraday decomposition (added 2026-08-14): close-to-open gap
+# vol carries information the open-to-close range does not.
+OVERNIGHT_COLUMNS: list[str] = [
+    "overnight_gap", "overnight_vol_21", "overnight_to_intraday_21",
+]
+
+# Deterministic calendar dummies (added 2026-08-14): day-of-week and
+# expiration effects on next-day vol. Event-DISTANCE features (earnings,
+# FOMC/CPI) are deliberately absent — the earnings DB only caches upcoming
+# dates and macro_calendar.py only covers 2026, so neither has training-window
+# history; adding them without a backfill would create regime-broken columns.
+CALENDAR_COLUMNS: list[str] = [
+    "dow_mon", "dow_fri", "opex_friday", "month_end",
+]
+
 # h=1 target-side columns (added with the within-stock deviation model).
 # gk_1 is the single-day GK vol proxy (with Parkinson / |c2c return| fallback),
 # log_gk_baseline_63 is b_t (the 63-day trailing mean of log gk_1, min 40 obs),
@@ -86,13 +108,18 @@ H1_FEATURE_COLUMNS: list[str] = [
     "garch_persistence",
 ]
 
-# Full feature matrix produced by build_features(): 45 legacy columns + 7 h=1.
+# Full feature matrix produced by build_features():
+# 28 baseline + 6 OHLC vol + 4 distribution + 7 ratios + 7 h=1
+# + 4 leverage + 3 overnight + 4 calendar = 63.
 FEATURE_COLUMNS: list[str] = (
     BASELINE_FEATURE_COLUMNS
     + OHLC_VOL_COLUMNS
     + DISTRIBUTION_SHAPE_COLUMNS
     + RATIO_FEATURE_COLUMNS
     + H1_FEATURE_COLUMNS
+    + LEVERAGE_COLUMNS
+    + OVERNIGHT_COLUMNS
+    + CALENDAR_COLUMNS
 )
 
 
@@ -166,9 +193,9 @@ class FeaturePipeline:
     def build_features(self, start: date, end: date) -> pd.DataFrame:
         """Build the full feature matrix from cached bars. No I/O.
 
-        Returns a MultiIndex (symbol, date) DataFrame with FEATURE_COLUMNS:
-        the 28 baseline columns + 6 OHLC vol + 4 distribution shape + 7 ratios = 45.
-        The production h=1 model pulls its frozen subset via HORIZON_FEATURE_SETS[1].
+        Returns a MultiIndex (symbol, date) DataFrame with the 63
+        FEATURE_COLUMNS. The production h=1 model pulls its frozen subset
+        via HORIZON_FEATURE_SETS[1].
         """
         watchlist_symbols = [t.symbol for t in self._watchlist]
         all_symbols = watchlist_symbols + list(self._indices)
@@ -269,6 +296,31 @@ class FeaturePipeline:
         df["dev_gk"] = lv - baseline
         df["har_dev_5"] = lv.rolling(5).mean() - baseline
         df["har_dev_22"] = lv.rolling(22).mean() - baseline
+
+        # Signed returns / leverage effect
+        df["ret_1"] = r
+        df["ret_5"] = r.rolling(5).sum()
+        df["ret_21"] = r.rolling(21).sum()
+        df["ret_1_neg"] = r.clip(upper=0.0)
+
+        # Overnight / intraday decomposition
+        gap = np.log(b["open"]) - np.log(b["close"].shift(1))
+        oc_ret = np.log(b["close"]) - np.log(b["open"])
+        df["overnight_gap"] = gap
+        df["overnight_vol_21"] = gap.rolling(21).std(ddof=0)
+        df["overnight_to_intraday_21"] = (
+            df["overnight_vol_21"] / oc_ret.rolling(21).std(ddof=0)
+        )
+
+        # Deterministic calendar dummies. month_end uses the next BUSINESS
+        # day's month — calendar knowledge, not future bar data.
+        dts = pd.DatetimeIndex(df.index)
+        dow = dts.dayofweek
+        df["dow_mon"] = (dow == 0).astype(float)
+        df["dow_fri"] = (dow == 4).astype(float)
+        df["opex_friday"] = ((dow == 4) & (dts.day >= 15) & (dts.day <= 21)).astype(float)
+        next_bday = dts + pd.tseries.offsets.BDay(1)
+        df["month_end"] = (next_bday.month != dts.month).astype(float)
 
         return df
 

@@ -14,6 +14,8 @@ logger = logging.getLogger(__name__)
 
 
 LGBM_HYPERPARAM_SPACE: dict[str, list] = {
+    # huber stops the fit chasing vol-spike outliers (L2 loves them)
+    "objective": ["regression", "huber"],
     "max_depth": [3, 4, 5, 6, -1],
     "num_leaves": [15, 31, 63],
     "learning_rate": [0.01, 0.03, 0.05, 0.1],
@@ -23,6 +25,12 @@ LGBM_HYPERPARAM_SPACE: dict[str, list] = {
     "subsample": [0.6, 0.8, 1.0],
     "colsample_bytree": [0.6, 0.8, 1.0],
     "min_child_samples": [5, 10, 20],
+    "min_split_gain": [0.0, 0.01, 0.1],
+    "max_bin": [63, 127, 255],
+    # extra-random splits: strong regularizer on noisy targets
+    "extra_trees": [False, True],
+    # piecewise-linear leaves — blends the tree with the HAR-like linear view
+    "linear_tree": [False, True],
 }
 
 
@@ -111,9 +119,10 @@ def _lgbm_factory(params: dict):
     full = dict(params)
     if full.get("subsample", 1.0) < 1.0 and "bagging_freq" not in full:
         full["bagging_freq"] = 1
+    objective = full.pop("objective", "regression")
     import lightgbm as lgb_lib
     return lgb_lib.LGBMRegressor(
-        objective="regression", random_state=0, verbose=-1, **full,
+        objective=objective, random_state=0, verbose=-1, **full,
     )
 
 

@@ -30,8 +30,9 @@ class LightGBMVolPredictor:
         # LightGBM requires bagging_freq>0 for subsample<1 to take effect.
         if params.get("subsample", 1.0) < 1.0 and "bagging_freq" not in params:
             params["bagging_freq"] = 1
+        objective = params.pop("objective", "regression")
         self._model = lgb.LGBMRegressor(
-            objective="regression",
+            objective=objective,
             random_state=0,
             verbose=-1,
             **params,

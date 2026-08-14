@@ -4,14 +4,18 @@ import sys
 import numpy as np
 import pandas as pd
 from arch import arch_model
+from arch.univariate import Normal
 
 from features.garch import PCT_SCALE, fit_garch11, garch_features_walk_forward
 
 
 def _simulate_garch(n: int, omega: float, alpha: float, beta: float, seed: int = 0) -> pd.Series:
-    """Simulate a synthetic GARCH(1,1) series of decimal returns (zero mean) via arch."""
+    """Simulate a synthetic GARCH(1,1) series of decimal returns (zero mean) via arch.
+    The distribution is seeded EXPLICITLY — np.random.seed alone leaves the
+    series dependent on cross-test global RNG state (flaky under suite
+    reordering)."""
     template = arch_model(np.zeros(1), vol="Garch", p=1, q=1, mean="zero", rescale=False)
-    np.random.seed(seed)
+    template.distribution = Normal(seed=seed)
     sim = template.simulate(params=[omega, alpha, beta], nobs=n)
     # sim["data"] is in the same units as the params (pct² ⇒ pct returns); convert to decimal.
     return pd.Series(sim["data"].values / PCT_SCALE)

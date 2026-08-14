@@ -53,7 +53,7 @@ async def test_small_pipeline() -> None:
         # Shape
         assert df.index.names == ["symbol", "date"], f"index names = {df.index.names}"
         assert list(df.columns) == FEATURE_COLUMNS, "column order/identity mismatch"
-        assert len(df.columns) == 45, f"expected 45 features, got {len(df.columns)}"
+        assert len(df.columns) == 63, f"expected 63 features, got {len(df.columns)}"
         # Confirm new feature blocks all present
         for col in OHLC_VOL_COLUMNS:
             assert col in df.columns, f"missing OHLC vol column {col}"

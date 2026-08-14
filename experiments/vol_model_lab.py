@@ -36,7 +36,9 @@ logger = logging.getLogger("vol_model_lab")
 
 TRAIN_WINDOW_DAYS = 504
 REFIT_EVERY = 21
-N_TRIALS = 50
+# The retrain job stays at 50 trials (30-min budget); the lab has no budget
+# and the 14-dim space deserves a denser search.
+N_TRIALS = 100
 # Candidate subset sizes for the frozen production list. Features are ordered
 # by gain-importance mean rank (nesting), but the WINNER is the candidate with
 # the best OOS within-ticker R² — the metric, not importance, decides.
@@ -88,7 +90,13 @@ def run_h1() -> None:
     results/h1_feature_importance.csv.
     """
     from features.target import build_h1_deviation_target
-    from model.evaluation import per_ticker_r2_median, qlike, within_ticker_r2
+    from model.evaluation import (
+        per_ticker_r2_median,
+        per_ticker_spearman_median,
+        qlike,
+        sign_hit_rate,
+        within_ticker_r2,
+    )
     from model.h1_baselines import (
         ewma_deviation,
         garch_deviation,
@@ -259,8 +267,13 @@ def run_h1() -> None:
     baseline_b = ref["baseline_b"]
     actual_var = np.exp(2.0 * ref["actual_lv"])
 
+    # 50/50 lgbm+har blend — a servable production route, so it competes.
+    dev_forecasts["blend"] = (
+        ref["predicted_dev"] + frames["har"].loc[common, "predicted_dev"]
+    ) / 2.0
+
     rows: list[dict] = []
-    for name in ("lgbm", "lgbm_full", "lgbm_ivw", "har",
+    for name in ("lgbm", "lgbm_full", "lgbm_ivw", "blend", "har",
                  "persistence", "ewma", "garch"):
         if name in frames:
             pred_dev = frames[name].loc[common, "predicted_dev"]
@@ -276,12 +289,15 @@ def run_h1() -> None:
             "dev_r2_ticker_median": per_ticker_r2_median(actual_dev, pred_dev),
             "qlike_level": qlike(actual_var, forecast_var),
             "rmse_dev": m["rmse"],
+            "sign_hit": sign_hit_rate(actual_dev, pred_dev),
+            "spearman_med": per_ticker_spearman_median(actual_dev, pred_dev),
         }
         rows.append(row)
         print(
             f"  {name:<12s} dev_R²={row['dev_r2_pooled']:+.4f} "
             f"(within {row['dev_r2_within']:+.4f}, ticker-median {row['dev_r2_ticker_median']:+.4f}) "
-            f"QLIKE={row['qlike_level']:.4f}"
+            f"QLIKE={row['qlike_level']:.4f} "
+            f"sign={row['sign_hit']:.3f} ρ={row['spearman_med']:+.3f}"
         )
 
     results_df = pd.DataFrame(rows)
@@ -309,13 +325,19 @@ def run_h1() -> None:
     # ---------------- ACCEPTANCE GATE ----------------
     _print_section("ACCEPTANCE GATE")
     by_model = {r["model"]: r for r in rows}
-    lgbm_cfg = max(("lgbm", "lgbm_ivw"), key=lambda n: by_model[n]["dev_r2_within"])
-    lgbm_w = by_model[lgbm_cfg]["dev_r2_within"]
+    best_cfg = max(
+        ("lgbm", "lgbm_ivw", "blend", "har"),
+        key=lambda n: by_model[n]["dev_r2_within"],
+    )
+    best_w = by_model[best_cfg]["dev_r2_within"]
     har_w = by_model["har"]["dev_r2_within"]
-    passed = lgbm_w > har_w
-    print(f"rule: best-lgbm within-ticker R² > har  →  "
-          f"{lgbm_cfg} {lgbm_w:+.4f} vs {har_w:+.4f}")
-    print(f"VERDICT: {'PASS — route h=1 to LightGBM' if passed else 'FAIL — route h=1 to HAR in production'}")
+    passed = best_cfg != "har"
+    print("rule: argmax within-ticker R²  →  " + ", ".join(
+        f"{n}={by_model[n]['dev_r2_within']:+.4f}"
+        for n in ("lgbm", "lgbm_ivw", "blend", "har")
+    ))
+    print(f"VERDICT: {'PASS' if passed else 'FAIL'} — route h=1 to "
+          f"{best_cfg} ({best_w:+.4f})")
 
     print(f"\ntotal runtime: {(time.monotonic() - t_start) / 60.0:.1f} min")
 

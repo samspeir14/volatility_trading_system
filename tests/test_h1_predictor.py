@@ -68,6 +68,21 @@ def test_missing_lgbm_falls_back_to_har():
     print("fallback: route=lgbm with no artifact degrades to HAR")
 
 
+def test_blend_route():
+    har = _fitted_har()
+    lgbm = _fitted_lgbm()
+    p = H1DeviationPredictor(lgbm, har, route="blend")
+    assert p.active_model == "blend"
+    row = _one_row()
+    expected = (float(lgbm.predict(row)[0]) + float(har.predict(row)[0])) / 2.0
+    assert abs(p.predict_deviation(row) - expected) < 1e-12
+    # blend with one artifact missing degrades to the present model
+    p_degraded = H1DeviationPredictor(None, har, route="blend")
+    assert p_degraded.active_model == "har"
+    assert np.isfinite(p_degraded.predict_deviation(row))
+    print("blend: 50/50 average served; degrades to single model when one missing")
+
+
 def test_invalid_route_rejected():
     try:
         H1DeviationPredictor(None, _fitted_har(), route="xgboost")
@@ -112,6 +127,10 @@ def test_reconciliation_pass_and_breach():
                 m: v["dev_r2_ticker_median"] for m, v in metrics.items()
             },
             "qlike_level": {m: v["qlike_level"] for m, v in metrics.items()},
+            "sign_hit_rate": {m: v["sign_hit_rate"] for m, v in metrics.items()},
+            "dev_spearman_median": {
+                m: v["dev_spearman_median"] for m, v in metrics.items()
+            },
         },
     }
     assert reconcile(payload, preds) == []
@@ -125,6 +144,7 @@ def test_reconciliation_pass_and_breach():
 def main() -> int:
     test_route_honored()
     test_missing_lgbm_falls_back_to_har()
+    test_blend_route()
     test_invalid_route_rejected()
     test_reconciliation_pass_and_breach()
     print("all h1_predictor tests passed")

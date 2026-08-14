@@ -4,10 +4,11 @@ chain preserved).
 
 Trains the pooled LightGBM on the next-day log-GK-vol deviation target plus
 the HAR-RV benchmark, scores both against GARCH/EWMA/persistence baselines on
-identical walk-forward OOS rows, applies the acceptance gate (LightGBM must
-beat HAR on OOS within-ticker deviation R² — the singular strategy metric,
-else route=har), persists OOS predictions for the nightly reconciliation, and
-writes the schema-v2 routing JSON (previous file kept as .bak).
+identical walk-forward OOS rows, applies the acceptance gate (route = argmax
+OOS within-ticker deviation R² over lgbm / har / their 50/50 blend — the
+singular strategy metric), persists OOS predictions for the nightly
+reconciliation, and writes the schema-v2 routing JSON (previous file kept
+as .bak).
 """
 import asyncio
 import json
@@ -191,6 +192,9 @@ def run_h1_retrain(settings) -> int:
         model_preds: dict[str, pd.Series] = {
             "lgbm": ref["predicted_dev"],
             "har": wf_har.loc[common, "predicted_dev"],
+            "blend": (
+                ref["predicted_dev"] + wf_har.loc[common, "predicted_dev"]
+            ) / 2.0,
             **{name: dev.loc[common] for name, dev in dev_forecasts.items()},
         }
         for name, pred in model_preds.items():
@@ -219,17 +223,20 @@ def run_h1_retrain(settings) -> int:
                 f"  {name:<12s} dev_R²={m['dev_r2_pooled']:+.4f} "
                 f"(within {m['dev_r2_within']:+.4f}, "
                 f"ticker-median {m['dev_r2_ticker_median']:+.4f}) "
-                f"QLIKE={m['qlike_level']:.4f}"
+                f"QLIKE={m['qlike_level']:.4f} "
+                f"sign={m['sign_hit_rate']:.3f} ρ={m['dev_spearman_median']:+.3f}"
             )
 
         # --- acceptance gate: within-ticker deviation R², the singular
-        # strategy metric (QLIKE and pooled R² stay report-only) ---
-        lgbm_w = metrics["lgbm"]["dev_r2_within"]
-        har_w = metrics["har"]["dev_r2_within"]
-        route = "lgbm" if lgbm_w > har_w else "har"
-        passed = route == "lgbm"
-        print(f"\nacceptance gate (lgbm within-ticker R² > har): "
-              f"{lgbm_w:+.4f} vs {har_w:+.4f} → route={route}")
+        # strategy metric (everything else stays report-only). The 50/50
+        # lgbm+har blend is a servable route, so it competes too. ---
+        candidates = ("lgbm", "har", "blend")
+        within = {n: metrics[n]["dev_r2_within"] for n in candidates}
+        route = max(candidates, key=lambda n: within[n])
+        passed = route != "har"
+        print("\nacceptance gate (argmax within-ticker R² of "
+              + ", ".join(f"{n}={within[n]:+.4f}" for n in candidates)
+              + f") → route={route}")
 
         # --- per-ticker GARCH persistence (diagnostics + term-projection
         # fallback; runtime primarily uses the garch_persistence feature) ---
@@ -291,8 +298,17 @@ def run_h1_retrain(settings) -> int:
                 "qlike_level": {
                     n: float(m["qlike_level"]) for n, m in metrics.items()
                 },
+                "sign_hit_rate": {
+                    n: float(m["sign_hit_rate"]) for n, m in metrics.items()
+                },
+                "dev_spearman_median": {
+                    n: float(m["dev_spearman_median"]) for n, m in metrics.items()
+                },
                 "route": route,
-                "acceptance": {"rule": "within_r2 lgbm > har", "passed": passed},
+                "acceptance": {
+                    "rule": "argmax within_r2 {lgbm,har,blend}",
+                    "passed": passed,
+                },
                 "artifacts": promoted,
                 "top_features": top_features,
                 "lgbm_hyperparams": {k: (v.item() if hasattr(v, "item") else v)
