@@ -58,6 +58,46 @@ def test_save_load_roundtrip():
     print("save_load_roundtrip: predictions match to 1e-9 after reload")
 
 
+def test_inverse_variance_weights():
+    """Weighted fit runs, weights are per-ticker inverse variance (mean 1),
+    the flag survives an artifact roundtrip, and a non-MultiIndex y is
+    rejected loudly."""
+    rng = np.random.default_rng(2)
+    n = 120
+    idx = pd.MultiIndex.from_product(
+        [["CALM", "WILD"], pd.date_range("2024-01-01", periods=n // 2)],
+        names=["symbol", "date"],
+    )
+    X = pd.DataFrame({c: rng.normal(0, 1, n) for c in ("a", "b", "c")}, index=idx)
+    # WILD has 10x the deviation scale of CALM
+    y = pd.Series(
+        np.concatenate([rng.normal(0, 0.1, n // 2), rng.normal(0, 1.0, n // 2)]),
+        index=idx,
+    )
+    w = LightGBMVolPredictor._inverse_variance_weights(y)
+    assert abs(w.mean() - 1.0) < 1e-9
+    assert w[: n // 2].mean() > w[n // 2 :].mean(), "CALM rows must outweigh WILD"
+
+    pred = LightGBMVolPredictor(
+        horizon=1, hyperparams=DEFAULT_LGBM_HYPERPARAMS,
+        inverse_variance_weights=True,
+    )
+    pred.fit(X, y)
+    assert pred.predict(X).shape == (n,)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "ivw.joblib"
+        pred.save(path)
+        assert LightGBMVolPredictor.load(path).inverse_variance_weights is True
+
+    flat_y = pd.Series(rng.normal(0, 1, 10))
+    try:
+        LightGBMVolPredictor._inverse_variance_weights(flat_y)
+        raise AssertionError("expected ValueError for missing symbol level")
+    except ValueError as e:
+        assert "symbol" in str(e)
+    print("inverse_variance_weights: weighting, roundtrip, and guard OK")
+
+
 def test_deterministic_with_seed():
     X, y = _make_data()
     p1 = LightGBMVolPredictor(horizon=21, hyperparams=DEFAULT_LGBM_HYPERPARAMS)
@@ -98,6 +138,7 @@ def main() -> int:
     test_fit_then_predict()
     test_feature_importance_nonzero()
     test_save_load_roundtrip()
+    test_inverse_variance_weights()
     test_deterministic_with_seed()
     test_predict_before_fit_raises()
     test_load_rejects_wrong_model_type()

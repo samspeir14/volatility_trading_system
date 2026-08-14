@@ -99,17 +99,36 @@ FEATURE_COLUMNS: list[str] = (
 # The production h=1 feature set. Selection criterion (since 2026-08-13):
 # the lab nests top-N candidates by gain-importance mean rank and freezes the
 # subset with the best OOS within-ticker deviation R² — the strategy's
-# singular metric. Current list FROZEN 2026-08-10 from the EC2 lab run, which
-# still selected top-20 by importance rank alone; re-run
-# `python -m experiments.vol_model_lab` on the box and re-freeze from its
-# WINNER printout. Do not load from CSV at runtime.
+# singular metric. FROZEN 2026-08-13 from the EC2 lab run: the FULL 52-column
+# set won (within R² +0.1349 vs +0.1337 for the old top-20). Kept as an
+# explicit list so later feature-matrix additions cannot silently change the
+# production set — re-freeze only from a lab WINNER printout. Do not load
+# from CSV at runtime.
 HORIZON_FEATURE_SETS: dict[int, list[str]] = {
     1: [
-        "har_dev_5", "dev_gk", "vix3m_to_vix", "volume_ratio", "vix_level",
-        "market_avg_rv21", "har_dev_22", "vix9d_to_vix", "corr_spy_21",
-        "atr_roc", "ewma_94_97_ratio", "rv_10_63_ratio", "rsi_14", "rv_63",
-        "sector_avg_rv21", "log_gk_baseline_63", "har_rv_daily", "rskew_63",
-        "vix_vs_rv21_ann", "gk_1",
+        "rv_5", "rv_10", "rv_21", "rv_63",
+        "ewma_vol_94", "ewma_vol_97",
+        "har_rv_daily", "har_rv_weekly", "har_rv_monthly",
+        "acf_sq_ret_lag1", "acf_sq_ret_lag5", "acf_sq_ret_lag10",
+        "garch_forecast_var", "garch_resid_lb_pvalue",
+        "bb_width", "bb_width_roc",
+        "macd_hist_mag", "rsi_14",
+        "volume_ratio",
+        "atr_14", "atr_roc",
+        "intraday_range",
+        "market_avg_rv21", "sector_avg_rv21",
+        "vix_level", "vix9d_to_vix", "vix3m_to_vix",
+        "corr_spy_21",
+        "parkinson_5", "parkinson_10", "parkinson_21",
+        "gk_5", "gk_10", "gk_21",
+        "rskew_21", "rskew_63",
+        "rkurt_21", "rkurt_63",
+        "rv21_vs_market", "rv21_vs_sector",
+        "rv_5_21_ratio", "rv_10_63_ratio",
+        "garch_vs_rv21", "ewma_94_97_ratio", "vix_vs_rv21_ann",
+        "gk_1", "log_gk_1", "log_gk_baseline_63",
+        "dev_gk", "har_dev_5", "har_dev_22",
+        "garch_persistence",
     ],
 }
 

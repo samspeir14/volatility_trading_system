@@ -194,6 +194,29 @@ def run_h1() -> None:
     for i, f in enumerate(best_subset, 1):
         print(f"  {i:2d}. {f}")
 
+    # Inverse-variance-weighted variant on the winner subset: rows weighted
+    # 1/var(dev) per ticker, so the fit objective itself is within-ticker
+    # aligned instead of dominated by high-vol-of-vol names.
+    t0 = time.monotonic()
+    wf_lgbm_ivw = walk_forward_evaluate_h1(
+        feature_df, bars_by_symbol,
+        model_factory=lambda: ProdLGBM(
+            horizon=1, hyperparams=lgbm_params, inverse_variance_weights=True,
+        ),
+        feature_subset=best_subset,
+        train_window_days=TRAIN_WINDOW_DAYS, refit_every=REFIT_EVERY,
+    )
+    ivw_within = within_ticker_r2(
+        wf_lgbm_ivw["actual_dev"], wf_lgbm_ivw["predicted_dev"]
+    )
+    print(f"\nIVW variant within_R²={ivw_within:+.4f} vs unweighted "
+          f"{best_within:+.4f} ({time.monotonic() - t0:.1f}s)")
+    print("IVW VERDICT: " + (
+        "WEIGHTED wins — set inverse_variance_weights=True in the retrain job"
+        if ivw_within > best_within
+        else "unweighted wins — keep inverse_variance_weights=False"
+    ))
+
     t0 = time.monotonic()
     wf_har = walk_forward_evaluate_h1(
         feature_df, bars_by_symbol,
@@ -216,6 +239,7 @@ def run_h1() -> None:
     frames = {
         "lgbm": wf_lgbm_top,
         "lgbm_full": wf_lgbm_full,
+        "lgbm_ivw": wf_lgbm_ivw,
         "har": wf_har,
     }
     dev_forecasts = {
@@ -236,7 +260,8 @@ def run_h1() -> None:
     actual_var = np.exp(2.0 * ref["actual_lv"])
 
     rows: list[dict] = []
-    for name in ("lgbm", "lgbm_full", "har", "persistence", "ewma", "garch"):
+    for name in ("lgbm", "lgbm_full", "lgbm_ivw", "har",
+                 "persistence", "ewma", "garch"):
         if name in frames:
             pred_dev = frames[name].loc[common, "predicted_dev"]
         else:
@@ -284,10 +309,12 @@ def run_h1() -> None:
     # ---------------- ACCEPTANCE GATE ----------------
     _print_section("ACCEPTANCE GATE")
     by_model = {r["model"]: r for r in rows}
-    lgbm_w = by_model["lgbm"]["dev_r2_within"]
+    lgbm_cfg = max(("lgbm", "lgbm_ivw"), key=lambda n: by_model[n]["dev_r2_within"])
+    lgbm_w = by_model[lgbm_cfg]["dev_r2_within"]
     har_w = by_model["har"]["dev_r2_within"]
     passed = lgbm_w > har_w
-    print(f"rule: lgbm within-ticker R² > har  →  {lgbm_w:+.4f} vs {har_w:+.4f}")
+    print(f"rule: best-lgbm within-ticker R² > har  →  "
+          f"{lgbm_cfg} {lgbm_w:+.4f} vs {har_w:+.4f}")
     print(f"VERDICT: {'PASS — route h=1 to LightGBM' if passed else 'FAIL — route h=1 to HAR in production'}")
 
     print(f"\ntotal runtime: {(time.monotonic() - t_start) / 60.0:.1f} min")

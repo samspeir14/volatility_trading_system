@@ -143,20 +143,20 @@ async def test_full_watchlist_perf() -> None:
 
 def test_horizon_feature_sets_structure() -> None:
     """Pure unit test — no API or cache needed. h=1 is the only production
-    model; its frozen top-20 must stay a valid subset of FEATURE_COLUMNS."""
+    model; its frozen set (the full 52 columns won the 2026-08-13 lab's
+    within-ticker-R² subset selection) must stay a valid, duplicate-free
+    snapshot of FEATURE_COLUMNS. If FEATURE_COLUMNS grows, the frozen list
+    intentionally does NOT follow — re-freeze only from a lab WINNER."""
     assert set(HORIZON_FEATURE_SETS.keys()) == {1}, (
         f"unexpected horizons {set(HORIZON_FEATURE_SETS.keys())}"
     )
     feats = HORIZON_FEATURE_SETS[1]
-    assert len(feats) == 20, f"expected 20 features, got {len(feats)}"
-    assert len(set(feats)) == 20, "duplicate feature names"
+    assert len(feats) == 52, f"expected 52 features, got {len(feats)}"
+    assert len(set(feats)) == 52, "duplicate feature names"
     # Every selected feature must exist in the full FEATURE_COLUMNS set
     unknown = [f for f in feats if f not in FEATURE_COLUMNS]
     assert not unknown, f"features not in FEATURE_COLUMNS: {unknown}"
-    # The frozen list carries rskew_63 from DISTRIBUTION_SHAPE_COLUMNS — the
-    # rest of that family is computed for offline studies only.
-    assert set(feats) & set(DISTRIBUTION_SHAPE_COLUMNS) == {"rskew_63"}
-    print("horizon_feature_sets: h=1 frozen top-20 is a valid FEATURE_COLUMNS subset")
+    print("horizon_feature_sets: h=1 frozen 52-set is a valid FEATURE_COLUMNS subset")
 
 
 async def main() -> int:
