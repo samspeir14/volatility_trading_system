@@ -8,13 +8,11 @@ Data notes (vetted 2026-07-02, experiments/dolthub_iv_pull.py):
   per-expiration ATM IV. Levels have an offset vs our logged atm_iv;
   changes/ranks are the tradeable signal.
 
-Strategy: per-symbol pagination keyed on the last date already stored —
-`WHERE act_symbol='X' AND date > '<last>' ORDER BY date LIMIT 40` (a full
-page is always under the ~41-row API cap). Seeds itself from
-experiments/results/dolthub_iv_history.csv (the 2026-07 research pull, 19
-symbols) when the output file does not exist yet, so only the ~14 newer
-watchlist names pull deep history. Resumable: re-running continues from
-the stored frontier per symbol.
+Strategy: the table's PK leads with `date`, so EXACT-DATE lookups are fast
+index hits while anything range-shaped full-scans into the server's 30s
+deadline (learned the hard way; see experiments/dolthub_iv_pull.py). One
+query per weekday date with all watchlist symbols (33 rows, under the ~41-row
+API cap). Resumable: continues from the last date already in the CSV.
 
 Output: data/cache/iv_history.csv  (symbol, date, iv_current, hv_current)
 
@@ -28,7 +26,6 @@ import sys
 import time
 import urllib.parse
 import urllib.request
-from collections import defaultdict
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -36,9 +33,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 API = "https://www.dolthub.com/api/v1alpha1/post-no-preference/options/master"
 OUT = PROJECT_ROOT / "data" / "cache" / "iv_history.csv"
-SEED = PROJECT_ROOT / "experiments" / "results" / "dolthub_iv_history.csv"
 START_DATE = "2021-06-01"  # comfortably before the 4y training window
-PAGE = 40
 
 
 def query(q: str, retries: int = 5) -> list[dict]:
@@ -57,59 +52,59 @@ def query(q: str, retries: int = 5) -> list[dict]:
     return []
 
 
-def _load_existing() -> dict[str, str]:
-    """Return {symbol: max_date_stored}. Seeds OUT from the research CSV on
-    first run."""
-    if not OUT.exists() and SEED.exists():
-        OUT.parent.mkdir(parents=True, exist_ok=True)
-        with open(SEED) as src, open(OUT, "w", newline="") as dst:
-            dst.write(src.read())
-        print(f"seeded {OUT} from {SEED}")
-    frontier: dict[str, str] = defaultdict(str)
+def _resume_date() -> str:
+    """Last date already in the CSV (dates are written in order), or the
+    backfill start."""
+    last = ""
     if OUT.exists():
         with open(OUT) as f:
             for row in csv.DictReader(f):
-                if row["date"] > frontier[row["symbol"]]:
-                    frontier[row["symbol"]] = row["date"]
-    return frontier
+                if row["date"] > last:
+                    last = row["date"]
+    return last or START_DATE
 
 
 def main() -> int:
+    from datetime import date as ddate, timedelta
+
     from config import load_watchlist
 
     symbols = [t.symbol for t in load_watchlist()]
-    frontier = _load_existing()
+    in_list = ",".join(f"'{s}'" for s in symbols)
     OUT.parent.mkdir(parents=True, exist_ok=True)
+
+    resume = _resume_date()
+    d = ddate.fromisoformat(resume) + timedelta(days=1)
+    weekdays: list[str] = []
+    while d <= ddate.today():
+        if d.weekday() < 5:
+            weekdays.append(d.isoformat())
+        d += timedelta(days=1)
+    print(f"pulling {len(weekdays)} dates after {resume} for {len(symbols)} symbols")
 
     t0 = time.monotonic()
     total = 0
+    write_header = not OUT.exists() or OUT.stat().st_size == 0
     with open(OUT, "a", newline="") as f:
         w = csv.writer(f)
-        if OUT.stat().st_size == 0:
+        if write_header:
             w.writerow(["symbol", "date", "iv_current", "hv_current"])
-        for sym in symbols:
-            last = frontier.get(sym) or START_DATE
-            pulled = 0
-            while True:
-                rows = query(
-                    "SELECT date, act_symbol, iv_current, hv_current "
-                    "FROM volatility_history "
-                    f"WHERE act_symbol = '{sym}' AND date > '{last}' "
-                    f"ORDER BY date LIMIT {PAGE}"
-                )
-                if not rows:
-                    break
-                for r in rows:
-                    w.writerow([r["act_symbol"], r["date"],
-                                r["iv_current"], r["hv_current"]])
-                last = rows[-1]["date"]
-                pulled += len(rows)
-                f.flush()
-                time.sleep(0.3)
-                if len(rows) < PAGE:
-                    break
-            total += pulled
-            print(f"  {sym}: +{pulled} rows (through {last})", flush=True)
+        for i, day in enumerate(weekdays):
+            rows = query(
+                "SELECT date, act_symbol, iv_current, hv_current "
+                "FROM volatility_history "
+                f"WHERE date = '{day}' AND act_symbol IN ({in_list}) "
+                "ORDER BY act_symbol"
+            )
+            for r in rows:
+                w.writerow([r["act_symbol"], r["date"],
+                            r["iv_current"], r["hv_current"]])
+            total += len(rows)
+            f.flush()
+            if i % 100 == 0:
+                print(f"  ...{day}: {total} rows ({time.monotonic() - t0:.0f}s)",
+                      flush=True)
+            time.sleep(0.25)
     print(f"done: +{total} rows -> {OUT} in {time.monotonic() - t0:.0f}s")
     return 0
 
