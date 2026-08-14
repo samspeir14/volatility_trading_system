@@ -2,7 +2,8 @@
 
 Routes between the pooled LightGBM and the HAR-RV benchmark based on the
 retrain job's acceptance gate (LightGBM must beat HAR on out-of-sample
-QLIKE; the decision is stored as `route` in latest_retrain_r2.json).
+within-ticker deviation R²; the decision is stored as `route` in
+latest_retrain_r2.json).
 HAR is a tiny artifact and always loadable, so it doubles as the fallback
 when the LightGBM artifact is missing or fails to produce a finite value.
 """

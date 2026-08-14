@@ -96,11 +96,13 @@ FEATURE_COLUMNS: list[str] = (
 )
 
 
-# The production h=1 feature set (top-20 by mean rank across walk-forward
-# refits). FROZEN 2026-08-10 from `python -m experiments.vol_model_lab` on the
-# EC2 box (results/h1_feature_importance.csv). Demeaned HAR components
-# dominate, then VIX term structure and cross-ticker context. Frozen at
-# integration time — do not load from CSV at runtime.
+# The production h=1 feature set. Selection criterion (since 2026-08-13):
+# the lab nests top-N candidates by gain-importance mean rank and freezes the
+# subset with the best OOS within-ticker deviation R² — the strategy's
+# singular metric. Current list FROZEN 2026-08-10 from the EC2 lab run, which
+# still selected top-20 by importance rank alone; re-run
+# `python -m experiments.vol_model_lab` on the box and re-freeze from its
+# WINNER printout. Do not load from CSV at runtime.
 HORIZON_FEATURE_SETS: dict[int, list[str]] = {
     1: [
         "har_dev_5", "dev_gk", "vix3m_to_vix", "volume_ratio", "vix_level",

@@ -5,9 +5,9 @@ chain preserved).
 Trains the pooled LightGBM on the next-day log-GK-vol deviation target plus
 the HAR-RV benchmark, scores both against GARCH/EWMA/persistence baselines on
 identical walk-forward OOS rows, applies the acceptance gate (LightGBM must
-beat HAR on OOS QLIKE, else route=har), persists OOS predictions for the
-nightly reconciliation, and writes the schema-v2 routing JSON (previous file
-kept as .bak).
+beat HAR on OOS within-ticker deviation R² — the singular strategy metric,
+else route=har), persists OOS predictions for the nightly reconciliation, and
+writes the schema-v2 routing JSON (previous file kept as .bak).
 """
 import asyncio
 import json
@@ -222,13 +222,14 @@ def run_h1_retrain(settings) -> int:
                 f"QLIKE={m['qlike_level']:.4f}"
             )
 
-        # --- acceptance gate ---
-        lgbm_q = metrics["lgbm"]["qlike_level"]
-        har_q = metrics["har"]["qlike_level"]
-        route = "lgbm" if lgbm_q < har_q else "har"
+        # --- acceptance gate: within-ticker deviation R², the singular
+        # strategy metric (QLIKE and pooled R² stay report-only) ---
+        lgbm_w = metrics["lgbm"]["dev_r2_within"]
+        har_w = metrics["har"]["dev_r2_within"]
+        route = "lgbm" if lgbm_w > har_w else "har"
         passed = route == "lgbm"
-        print(f"\nacceptance gate (lgbm QLIKE < har QLIKE): "
-              f"{lgbm_q:.4f} vs {har_q:.4f} → route={route}")
+        print(f"\nacceptance gate (lgbm within-ticker R² > har): "
+              f"{lgbm_w:+.4f} vs {har_w:+.4f} → route={route}")
 
         # --- per-ticker GARCH persistence (diagnostics + term-projection
         # fallback; runtime primarily uses the garch_persistence feature) ---
@@ -291,7 +292,7 @@ def run_h1_retrain(settings) -> int:
                     n: float(m["qlike_level"]) for n, m in metrics.items()
                 },
                 "route": route,
-                "acceptance": {"rule": "qlike lgbm < har", "passed": passed},
+                "acceptance": {"rule": "within_r2 lgbm > har", "passed": passed},
                 "artifacts": promoted,
                 "top_features": top_features,
                 "lgbm_hyperparams": {k: (v.item() if hasattr(v, "item") else v)

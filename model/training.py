@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from features.target import build_h1_deviation_target
-from model.evaluation import date_based_ts_split
+from model.evaluation import date_based_ts_split, within_ticker_r2
 
 logger = logging.getLogger(__name__)
 
@@ -39,14 +39,6 @@ DEFAULT_LGBM_HYPERPARAMS: dict = {
 }
 
 
-def _r2_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    ss_res = float(np.sum((y_true - y_pred) ** 2))
-    ss_tot = float(np.sum((y_true - y_true.mean()) ** 2))
-    if ss_tot <= 0:
-        return float("nan")
-    return 1.0 - ss_res / ss_tot
-
-
 def tune_hyperparameters(
     X: pd.DataFrame,
     y: pd.Series,
@@ -56,7 +48,10 @@ def tune_hyperparameters(
     space: dict[str, list] | None = None,
     model_factory: Callable[[dict], object] | None = None,
 ) -> tuple[dict, float]:
-    """Random search scored as mean OOS R² across date-based TS CV folds.
+    """Random search scored as mean OOS WITHIN-TICKER R² across date-based
+    TS CV folds — the singular strategy metric (pooled R² gets credit for
+    cross-sectional vol levels the options market already prices).
+    Requires a (symbol, date) MultiIndex on X/y.
     Defaults to the LightGBM search space + LGBMRegressor factory."""
     if space is None:
         space = LGBM_HYPERPARAM_SPACE
@@ -89,18 +84,25 @@ def tune_hyperparameters(
             except Exception as exc:
                 logger.warning("trial %d fold failed: %s", trial, exc)
                 continue
-            fold_scores.append(_r2_score(y_te.to_numpy(), preds))
+            fold_scores.append(
+                within_ticker_r2(y_te, pd.Series(preds, index=y_te.index))
+            )
         if not fold_scores:
             continue
         mean_score = float(np.nanmean(fold_scores))
         if mean_score > best_score:
             best_score = mean_score
             best_params = params
-            logger.debug("trial %d: r2=%.4f params=%s", trial, mean_score, params)
+            logger.debug(
+                "trial %d: within_r2=%.4f params=%s", trial, mean_score, params
+            )
 
     if best_params is None:
         raise RuntimeError("hyperparameter tuning produced no valid results")
-    logger.info("best hyperparams (mean CV R²=%.4f): %s", best_score, best_params)
+    logger.info(
+        "best hyperparams (mean CV within-ticker R²=%.4f): %s",
+        best_score, best_params,
+    )
     return best_params, best_score
 
 
