@@ -126,11 +126,11 @@ FEATURE_COLUMNS: list[str] = (
 # The production h=1 feature set. Selection criterion (since 2026-08-13):
 # the lab nests top-N candidates by gain-importance mean rank and freezes the
 # subset with the best OOS within-ticker deviation R² — the strategy's
-# singular metric. FROZEN 2026-08-13 from the EC2 lab run: the FULL 52-column
-# set won (within R² +0.1349 vs +0.1337 for the old top-20). Kept as an
-# explicit list so later feature-matrix additions cannot silently change the
-# production set — re-freeze only from a lab WINNER printout. Do not load
-# from CSV at runtime.
+# singular metric. FROZEN 2026-08-14 from the EC2 lab run: the FULL 63-column
+# set won again (within R² +0.1423 vs +0.1410 for top-20; blend route
+# +0.1466). Kept as an explicit list so later feature-matrix additions cannot
+# silently change the production set — re-freeze only from a lab WINNER
+# printout. Do not load from CSV at runtime.
 HORIZON_FEATURE_SETS: dict[int, list[str]] = {
     1: [
         "rv_5", "rv_10", "rv_21", "rv_63",
@@ -156,6 +156,9 @@ HORIZON_FEATURE_SETS: dict[int, list[str]] = {
         "gk_1", "log_gk_1", "log_gk_baseline_63",
         "dev_gk", "har_dev_5", "har_dev_22",
         "garch_persistence",
+        "ret_1", "ret_5", "ret_21", "ret_1_neg",
+        "overnight_gap", "overnight_vol_21", "overnight_to_intraday_21",
+        "dow_mon", "dow_fri", "opex_friday", "month_end",
     ],
 }
 

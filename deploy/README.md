@@ -59,7 +59,7 @@ When stopped, open positions persist in the Tradier sandbox. Restart picks up wh
 
 ## 6. Weekly model retraining (cron)
 
-Retrain the h=1 within-stock deviation model every Sunday at 3am UTC: pooled LightGBM (top-20 features) + the HAR-RV benchmark, scored against GARCH/EWMA/persistence baselines on identical walk-forward OOS rows. The job applies the **acceptance gate** (LightGBM must beat HAR on out-of-sample within-ticker deviation R², else `route=har`), writes `lgbm_h1_<date>.joblib` + `har_h1_<date>.joblib` + `h1_oos_predictions.parquet` + a schema-v2 `latest_retrain_r2.json` (previous JSON kept as `.bak`), then restarts the bot so the routing takes effect.
+Retrain the h=1 within-stock deviation model every Sunday at 3am UTC: pooled LightGBM (frozen 63-feature set, inverse-variance weighted) + the HAR-RV benchmark, scored against GARCH/EWMA/persistence baselines on identical walk-forward OOS rows. The job applies the **acceptance gate** (`route` = argmax out-of-sample within-ticker deviation R² over LightGBM / HAR / their 50/50 blend), writes `lgbm_h1_<date>.joblib` + `har_h1_<date>.joblib` + `h1_oos_predictions.parquet` + a schema-v2 `latest_retrain_r2.json` (previous JSON kept as `.bak`), then restarts the bot so the routing takes effect.
 
 ### 6a. NOPASSWD sudoers entry for the restart
 
