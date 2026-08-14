@@ -125,9 +125,13 @@ def run_h1_retrain(settings) -> int:
         )
         print(f"daily bars through: {bars_through}")
 
+        from features.feature_pipeline import load_earnings_history, load_iv_history
+        cache_dir = Path(settings.cache_db_path).parent
         pipeline = FeaturePipeline(
             store, tickers,
             garch_min_history=100, garch_refit_every=21,
+            iv_history=load_iv_history(cache_dir / "iv_history.csv"),
+            earnings_history=load_earnings_history(cache_dir / "earnings_history.csv"),
         )
         t0 = time.monotonic()
         feature_df = pipeline.build_features(start, end)

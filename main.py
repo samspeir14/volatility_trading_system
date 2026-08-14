@@ -818,9 +818,15 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
     watchlist = (load_watchlist(SMALL_WATCHLIST_PATH)
                  if settings.account_profile == "small" else load_watchlist())
     market_data = MarketData(client, watchlist)
+    # IV/earnings backfill CSVs (scripts/backfill_*.py); features degrade to
+    # NaN with a logged warning when a file is absent.
+    from features.feature_pipeline import load_earnings_history, load_iv_history
+    cache_dir = settings.cache_db_path.parent
     feature_pipeline = FeaturePipeline(
         store, watchlist,
         garch_min_history=100, garch_refit_every=21,
+        iv_history=load_iv_history(cache_dir / "iv_history.csv"),
+        earnings_history=load_earnings_history(cache_dir / "earnings_history.csv"),
     )
     position_tracker = PositionTracker(client=client, order_log=order_log, settings=settings)
     position_reconciler = PositionReconciler(

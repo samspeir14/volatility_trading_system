@@ -4,6 +4,8 @@ from datetime import date
 import numpy as np
 import pandas as pd
 
+from pathlib import Path
+
 from config import MARKET_INDICES, Ticker
 from data import (
     AsyncTradierClient,
@@ -11,6 +13,7 @@ from data import (
     compute_log_returns,
     fetch_and_cache,
 )
+from data.macro_calendar import events_by_label
 from features.cross_ticker import (
     RATIO_FEATURE_COLUMNS,
     add_ratio_features,
@@ -88,12 +91,36 @@ OVERNIGHT_COLUMNS: list[str] = [
 ]
 
 # Deterministic calendar dummies (added 2026-08-14): day-of-week and
-# expiration effects on next-day vol. Event-DISTANCE features (earnings,
-# FOMC/CPI) are deliberately absent — the earnings DB only caches upcoming
-# dates and macro_calendar.py only covers 2026, so neither has training-window
-# history; adding them without a backfill would create regime-broken columns.
+# expiration effects on next-day vol.
 CALENDAR_COLUMNS: list[str] = [
     "dow_mon", "dow_fri", "opex_friday", "month_end",
+]
+
+# Macro release dummies (added 2026-08-14): scheduled FOMC/CPI/PPI/PCE/NFP
+# days from data/macro_calendar.py (backfilled 2022-2026 from the official
+# OMB schedule PDFs). "tomorrow" is the next BUSINESS day after the bar —
+# the event the h=1 target's window will contain.
+MACRO_FEATURE_COLUMNS: list[str] = [
+    "macro_any_tomorrow", "macro_any_today",
+    "fomc_tomorrow", "cpi_tomorrow", "nfp_tomorrow",
+]
+
+# Earnings-distance features (added 2026-08-14; data/cache/earnings_history.csv
+# via scripts/backfill_earnings_history.py). Impact date = the trading day
+# containing the reaction (report date +1 BDay for after-market-close
+# reports). Uses the realized calendar — in reality dates are announced weeks
+# ahead, so treating the near-term schedule as known is point-in-time honest
+# enough for a 21-day-capped horizon. NaN for ETFs / missing data.
+EARNINGS_FEATURE_COLUMNS: list[str] = [
+    "earnings_tomorrow", "days_to_earnings", "days_since_earnings",
+]
+
+# Implied-vol features (added 2026-08-14; data/cache/iv_history.csv via
+# scripts/backfill_iv_history.py — DoltHub composite ~30d IV, sparse ~3/week
+# before 2025). Forward-filled onto bar dates with a 5-day staleness limit.
+# Levels have a source-specific offset; changes/ranks carry the signal.
+IV_FEATURE_COLUMNS: list[str] = [
+    "iv_level", "iv_minus_hv", "iv_chg_5", "iv_pctile_252",
 ]
 
 # h=1 target-side columns (added with the within-stock deviation model).
@@ -110,7 +137,7 @@ H1_FEATURE_COLUMNS: list[str] = [
 
 # Full feature matrix produced by build_features():
 # 28 baseline + 6 OHLC vol + 4 distribution + 7 ratios + 7 h=1
-# + 4 leverage + 3 overnight + 4 calendar = 63.
+# + 4 leverage + 3 overnight + 4 calendar + 5 macro + 3 earnings + 4 IV = 75.
 FEATURE_COLUMNS: list[str] = (
     BASELINE_FEATURE_COLUMNS
     + OHLC_VOL_COLUMNS
@@ -120,6 +147,9 @@ FEATURE_COLUMNS: list[str] = (
     + LEVERAGE_COLUMNS
     + OVERNIGHT_COLUMNS
     + CALENDAR_COLUMNS
+    + MACRO_FEATURE_COLUMNS
+    + EARNINGS_FEATURE_COLUMNS
+    + IV_FEATURE_COLUMNS
 )
 
 
@@ -163,6 +193,28 @@ HORIZON_FEATURE_SETS: dict[int, list[str]] = {
 }
 
 
+def load_iv_history(path: Path) -> pd.DataFrame | None:
+    """Load the DoltHub IV backfill CSV (symbol, date, iv_current, hv_current).
+    Returns None (features become NaN) when the file is missing/empty."""
+    if not path.exists():
+        logger.warning("iv history missing at %s — IV features will be NaN", path)
+        return None
+    df = pd.read_csv(path, parse_dates=["date"])
+    return df if not df.empty else None
+
+
+def load_earnings_history(path: Path) -> pd.DataFrame | None:
+    """Load the DoltHub earnings backfill CSV (symbol, date, when).
+    Returns None (features become NaN) when the file is missing/empty."""
+    if not path.exists():
+        logger.warning(
+            "earnings history missing at %s — earnings features will be NaN", path,
+        )
+        return None
+    df = pd.read_csv(path, parse_dates=["date"])
+    return df if not df.empty else None
+
+
 class FeaturePipeline:
     def __init__(
         self,
@@ -171,12 +223,43 @@ class FeaturePipeline:
         market_indices: tuple[str, ...] = MARKET_INDICES,
         garch_min_history: int = 252,
         garch_refit_every: int = 21,
+        iv_history: pd.DataFrame | None = None,
+        earnings_history: pd.DataFrame | None = None,
     ):
         self._store = store
         self._watchlist = watchlist
         self._indices = market_indices
         self._garch_min_history = garch_min_history
         self._garch_refit_every = garch_refit_every
+
+        # label -> frozenset[date] for the macro dummies
+        self._macro_events = events_by_label()
+        self._macro_all = frozenset().union(*self._macro_events.values())
+
+        # symbol -> sorted DatetimeIndex of earnings IMPACT days (the trading
+        # day containing the reaction: report date +1 BDay for AMC reports).
+        self._earnings_impacts: dict[str, pd.DatetimeIndex] = {}
+        if earnings_history is not None:
+            for sym, grp in earnings_history.groupby("symbol"):
+                when = grp["when"].fillna("").str.lower()
+                dates = pd.to_datetime(grp["date"])
+                impact = dates.where(
+                    ~when.str.startswith("after"),
+                    dates + pd.tseries.offsets.BDay(1),
+                )
+                self._earnings_impacts[str(sym)] = pd.DatetimeIndex(
+                    sorted(impact.unique())
+                )
+
+        # symbol -> (iv Series, hv Series) indexed by observation date
+        self._iv_by_symbol: dict[str, tuple[pd.Series, pd.Series]] = {}
+        if iv_history is not None:
+            for sym, grp in iv_history.groupby("symbol"):
+                g = grp.drop_duplicates("date").set_index("date").sort_index()
+                self._iv_by_symbol[str(sym)] = (
+                    pd.to_numeric(g["iv_current"], errors="coerce"),
+                    pd.to_numeric(g["hv_current"], errors="coerce"),
+                )
 
     async def ensure_data(
         self,
@@ -215,7 +298,7 @@ class FeaturePipeline:
             if sym not in returns or bars[sym].empty:
                 logger.warning("No bars for %s; skipping", sym)
                 continue
-            per_ticker[sym] = self._build_single_ticker(bars[sym], returns[sym])
+            per_ticker[sym] = self._build_single_ticker(sym, bars[sym], returns[sym])
 
         # Cross-ticker features (writes into per_ticker frames in place)
         if per_ticker:
@@ -234,7 +317,7 @@ class FeaturePipeline:
         result = result.reindex(columns=FEATURE_COLUMNS).dropna(how="all")
         return result
 
-    def _build_single_ticker(self, b: pd.DataFrame, r: pd.Series) -> pd.DataFrame:
+    def _build_single_ticker(self, sym: str, b: pd.DataFrame, r: pd.Series) -> pd.DataFrame:
         df = pd.DataFrame(index=b.index, dtype=float)
 
         # Realized vol
@@ -324,6 +407,63 @@ class FeaturePipeline:
         df["opex_friday"] = ((dow == 4) & (dts.day >= 15) & (dts.day <= 21)).astype(float)
         next_bday = dts + pd.tseries.offsets.BDay(1)
         df["month_end"] = (next_bday.month != dts.month).astype(float)
+
+        # Macro release dummies (scheduled dates — calendar knowledge)
+        today_d = np.array([d.date() for d in dts])
+        tomorrow_d = np.array([d.date() for d in next_bday])
+
+        def _in(day_arr: np.ndarray, events: frozenset) -> np.ndarray:
+            return np.array([d in events for d in day_arr], dtype=float)
+
+        df["macro_any_tomorrow"] = _in(tomorrow_d, self._macro_all)
+        df["macro_any_today"] = _in(today_d, self._macro_all)
+        df["fomc_tomorrow"] = _in(tomorrow_d, self._macro_events.get("FOMC decision", frozenset()))
+        df["cpi_tomorrow"] = _in(tomorrow_d, self._macro_events.get("CPI release", frozenset()))
+        df["nfp_tomorrow"] = _in(tomorrow_d, self._macro_events.get("NFP release", frozenset()))
+
+        # Earnings-distance features (NaN when no earnings data for symbol)
+        impacts = self._earnings_impacts.get(sym)
+        if impacts is not None and len(impacts) > 0:
+            imp = impacts.values
+            t = dts.values
+            nxt = np.searchsorted(imp, t, side="right")  # first impact > t
+            prv = nxt - 1
+            one_day = np.timedelta64(1, "D")
+            days_to = np.where(
+                nxt < len(imp),
+                (imp[np.minimum(nxt, len(imp) - 1)] - t) / one_day,
+                np.nan,
+            )
+            days_since = np.where(
+                prv >= 0,
+                (t - imp[np.maximum(prv, 0)]) / one_day,
+                np.nan,
+            )
+            df["earnings_tomorrow"] = np.isin(next_bday.values, imp).astype(float)
+            df["days_to_earnings"] = np.minimum(days_to, 21.0)
+            df["days_since_earnings"] = np.minimum(days_since, 63.0)
+        else:
+            df["earnings_tomorrow"] = float("nan")
+            df["days_to_earnings"] = float("nan")
+            df["days_since_earnings"] = float("nan")
+
+        # Implied-vol features (NaN when no IV data for symbol; observations
+        # are sparse pre-2025, so ffill onto bar dates with a 5-day limit)
+        iv_pair = self._iv_by_symbol.get(sym)
+        if iv_pair is not None:
+            iv_al = iv_pair[0].reindex(dts, method="ffill", limit=5)
+            hv_al = iv_pair[1].reindex(dts, method="ffill", limit=5)
+            iv_al.index = df.index
+            hv_al.index = df.index
+            df["iv_level"] = iv_al
+            df["iv_minus_hv"] = iv_al - hv_al
+            df["iv_chg_5"] = iv_al.diff(5)
+            df["iv_pctile_252"] = iv_al.rolling(252, min_periods=60).rank(pct=True)
+        else:
+            df["iv_level"] = float("nan")
+            df["iv_minus_hv"] = float("nan")
+            df["iv_chg_5"] = float("nan")
+            df["iv_pctile_252"] = float("nan")
 
         return df
 

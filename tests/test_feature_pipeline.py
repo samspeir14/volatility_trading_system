@@ -53,7 +53,7 @@ async def test_small_pipeline() -> None:
         # Shape
         assert df.index.names == ["symbol", "date"], f"index names = {df.index.names}"
         assert list(df.columns) == FEATURE_COLUMNS, "column order/identity mismatch"
-        assert len(df.columns) == 63, f"expected 63 features, got {len(df.columns)}"
+        assert len(df.columns) == 75, f"expected 75 features, got {len(df.columns)}"
         # Confirm new feature blocks all present
         for col in OHLC_VOL_COLUMNS:
             assert col in df.columns, f"missing OHLC vol column {col}"
@@ -139,6 +139,58 @@ async def test_full_watchlist_perf() -> None:
         print("PASS: build_features under the 30s gate")
     finally:
         store.close()
+
+
+def test_new_feature_blocks_offline() -> None:
+    """Pure unit test of the macro/earnings/IV feature blocks via
+    _build_single_ticker (no store access on that path). Anchored on the
+    2026-06-17 FOMC decision from the backfilled calendar."""
+    import pandas as pd
+
+    idx = pd.date_range("2026-06-08", "2026-06-26", freq="B")
+    n = len(idx)
+    rng = np.random.default_rng(0)
+    close = pd.Series(100 * np.exp(np.cumsum(rng.normal(0, 0.01, n))), index=idx)
+    bars = pd.DataFrame({
+        "open": close.shift(1).fillna(100.0) * 1.001,
+        "high": close * 1.01, "low": close * 0.99,
+        "close": close, "volume": np.full(n, 1e6),
+    }, index=idx)
+    returns = np.log(close / close.shift(1))
+
+    iv_hist = pd.DataFrame({
+        "symbol": "TEST",
+        "date": idx[:-4],  # last 4 bar days missing -> ffill (limit 5) covers
+        "iv_current": np.linspace(0.30, 0.40, n - 4),
+        "hv_current": np.full(n - 4, 0.25),
+    })
+    earn_hist = pd.DataFrame({
+        "symbol": ["TEST"],
+        "date": [pd.Timestamp("2026-06-17")],
+        "when": ["After market close"],   # impact day = 2026-06-18
+    })
+
+    pipe = FeaturePipeline(
+        None, [], iv_history=iv_hist, earnings_history=earn_hist,
+    )
+    df = pipe._build_single_ticker("TEST", bars, returns)
+
+    row_0616 = df.loc[pd.Timestamp("2026-06-16")]
+    row_0617 = df.loc[pd.Timestamp("2026-06-17")]
+    row_0618 = df.loc[pd.Timestamp("2026-06-18")]
+    # FOMC decision 2026-06-17
+    assert row_0616["fomc_tomorrow"] == 1.0 and row_0616["macro_any_tomorrow"] == 1.0
+    assert row_0617["macro_any_today"] == 1.0 and row_0617["fomc_tomorrow"] == 0.0
+    # AMC earnings 06-17 -> impact 06-18
+    assert row_0617["earnings_tomorrow"] == 1.0
+    assert row_0618["days_since_earnings"] == 0.0
+    assert row_0616["days_to_earnings"] == 2.0
+    # IV block: level ffilled to the end, spread positive, percentile rises
+    assert np.isfinite(df["iv_level"].iloc[-1])
+    assert (df["iv_minus_hv"].dropna() > 0).all()
+    # signed returns / overnight present
+    assert np.isfinite(row_0617["ret_1"]) and np.isfinite(row_0617["overnight_gap"])
+    print("new_feature_blocks: macro/earnings/IV blocks compute point-in-time values")
 
 
 def test_horizon_feature_sets_structure() -> None:

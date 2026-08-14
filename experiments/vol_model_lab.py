@@ -123,7 +123,13 @@ def run_h1() -> None:
         watchlist = _drop_stale_symbols(store, watchlist)
         print(f"tickers after staleness filter: {len(watchlist)}")
 
-        pipeline = FeaturePipeline(store, watchlist)
+        from features.feature_pipeline import load_earnings_history, load_iv_history
+        cache_dir = Path(settings.cache_db_path).parent
+        pipeline = FeaturePipeline(
+            store, watchlist,
+            iv_history=load_iv_history(cache_dir / "iv_history.csv"),
+            earnings_history=load_earnings_history(cache_dir / "earnings_history.csv"),
+        )
         t0 = time.monotonic()
         feature_df = pipeline.build_features(start, end)
         print(f"features: {feature_df.shape} (built in {time.monotonic() - t0:.1f}s)")
