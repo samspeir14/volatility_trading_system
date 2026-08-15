@@ -47,6 +47,23 @@ def daily_ohlc_vol(bars: pd.DataFrame) -> pd.Series:
     return gk.fillna(park).fillna(c2c)
 
 
+def daily_total_vol(bars: pd.DataFrame) -> pd.Series:
+    """Single-day TOTAL vol proxy: sqrt(overnight_gap² + intraday²), with
+    intraday = daily_ohlc_vol (GK-first). The GK family measures the session
+    only; options price close-to-close, and the overnight gap carries ~40%
+    of close-to-close variance on this watchlist (replay_analysis
+    2026-08-14). LAB-ONLY until a checkpoint gate vote — the production
+    target stays GK. Rows where the intraday estimator is NaN (halt /
+    placeholder bar) stay NaN; a missing gap (first row, bad open) degrades
+    to intraday-only."""
+    o = _positive_or_nan(bars["open"])
+    c = _positive_or_nan(bars["close"])
+    gap = np.log(o / c.shift(1))
+    intraday = daily_ohlc_vol(bars)
+    total = np.sqrt(gap.pow(2).fillna(0.0) + intraday.pow(2))
+    return total.where(intraday.notna())
+
+
 def log_vol(vol: pd.Series) -> pd.Series:
     return np.log(vol + GK_EPS)
 
@@ -63,22 +80,25 @@ def rolling_log_vol_baseline(
 
 def build_h1_deviation_target(
     bars_by_symbol: dict[str, pd.DataFrame],
+    vol_fn=daily_ohlc_vol,
 ) -> tuple[pd.Series, pd.Series, pd.Series]:
     """Returns (y, b, lv), each indexed by (symbol, date):
 
-        lv[(s,t)] = log(daily_ohlc_vol_t + GK_EPS)
+        lv[(s,t)] = log(vol_fn_t + GK_EPS)
         b[(s,t)]  = rolling_log_vol_baseline(lv_s) at t
         y[(s,t)]  = lv[(s,t+1)] - b[(s,t)]
 
-    y is NaN-dropped (needs both tomorrow's vol and today's baseline); b and
-    lv are returned full-length for level reconstruction and HAR inputs."""
+    `vol_fn` is the single-day vol proxy (default GK-first daily_ohlc_vol;
+    the lab's Yang-Zhang arm passes daily_total_vol). y is NaN-dropped
+    (needs both tomorrow's vol and today's baseline); b and lv are returned
+    full-length for level reconstruction and HAR inputs."""
     y_parts: list[pd.Series] = []
     b_parts: list[pd.Series] = []
     lv_parts: list[pd.Series] = []
     for symbol, bars in bars_by_symbol.items():
         if bars.empty:
             continue
-        lv = log_vol(daily_ohlc_vol(bars))
+        lv = log_vol(vol_fn(bars))
         b = rolling_log_vol_baseline(lv)
         y = lv.shift(-1) - b
         idx = pd.MultiIndex.from_product(
