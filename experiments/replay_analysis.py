@@ -86,8 +86,11 @@ def _project(frame: pd.DataFrame, phi: pd.Series, dte: int) -> pd.Series:
     return pd.Series(out, index=frame.index)
 
 
-def _zgate_counts(div: pd.Series) -> tuple[int, int]:
-    sells = buys = 0
+def _zgate_masks(div: pd.Series) -> tuple[pd.Series, pd.Series]:
+    """(sell_mask, buy_mask) over div's index: trailing-z triggers under the
+    production thresholds and the |div| cap."""
+    sell = pd.Series(False, index=div.index)
+    buy = pd.Series(False, index=div.index)
     for _, g in div.groupby(level="symbol"):
         g = g.dropna()
         if len(g) <= Z_MIN_OBS:
@@ -96,9 +99,43 @@ def _zgate_counts(div: pd.Series) -> tuple[int, int]:
         roll_std = g.shift(1).rolling(Z_MIN_OBS, min_periods=Z_MIN_OBS).std()
         z = (g - roll_mean) / roll_std
         ok = g.abs() <= MAX_DIV
-        sells += int(((z >= SELL_Z) & ok).sum())
-        buys += int(((z <= BUY_Z) & ok).sum())
-    return sells, buys
+        sell.loc[g.index] = ((z >= SELL_Z) & ok).to_numpy()
+        buy.loc[g.index] = ((z <= BUY_Z) & ok).to_numpy()
+    return sell, buy
+
+
+def _zgate_counts(div: pd.Series) -> tuple[int, int]:
+    sell, buy = _zgate_masks(div)
+    return int(sell.sum()), int(buy.sum())
+
+
+def _earnings_excluded(index: pd.MultiIndex, cache_dir: Path, window_bd: int = 7) -> pd.Series:
+    """True where the bot's earnings gate would block entry: an earnings
+    impact date inside (t, t + window_bd business days]. Impact date = the
+    trading day the reaction lands (AMC -> next session), mirroring the
+    pipeline's convention."""
+    df = pd.read_csv(cache_dir / "earnings_history.csv", parse_dates=["date"])
+    impact_by_symbol: dict[str, np.ndarray] = {}
+    for s, g in df.groupby("symbol"):
+        when = g["when"].fillna("").astype(str)
+        impact = g["date"].where(
+            ~when.str.startswith("After"),
+            g["date"] + pd.tseries.offsets.BDay(1),
+        )
+        impact_by_symbol[s] = np.sort(impact.to_numpy(dtype="datetime64[ns]"))
+    out = pd.Series(False, index=index)
+    dates = pd.DatetimeIndex(index.get_level_values("date"))
+    horizon = dates + pd.tseries.offsets.BDay(window_bd)
+    syms = index.get_level_values("symbol")
+    for s in pd.unique(syms):
+        imp = impact_by_symbol.get(s)
+        if imp is None or not len(imp):
+            continue
+        m = syms == s
+        lo = np.searchsorted(imp, dates[m].to_numpy(), side="right")
+        hi = np.searchsorted(imp, horizon[m].to_numpy(), side="right")
+        out.iloc[np.flatnonzero(m)] = hi > lo
+    return out
 
 
 def main() -> int:
@@ -205,6 +242,43 @@ def main() -> int:
                   f"mean|div|={div.abs().mean():.4f} p90|div|={div.abs().quantile(0.9):.4f} | "
                   f"|div|>=2/5/10pts: {counts[0.02]}/{counts[0.05]}/{counts[0.10]} of {n} | "
                   f"z-gate SELL={sells} BUY={buys}")
+
+    # --- performance ON PROXY TRADE DAYS (DTE 7): z-gate triggers minus
+    # earnings-window exclusions, i.e. the rows the bot would actually act
+    # on (cost gate not replayable) ---
+    print("\n=== performance on proxy trade days (DTE 7, earnings-gated) ===")
+    from model.evaluation import sign_hit_rate
+    blocked = _earnings_excluded(common, cache_dir, window_bd=7)
+    for name in ("old", "new"):
+        fc = _project(runs[name].loc[common], phi, 7)
+        paired = pd.concat([fc.rename("f"), iv_al.rename("iv")], axis=1).dropna()
+        div = paired["f"] - paired["iv"]
+        sell, buy = _zgate_masks(div)
+        trig = (sell | buy) & ~blocked.reindex(div.index, fill_value=False)
+        rows_t = runs[name].loc[div.index[trig]]
+        h_t = runs["har"].loc[div.index[trig]]
+        w = within_ticker_r2(rows_t["actual_dev"], rows_t["predicted_dev"])
+        sh = sign_hit_rate(rows_t["actual_dev"], rows_t["predicted_dev"])
+        mse_m = float(((rows_t["predicted_dev"] - rows_t["actual_dev"]) ** 2).mean())
+        mse_h = float(((h_t["predicted_dev"] - h_t["actual_dev"]) ** 2).mean())
+        n_dates = rows_t.index.get_level_values("date").nunique()
+        print(f"  {name}: n={len(rows_t)} rows ({int(sell.sum())}+{int(buy.sum())} "
+              f"triggers, {int((~blocked.reindex(div.index, fill_value=False) & (sell | buy)).sum())} after earnings gate, "
+              f"{n_dates} dates) within_R2={w:+.4f} sign_hit={sh:.3f} "
+              f"dev-MSE={mse_m:.4f} vs har {mse_h:.4f}")
+
+    # --- overnight share of close-to-close variance (the GK target ignores
+    # the overnight gap; options price it) ---
+    print("\n=== overnight share of close-to-close variance ===")
+    shares = []
+    for s, b in bars.items():
+        c, o = b["close"], b["open"]
+        r_on = np.log(o / c.shift(1)).dropna()
+        r_cc = np.log(c / c.shift(1)).dropna()
+        if len(r_cc) > 100 and float(r_cc.var()) > 0:
+            shares.append(float(r_on.var() / r_cc.var()))
+    print(f"  mean var(overnight)/var(close-to-close) across "
+          f"{len(shares)} names: {np.mean(shares):.3f} (median {np.median(shares):.3f})")
 
     print(f"\ntotal: {(time.monotonic() - t0) / 60.0:.1f} min")
     return 0
