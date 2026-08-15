@@ -177,13 +177,26 @@ def run_h1() -> None:
     print(f"lgbm-full walk-forward: {len(wf_lgbm_full)} OOS rows ({time.monotonic() - t0:.1f}s)")
 
     # Subset selection: nested top-N candidates ordered by importance mean
-    # rank, winner = best OOS within-ticker R². All candidates run on the
-    # same target rows, so their walk-forward outputs are directly comparable.
-    full_within = within_ticker_r2(
-        wf_lgbm_full["actual_dev"], wf_lgbm_full["predicted_dev"]
-    )
-    print(f"\nsubset selection (metric: OOS within-ticker R²):")
-    print(f"  full ({len(feature_df.columns):2d} feats)  within_R²={full_within:+.4f}")
+    # rank. WINNER = best OOS within-ticker R² on ELIGIBLE rows — (symbol,
+    # day) pairs the earnings gate would allow the bot to trade (exogenous,
+    # identical across candidates; z-gate trigger days are endogenous to each
+    # candidate and too few to select on). All-days R² is printed for
+    # context: earnings/macro eves are the easiest vol days, so pooled
+    # numbers flatter features that only fire on untradeable days.
+    from experiments.replay_analysis import _earnings_excluded
+    cache_dir_sel = Path(load_settings().cache_db_path).parent
+    eligible = ~_earnings_excluded(wf_lgbm_full.index, cache_dir_sel, window_bd=7)
+    print(f"\neligible rows (earnings-gate pass): {int(eligible.sum())} "
+          f"of {len(eligible)}")
+
+    def _within(frame: pd.DataFrame, mask=None) -> float:
+        f = frame if mask is None else frame.loc[mask.reindex(frame.index, fill_value=False)]
+        return within_ticker_r2(f["actual_dev"], f["predicted_dev"])
+
+    full_within = _within(wf_lgbm_full, eligible)
+    print("subset selection (metric: OOS within-ticker R² on ELIGIBLE rows):")
+    print(f"  full ({len(feature_df.columns):2d} feats)  eligible_R²={full_within:+.4f} "
+          f"(all-days {_within(wf_lgbm_full):+.4f})")
     best_subset: list[str] | None = None  # None = full feature set
     best_within = full_within
     wf_lgbm_top = wf_lgbm_full
@@ -197,11 +210,9 @@ def run_h1() -> None:
             train_window_days=TRAIN_WINDOW_DAYS, refit_every=REFIT_EVERY,
             vol_fn=VOL_FN,
         )
-        candidate_within = within_ticker_r2(
-            wf_candidate["actual_dev"], wf_candidate["predicted_dev"]
-        )
-        print(f"  top-{top_n:2d}           within_R²={candidate_within:+.4f} "
-              f"({time.monotonic() - t0:.1f}s)")
+        candidate_within = _within(wf_candidate, eligible)
+        print(f"  top-{top_n:2d}           eligible_R²={candidate_within:+.4f} "
+              f"(all-days {_within(wf_candidate):+.4f}, {time.monotonic() - t0:.1f}s)")
         if candidate_within > best_within:
             best_within = candidate_within
             best_subset = candidate
@@ -230,10 +241,8 @@ def run_h1() -> None:
         train_window_days=TRAIN_WINDOW_DAYS, refit_every=REFIT_EVERY,
         vol_fn=VOL_FN,
     )
-    ivw_within = within_ticker_r2(
-        wf_lgbm_ivw["actual_dev"], wf_lgbm_ivw["predicted_dev"]
-    )
-    print(f"\nIVW variant within_R²={ivw_within:+.4f} vs unweighted "
+    ivw_within = _within(wf_lgbm_ivw, eligible)
+    print(f"\nIVW variant eligible_R²={ivw_within:+.4f} vs unweighted "
           f"{best_within:+.4f} ({time.monotonic() - t0:.1f}s)")
     print("IVW VERDICT: " + (
         "WEIGHTED wins — set inverse_variance_weights=True in the retrain job"
