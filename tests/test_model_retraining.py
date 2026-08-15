@@ -112,6 +112,18 @@ def run_h1_retrain(settings) -> int:
             print(f"WARNING: daily bar refresh failed ({e}); "
                   f"training on cached bars", file=sys.stderr)
 
+        # Refresh earnings/IV history (DoltHub, incremental) so the
+        # earnings_*/iv_* features train on current data. Fail-soft like the
+        # bar refresh: a DoltHub outage must not kill the weekly cron.
+        for mod_name in ("scripts.backfill_earnings_history",
+                         "scripts.backfill_iv_history"):
+            try:
+                import importlib
+                importlib.import_module(mod_name).main()
+            except Exception as e:
+                print(f"WARNING: {mod_name} failed ({e}); "
+                      f"training on cached history", file=sys.stderr)
+
         all_symbols = [t.symbol for t in tickers]
         excluded_symbols = sorted(find_stale_symbols(store, all_symbols))
         if excluded_symbols:
