@@ -1,11 +1,16 @@
 """Next-day realized-vol target for the h=1 within-stock model.
 
-The target is the deviation of tomorrow's log Garman-Klass vol from the
-stock's own trailing 63-day mean log vol:
+The target is the deviation of tomorrow's log vol from the stock's own
+trailing 63-day mean log vol:
 
-    lv_t  = log(gk_vol_t + GK_EPS)
+    lv_t  = log(vol_t + GK_EPS)
     b_t   = mean(lv_{t-62..t})        # >= 40 observations, data <= t only
     y_t   = lv_{t+1} - b_t
+
+The single-day vol proxy is selectable (PRODUCTION_TARGET_PROXY):
+"total" (production since 2026-08-14) = sqrt(overnight_gap² + GK²), the
+close-to-close vol options actually price; "gk" = the legacy intraday-only
+Garman-Klass proxy, kept for lab comparisons.
 
 Demeaning by b_t makes pooling across tickers legitimate: the model never
 gets credit for knowing a ticker's vol level, only for timing deviations
@@ -21,6 +26,14 @@ from features.ohlc_vol import garman_klass_vol, parkinson_vol
 GK_EPS = 1e-8
 BASELINE_WINDOW = 63
 BASELINE_MIN_OBS = 40
+
+# The vol proxy production trains AND serves on. Switched "gk" -> "total"
+# 2026-08-14 after the yz_lab verdict: against realized TOTAL variance the
+# total-vol arm's QLIKE was 0.3949 vs GK's 0.6428 (DM t=-10.99) — the GK
+# target ignored the overnight ~40% of close-to-close variance that options
+# price, tilting signals toward SELL. main.py and the retrain job both read
+# this constant; the deploy retrain's gate vote is the promotion checkpoint.
+PRODUCTION_TARGET_PROXY = "total"
 
 
 def _positive_or_nan(s: pd.Series) -> pd.Series:
@@ -62,6 +75,14 @@ def daily_total_vol(bars: pd.DataFrame) -> pd.Series:
     intraday = daily_ohlc_vol(bars)
     total = np.sqrt(gap.pow(2).fillna(0.0) + intraday.pow(2))
     return total.where(intraday.notna())
+
+
+def target_vol_fn(proxy: str = PRODUCTION_TARGET_PROXY):
+    """Resolve a target_proxy name to its single-day vol function."""
+    fns = {"gk": daily_ohlc_vol, "total": daily_total_vol}
+    if proxy not in fns:
+        raise ValueError(f"unknown target proxy {proxy!r}")
+    return fns[proxy]
 
 
 def log_vol(vol: pd.Series) -> pd.Series:
