@@ -59,7 +59,7 @@ When stopped, open positions persist in the Tradier sandbox. Restart picks up wh
 
 ## 6. Weekly model retraining (cron)
 
-Retrain the h=1 within-stock deviation model every Sunday at 3am UTC: pooled LightGBM (frozen top-25 feature set incl. IV/earnings/macro-event features) + the HAR-RV benchmark. The job first refreshes daily bars and the DoltHub earnings/IV history CSVs (`data/cache/earnings_history.csv`, `iv_history.csv`) fail-soft, then scores against GARCH/EWMA/persistence baselines on identical walk-forward OOS rows. The job applies the **acceptance gate** (`route` = argmax out-of-sample within-ticker deviation R² over LightGBM / HAR / their 50/50 blend), writes `lgbm_h1_<date>.joblib` + `har_h1_<date>.joblib` + `h1_oos_predictions.parquet` + a schema-v2 `latest_retrain_r2.json` (previous JSON kept as `.bak`), then restarts the bot so the routing takes effect.
+Retrain the h=1 within-stock deviation model every Sunday at 3am UTC: pooled LightGBM (frozen top-10 feature set — earnings/IV/calendar features lead it, selected on eligible-day within-ticker R²) + the HAR-RV benchmark. The job first refreshes daily bars and the DoltHub earnings/IV history CSVs (`data/cache/earnings_history.csv`, `iv_history.csv`) fail-soft, then scores against GARCH/EWMA/persistence baselines on identical walk-forward OOS rows. The job applies the **acceptance gate** (`route` = argmax out-of-sample within-ticker deviation R² over LightGBM / HAR / their 50/50 blend), writes `lgbm_h1_<date>.joblib` + `har_h1_<date>.joblib` + `h1_oos_predictions.parquet` + a schema-v2 `latest_retrain_r2.json` (previous JSON kept as `.bak`), then restarts the bot so the routing takes effect.
 
 ### 6a. NOPASSWD sudoers entry for the restart
 
