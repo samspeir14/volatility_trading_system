@@ -195,24 +195,24 @@ def test_new_feature_blocks_offline() -> None:
 
 def test_horizon_feature_sets_structure() -> None:
     """Pure unit test — no API or cache needed. h=1 is the only production
-    model; its frozen set (top-25 won the 2026-08-14 post-backfill lab's
-    within-ticker-R² subset selection at +0.2008, beating the full 75-column
-    set's +0.1580) must stay a valid, duplicate-free subset of
-    FEATURE_COLUMNS. If FEATURE_COLUMNS grows, the frozen list intentionally
-    does NOT follow — re-freeze only from a lab WINNER."""
+    model; its frozen set (top-10 won the 2026-08-15 eligible-day selection
+    under the total-vol target: eligible +0.1954 / all-days +0.2620) must
+    stay a valid, duplicate-free subset of FEATURE_COLUMNS. If
+    FEATURE_COLUMNS grows, the frozen list intentionally does NOT follow —
+    re-freeze only from a lab WINNER."""
     assert set(HORIZON_FEATURE_SETS.keys()) == {1}, (
         f"unexpected horizons {set(HORIZON_FEATURE_SETS.keys())}"
     )
     feats = HORIZON_FEATURE_SETS[1]
-    assert len(feats) == 25, f"expected 25 features, got {len(feats)}"
-    assert len(set(feats)) == 25, "duplicate feature names"
+    assert len(feats) == 10, f"expected 10 features, got {len(feats)}"
+    assert len(set(feats)) == 10, "duplicate feature names"
     # Every selected feature must exist in the full FEATURE_COLUMNS set
     unknown = [f for f in feats if f not in FEATURE_COLUMNS]
     assert not unknown, f"features not in FEATURE_COLUMNS: {unknown}"
-    # The frozen set spans all three backfill-phase families — a regression
-    # here means the pipeline stopped feeding them.
-    assert "earnings_tomorrow" in feats and "iv_chg_5" in feats and "fomc_tomorrow" in feats
-    print("horizon_feature_sets: h=1 frozen top-25 is a valid FEATURE_COLUMNS subset")
+    # The frozen set spans the backfill-phase families (earnings, IV, and
+    # calendar) — a regression here means the pipeline stopped feeding them.
+    assert "earnings_tomorrow" in feats and "iv_chg_5" in feats and "month_end" in feats
+    print("horizon_feature_sets: h=1 frozen top-10 is a valid FEATURE_COLUMNS subset")
 
 
 async def main() -> int:

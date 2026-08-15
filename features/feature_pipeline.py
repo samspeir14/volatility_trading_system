@@ -158,24 +158,23 @@ FEATURE_COLUMNS: list[str] = (
 )
 
 
-# The production h=1 feature set. Selection criterion (since 2026-08-13):
+# The production h=1 feature set. Selection criterion (since 2026-08-15):
 # the lab nests top-N candidates by gain-importance mean rank and freezes the
-# subset with the best OOS within-ticker deviation R² — the strategy's
-# singular metric. FROZEN 2026-08-14 from the EC2 lab run after the
-# macro/earnings/IV backfill phase: top-25 won decisively (within R² +0.2008
-# vs +0.1580 for the full 75-column set — the first time trimming beat
-# keeping everything). 11 of the 25 are backfill-phase features
-# (earnings_tomorrow at #3, iv_chg_5 at #6). Kept as an explicit list so
-# later feature-matrix additions cannot silently change the production set —
+# subset with the best OOS within-ticker deviation R² on ELIGIBLE rows
+# (earnings-gate pass — days the bot can actually trade; all-days R²
+# flatters features that only fire on untradeable days). FROZEN 2026-08-15
+# under the total-vol target (ruler v3): top-10 won on BOTH scoreboards
+# (eligible +0.1954 / all-days +0.2620 vs the prior top-25's +0.1891 /
+# +0.2578). earnings_tomorrow ranks #1 even scored on rows where it never
+# fires — it teaches the model during training that earnings spikes are
+# events, not regime changes. Kept as an explicit list so later
+# feature-matrix additions cannot silently change the production set —
 # re-freeze only from a lab WINNER printout. Do not load from CSV at runtime.
 HORIZON_FEATURE_SETS: dict[int, list[str]] = {
     1: [
-        "har_dev_5", "dev_gk", "earnings_tomorrow", "volume_ratio",
-        "har_dev_22", "iv_chg_5", "vix3m_to_vix", "vix9d_to_vix",
-        "month_end", "market_avg_rv21", "vix_level", "fomc_tomorrow",
-        "iv_pctile_252", "days_to_earnings", "atr_roc", "corr_spy_21",
-        "rv_10_63_ratio", "ret_5", "macro_any_tomorrow", "ewma_94_97_ratio",
-        "nfp_tomorrow", "iv_minus_hv", "dow_mon", "rv_63", "rsi_14",
+        "earnings_tomorrow", "har_dev_5", "dev_gk", "vix3m_to_vix",
+        "volume_ratio", "har_dev_22", "iv_chg_5", "vix9d_to_vix",
+        "month_end", "iv_pctile_252",
     ],
 }
 
