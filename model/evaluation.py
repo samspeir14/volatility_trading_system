@@ -1,3 +1,4 @@
+import math
 from typing import Iterator
 
 import numpy as np
@@ -118,6 +119,96 @@ def per_ticker_r2_median(
     return float(np.median(r2s))
 
 
+def sign_hit_rate(actual: pd.Series, predicted: pd.Series) -> float:
+    """Fraction of rows where the forecast gets the deviation's SIGN right.
+    The cost gate monetizes direction-plus-threshold, not squared error, so
+    this is the report-only trade-aligned complement to within-ticker R².
+    Rows with zero actual (no direction to call) or NaN on either side are
+    dropped."""
+    paired = pd.concat(
+        [actual.rename("y"), predicted.rename("p")], axis=1
+    ).dropna()
+    paired = paired[paired["y"] != 0.0]
+    if paired.empty:
+        return float("nan")
+    hits = np.sign(paired["y"].to_numpy()) == np.sign(paired["p"].to_numpy())
+    return float(hits.mean())
+
+
+def per_ticker_spearman_median(
+    actual: pd.Series, predicted: pd.Series, level: str = "symbol"
+) -> float:
+    """Median across symbols of the within-symbol Spearman rank correlation
+    between forecast and actual deviation — pure time-ordering skill, immune
+    to scale and outliers. Report-only diagnostic. Symbols with <3 paired
+    rows are skipped."""
+    paired = pd.concat(
+        [actual.rename("y"), predicted.rename("p")], axis=1
+    ).dropna()
+    if paired.empty:
+        return float("nan")
+    rhos: list[float] = []
+    for _, grp in paired.groupby(level=level):
+        if len(grp) < 3:
+            continue
+        rho = grp["y"].rank().corr(grp["p"].rank())
+        if np.isfinite(rho):
+            rhos.append(float(rho))
+    if not rhos:
+        return float("nan")
+    return float(np.median(rhos))
+
+
+def diebold_mariano(
+    loss_a: pd.Series,
+    loss_b: pd.Series,
+    nw_lags: int = 5,
+    level: str = "date",
+) -> dict[str, float]:
+    """Diebold-Mariano test that model A's per-row losses are lower than
+    model B's, panel-safe: the loss differential d = loss_a − loss_b is
+    first averaged per date (cross-sectional correlation across tickers on
+    the same day would otherwise overstate the effective sample), then the
+    DM statistic is mean(d̄_t) / sqrt(NW_var(d̄_t)/T) with a Newey-West
+    (Bartlett) variance at `nw_lags`. Negative dm ⇒ A better. Two-sided
+    normal p-value. Requires a MultiIndex with `level` on both series;
+    NaN pairs dropped."""
+    paired = pd.concat(
+        [loss_a.rename("a"), loss_b.rename("b")], axis=1
+    ).dropna()
+    if paired.empty:
+        return {"dm": float("nan"), "p": float("nan"),
+                "mean_diff": float("nan"), "n_dates": 0}
+    d = (paired["a"] - paired["b"]).groupby(level=level).mean()
+    t_len = len(d)
+    if t_len < 10:
+        return {"dm": float("nan"), "p": float("nan"),
+                "mean_diff": float(d.mean()), "n_dates": t_len}
+    dc = d - d.mean()
+    gamma0 = float((dc ** 2).mean())
+    var = gamma0
+    for lag in range(1, min(nw_lags, t_len - 1) + 1):
+        cov = float((dc.iloc[lag:].to_numpy() * dc.iloc[:-lag].to_numpy()).mean())
+        var += 2.0 * (1.0 - lag / (nw_lags + 1.0)) * cov
+    if var <= 0:
+        return {"dm": float("nan"), "p": float("nan"),
+                "mean_diff": float(d.mean()), "n_dates": t_len}
+    dm = float(d.mean() / math.sqrt(var / t_len))
+    p = float(2.0 * (1.0 - 0.5 * (1.0 + math.erf(abs(dm) / math.sqrt(2.0)))))
+    return {"dm": dm, "p": p, "mean_diff": float(d.mean()), "n_dates": t_len}
+
+
+def qlike_losses(actual_var: pd.Series, forecast_var: pd.Series) -> pd.Series:
+    """Per-row QLIKE losses (a/f − log(a/f) − 1) for loss-differential
+    tests; same dropping rules as qlike()."""
+    paired = pd.concat(
+        [actual_var.rename("a"), forecast_var.rename("f")], axis=1
+    ).dropna()
+    paired = paired[(paired["a"] > 0) & (paired["f"] > 0)]
+    ratio = paired["a"] / paired["f"]
+    return ratio - np.log(ratio) - 1.0
+
+
 def r2_vs_baseline(actual: pd.Series, predicted: pd.Series, baseline: pd.Series) -> float:
     """Out-of-sample R² against a competing forecast: 1 − SSE_model / SSE_baseline
     (Campbell–Thompson style). Positive = model beats the baseline; 0 = ties it.
@@ -178,7 +269,35 @@ def h1_metrics_from_predictions(preds_long: pd.DataFrame) -> dict[str, dict[str,
             "dev_r2_within": within_ticker_r2(actual_dev, pred_dev),
             "dev_r2_ticker_median": per_ticker_r2_median(actual_dev, pred_dev),
             "qlike_level": qlike(actual_var, forecast_var),
+            "sign_hit_rate": sign_hit_rate(actual_dev, pred_dev),
+            "dev_spearman_median": per_ticker_spearman_median(actual_dev, pred_dev),
         }
+    return out
+
+
+def h1_dm_tests(
+    preds_long: pd.DataFrame,
+    model_a: str = "lgbm",
+    model_b: str = "har",
+) -> dict[str, dict[str, float]]:
+    """Diebold-Mariano tests of model A vs model B from the long-format
+    predictions frame: on per-row QLIKE losses (level-variance forecasts)
+    and on squared deviation errors. Negative dm ⇒ A better. Single
+    definition used by the lab and the retrain report."""
+    out: dict[str, dict[str, float]] = {}
+    frames = {}
+    for name in (model_a, model_b):
+        g = preds_long[preds_long["model"] == name].set_index(["symbol", "date"])
+        actual_var = np.exp(2.0 * g["actual_lv"])
+        forecast_var = np.exp(2.0 * (g["baseline_b"] + g["predicted_dev"]))
+        frames[name] = {
+            "qlike": qlike_losses(actual_var, forecast_var),
+            "dev_sq": (g["predicted_dev"] - g["actual_dev"]) ** 2,
+        }
+    for loss_name in ("qlike", "dev_sq"):
+        out[loss_name] = diebold_mariano(
+            frames[model_a][loss_name], frames[model_b][loss_name]
+        )
     return out
 
 

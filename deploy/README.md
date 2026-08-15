@@ -59,7 +59,7 @@ When stopped, open positions persist in the Tradier sandbox. Restart picks up wh
 
 ## 6. Weekly model retraining (cron)
 
-Retrain the h=1 within-stock deviation model every Sunday at 3am UTC: pooled LightGBM (top-20 features) + the HAR-RV benchmark, scored against GARCH/EWMA/persistence baselines on identical walk-forward OOS rows. The job applies the **acceptance gate** (LightGBM must beat HAR on out-of-sample QLIKE, else `route=har`), writes `lgbm_h1_<date>.joblib` + `har_h1_<date>.joblib` + `h1_oos_predictions.parquet` + a schema-v2 `latest_retrain_r2.json` (previous JSON kept as `.bak`), then restarts the bot so the routing takes effect.
+Retrain the h=1 within-stock deviation model every Sunday at 3am UTC: pooled LightGBM (frozen top-25 feature set incl. IV/earnings/macro-event features) + the HAR-RV benchmark. The job first refreshes daily bars and the DoltHub earnings/IV history CSVs (`data/cache/earnings_history.csv`, `iv_history.csv`) fail-soft, then scores against GARCH/EWMA/persistence baselines on identical walk-forward OOS rows. The job applies the **acceptance gate** (`route` = argmax out-of-sample within-ticker deviation R² over LightGBM / HAR / their 50/50 blend), writes `lgbm_h1_<date>.joblib` + `har_h1_<date>.joblib` + `h1_oos_predictions.parquet` + a schema-v2 `latest_retrain_r2.json` (previous JSON kept as `.bak`), then restarts the bot so the routing takes effect.
 
 ### 6a. NOPASSWD sudoers entry for the restart
 
@@ -81,7 +81,7 @@ sudo visudo -c -f /etc/sudoers.d/options-trader-restart   # validate before sudo
 ```bash
 sudo tee /etc/cron.d/options-trader-retrain >/dev/null <<'EOF'
 # Weekly h=1 retrain: tunes the pooled LightGBM, refits the HAR-RV benchmark,
-# applies the QLIKE acceptance gate, writes new artifacts +
+# applies the within-ticker-R² acceptance gate, writes new artifacts +
 # latest_retrain_r2.json, then restarts the bot so the routing takes effect.
 # The && chain means the restart only fires if the retrain succeeded.
 SHELL=/bin/bash
@@ -102,7 +102,7 @@ The `&&` between retraining and restart is load-bearing: if the retrain crashes 
 
 A nightly cron (`scripts/reconcile_h1_metrics.py`, e.g. `30 3 * * 2-6`) recomputes every reported h=1 metric from the stored `h1_oos_predictions.parquet` and alerts to Slack if any drifts from the JSON by more than 1e-6 — the routing decision can't silently detach from the predictions it was based on.
 
-The JSON's `h1` block carries per-model **pooled**, **within-ticker**, and **ticker-median deviation R²** plus **level QLIKE** (the acceptance-gate metric). Within-ticker is the one that matters: it strips per-symbol vol levels, so it scores timing skill rather than "TSLA is more volatile than KO". Pooled will read higher; that gap is cross-sectional level credit, not tradeable skill.
+The JSON's `h1` block carries per-model **pooled**, **within-ticker**, and **ticker-median deviation R²** plus **level QLIKE**. Within-ticker is the singular metric — the acceptance gate, hyperparameter tuning, and feature-subset selection all optimize it. It strips per-symbol vol levels, so it scores timing skill rather than "TSLA is more volatile than KO". Pooled will read higher; that gap is cross-sectional level credit, not tradeable skill. QLIKE and pooled R² are report-only diagnostics.
 
 ## 6d. The strategy and the account profile
 

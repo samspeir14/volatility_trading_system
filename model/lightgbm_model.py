@@ -17,6 +17,11 @@ class LightGBMVolPredictor:
     horizon: int
     hyperparams: dict
     feature_columns: list[str] = field(default_factory=list)
+    # Weight each training row by 1/var(y) of its ticker, so pooled MSE
+    # becomes an equal-per-ticker normalized loss — aligned with the
+    # within-ticker R² strategy metric instead of letting high-vol-of-vol
+    # names dominate the fit. Requires a (symbol, date) MultiIndex on y.
+    inverse_variance_weights: bool = False
     _model: lgb.LGBMRegressor | None = None
 
     def fit(self, X: pd.DataFrame, y: pd.Series) -> None:
@@ -25,13 +30,34 @@ class LightGBMVolPredictor:
         # LightGBM requires bagging_freq>0 for subsample<1 to take effect.
         if params.get("subsample", 1.0) < 1.0 and "bagging_freq" not in params:
             params["bagging_freq"] = 1
+        objective = params.pop("objective", "regression")
         self._model = lgb.LGBMRegressor(
-            objective="regression",
+            objective=objective,
             random_state=0,
             verbose=-1,
             **params,
         )
-        self._model.fit(X, y)
+        sample_weight = (
+            self._inverse_variance_weights(y)
+            if self.inverse_variance_weights else None
+        )
+        self._model.fit(X, y, sample_weight=sample_weight)
+
+    @staticmethod
+    def _inverse_variance_weights(y: pd.Series) -> np.ndarray:
+        if "symbol" not in (y.index.names or []):
+            raise ValueError(
+                "inverse_variance_weights=True needs a 'symbol' index level on y"
+            )
+        var = y.groupby(level="symbol").transform("var")
+        median_var = float(var.median())
+        if not np.isfinite(median_var) or median_var <= 0:
+            return np.ones(len(y))
+        # Floor at 10% of the median var so a near-constant symbol (or one
+        # with too few rows for a variance) cannot blow up its weights.
+        var = var.fillna(median_var).clip(lower=0.1 * median_var)
+        w = 1.0 / var
+        return (w / w.mean()).to_numpy()
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
         if self._model is None:
@@ -59,6 +85,7 @@ class LightGBMVolPredictor:
                 "horizon": self.horizon,
                 "hyperparams": self.hyperparams,
                 "feature_columns": self.feature_columns,
+                "inverse_variance_weights": self.inverse_variance_weights,
             },
             path,
         )
@@ -75,6 +102,7 @@ class LightGBMVolPredictor:
             horizon=bundle["horizon"],
             hyperparams=bundle["hyperparams"],
             feature_columns=bundle["feature_columns"],
+            inverse_variance_weights=bundle.get("inverse_variance_weights", False),
         )
         instance._model = bundle["model"]
         return instance

@@ -12,8 +12,10 @@ real-money profile), running autonomously on EC2 under systemd.
 1. **Forecast.** A pooled LightGBM predicts each ticker's next-day
    log-GK-volatility *deviation* from its own 63-day baseline (within-stock
    timing skill, not "TSLA is more volatile than KO"). A HAR-RV benchmark
-   trains alongside it; a weekly acceptance gate (out-of-sample QLIKE) routes
-   production to whichever is actually better (`route=lgbm|har`).
+   trains alongside it; a weekly acceptance gate (out-of-sample within-ticker
+   deviation R² — the strategy's singular metric) routes production to
+   whichever is actually better: LightGBM, HAR, or their 50/50 blend
+   (`route=lgbm|har|blend`).
 2. **Term-project.** The 1-day forecast is decayed toward the ticker's mean
    vol along its GARCH persistence to the exact DTE of each candidate option,
    then compared to that expiration's ATM implied vol. Beyond ~2 weeks the

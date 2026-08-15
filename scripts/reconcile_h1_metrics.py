@@ -34,6 +34,8 @@ CHECKED_METRICS = (
     "deviation_r2_within",
     "deviation_r2_ticker_median",
     "qlike_level",
+    "sign_hit_rate",
+    "dev_spearman_median",
 )
 # JSON metric key -> key in h1_metrics_from_predictions output
 _METRIC_MAP = {
@@ -41,6 +43,8 @@ _METRIC_MAP = {
     "deviation_r2_within": "dev_r2_within",
     "deviation_r2_ticker_median": "dev_r2_ticker_median",
     "qlike_level": "qlike_level",
+    "sign_hit_rate": "sign_hit_rate",
+    "dev_spearman_median": "dev_spearman_median",
 }
 
 

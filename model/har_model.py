@@ -4,7 +4,8 @@ Pooled OLS of tomorrow's log-vol deviation on the demeaned HAR components
 (1/5/22-day trailing means of log GK vol, each minus the 63-day baseline
 b_t). Demeaning both sides makes the pooled regression legitimate across
 tickers, mirroring the LightGBM setup. This is the acceptance-gate
-benchmark: the LightGBM route must beat it on out-of-sample QLIKE.
+benchmark: the LightGBM route must beat it on out-of-sample within-ticker
+deviation R².
 """
 from __future__ import annotations
 

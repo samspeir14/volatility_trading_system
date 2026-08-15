@@ -25,7 +25,12 @@ def test_macro_calendar_window_and_staleness():
     assert cal.next_event_in_window(date(2026, 7, 30), date(2026, 8, 11)) is None
     # Aged-out table fails open
     assert cal.next_event_in_window(date(2050, 1, 1), date(2050, 12, 31)) is None
-    assert len(MACRO_EVENTS) == 20, "2026: 8 FOMC + 12 CPI"
+    from datetime import date as _date
+    events_2026 = [e for e in MACRO_EVENTS if e[0] >= _date(2026, 1, 1)]
+    assert len(events_2026) == 20, "2026: 8 FOMC + 12 CPI"
+    # Gating scope stays FOMC+CPI even though the history table carries
+    # PPI/PCE/NFP for the model features.
+    assert {label for _, label in MACRO_EVENTS} == {"FOMC decision", "CPI release"}
     print("macro_calendar: window hits, quiet stretch, aged-out fail-open")
 
 

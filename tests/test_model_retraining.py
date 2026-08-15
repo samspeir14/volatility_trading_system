@@ -4,10 +4,11 @@ chain preserved).
 
 Trains the pooled LightGBM on the next-day log-GK-vol deviation target plus
 the HAR-RV benchmark, scores both against GARCH/EWMA/persistence baselines on
-identical walk-forward OOS rows, applies the acceptance gate (LightGBM must
-beat HAR on OOS QLIKE, else route=har), persists OOS predictions for the
-nightly reconciliation, and writes the schema-v2 routing JSON (previous file
-kept as .bak).
+identical walk-forward OOS rows, applies the acceptance gate (route = argmax
+OOS within-ticker deviation R² over lgbm / har / their 50/50 blend — the
+singular strategy metric), persists OOS predictions for the nightly
+reconciliation, and writes the schema-v2 routing JSON (previous file kept
+as .bak).
 """
 import asyncio
 import json
@@ -76,7 +77,7 @@ def run_h1_retrain(settings) -> int:
     """h=1 within-stock deviation retrain: pooled LightGBM (top-20 features)
     + HAR benchmark + GARCH/EWMA/persistence baselines, acceptance-gated
     routing, OOS predictions persisted for nightly reconciliation."""
-    from model.evaluation import h1_metrics_from_predictions
+    from model.evaluation import h1_dm_tests, h1_metrics_from_predictions
 
     end = _last_weekday(date.today())
     start = end - timedelta(days=4 * 365)
@@ -111,6 +112,18 @@ def run_h1_retrain(settings) -> int:
             print(f"WARNING: daily bar refresh failed ({e}); "
                   f"training on cached bars", file=sys.stderr)
 
+        # Refresh earnings/IV history (DoltHub, incremental) so the
+        # earnings_*/iv_* features train on current data. Fail-soft like the
+        # bar refresh: a DoltHub outage must not kill the weekly cron.
+        for mod_name in ("scripts.backfill_earnings_history",
+                         "scripts.backfill_iv_history"):
+            try:
+                import importlib
+                importlib.import_module(mod_name).main()
+            except Exception as e:
+                print(f"WARNING: {mod_name} failed ({e}); "
+                      f"training on cached history", file=sys.stderr)
+
         all_symbols = [t.symbol for t in tickers]
         excluded_symbols = sorted(find_stale_symbols(store, all_symbols))
         if excluded_symbols:
@@ -124,9 +137,13 @@ def run_h1_retrain(settings) -> int:
         )
         print(f"daily bars through: {bars_through}")
 
+        from features.feature_pipeline import load_earnings_history, load_iv_history
+        cache_dir = Path(settings.cache_db_path).parent
         pipeline = FeaturePipeline(
             store, tickers,
             garch_min_history=100, garch_refit_every=21,
+            iv_history=load_iv_history(cache_dir / "iv_history.csv"),
+            earnings_history=load_earnings_history(cache_dir / "earnings_history.csv"),
         )
         t0 = time.monotonic()
         feature_df = pipeline.build_features(start, end)
@@ -150,6 +167,9 @@ def run_h1_retrain(settings) -> int:
         print(f"lgbm tuned in {time.monotonic() - t0:.1f}s: {lgbm_params}")
 
         t0 = time.monotonic()
+        # Unweighted per the 2026-08-14 post-backfill lab verdict (+0.2008 vs
+        # +0.1985 IVW). The lab re-tests IVW every run; flip this flag only
+        # from a lab IVW VERDICT printout.
         wf_lgbm = walk_forward_evaluate_h1(
             feature_df, bars_by_symbol,
             model_factory=lambda: LightGBMVolPredictor(
@@ -191,6 +211,9 @@ def run_h1_retrain(settings) -> int:
         model_preds: dict[str, pd.Series] = {
             "lgbm": ref["predicted_dev"],
             "har": wf_har.loc[common, "predicted_dev"],
+            "blend": (
+                ref["predicted_dev"] + wf_har.loc[common, "predicted_dev"]
+            ) / 2.0,
             **{name: dev.loc[common] for name, dev in dev_forecasts.items()},
         }
         for name, pred in model_preds.items():
@@ -219,16 +242,32 @@ def run_h1_retrain(settings) -> int:
                 f"  {name:<12s} dev_R²={m['dev_r2_pooled']:+.4f} "
                 f"(within {m['dev_r2_within']:+.4f}, "
                 f"ticker-median {m['dev_r2_ticker_median']:+.4f}) "
-                f"QLIKE={m['qlike_level']:.4f}"
+                f"QLIKE={m['qlike_level']:.4f} "
+                f"sign={m['sign_hit_rate']:.3f} ρ={m['dev_spearman_median']:+.3f}"
             )
 
-        # --- acceptance gate ---
-        lgbm_q = metrics["lgbm"]["qlike_level"]
-        har_q = metrics["har"]["qlike_level"]
-        route = "lgbm" if lgbm_q < har_q else "har"
-        passed = route == "lgbm"
-        print(f"\nacceptance gate (lgbm QLIKE < har QLIKE): "
-              f"{lgbm_q:.4f} vs {har_q:.4f} → route={route}")
+        # --- margin + significance vs the HAR benchmark (report-only):
+        # QLIKE margin with a panel-safe Diebold-Mariano test (per-date
+        # mean loss differentials, Newey-West variance) ---
+        dm = h1_dm_tests(preds_long, "lgbm", "har")
+        qlike_margin = metrics["lgbm"]["qlike_level"] - metrics["har"]["qlike_level"]
+        print(
+            f"\nlgbm vs har: QLIKE margin {qlike_margin:+.4f} "
+            f"(DM t={dm['qlike']['dm']:+.2f}, p={dm['qlike']['p']:.4f}) | "
+            f"dev-MSE DM t={dm['dev_sq']['dm']:+.2f}, p={dm['dev_sq']['p']:.4f} "
+            f"(negative t = lgbm better; {dm['qlike']['n_dates']} dates)"
+        )
+
+        # --- acceptance gate: within-ticker deviation R², the singular
+        # strategy metric (everything else stays report-only). The 50/50
+        # lgbm+har blend is a servable route, so it competes too. ---
+        candidates = ("lgbm", "har", "blend")
+        within = {n: metrics[n]["dev_r2_within"] for n in candidates}
+        route = max(candidates, key=lambda n: within[n])
+        passed = route != "har"
+        print("\nacceptance gate (argmax within-ticker R² of "
+              + ", ".join(f"{n}={within[n]:+.4f}" for n in candidates)
+              + f") → route={route}")
 
         # --- per-ticker GARCH persistence (diagnostics + term-projection
         # fallback; runtime primarily uses the garch_persistence feature) ---
@@ -290,8 +329,21 @@ def run_h1_retrain(settings) -> int:
                 "qlike_level": {
                     n: float(m["qlike_level"]) for n, m in metrics.items()
                 },
+                "sign_hit_rate": {
+                    n: float(m["sign_hit_rate"]) for n, m in metrics.items()
+                },
+                "dev_spearman_median": {
+                    n: float(m["dev_spearman_median"]) for n, m in metrics.items()
+                },
                 "route": route,
-                "acceptance": {"rule": "qlike lgbm < har", "passed": passed},
+                "acceptance": {
+                    "rule": "argmax within_r2 {lgbm,har,blend}",
+                    "passed": passed,
+                },
+                "dm_lgbm_vs_har": {
+                    loss: {k: float(v) for k, v in stats.items()}
+                    for loss, stats in dm.items()
+                },
                 "artifacts": promoted,
                 "top_features": top_features,
                 "lgbm_hyperparams": {k: (v.item() if hasattr(v, "item") else v)

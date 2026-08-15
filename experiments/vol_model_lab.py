@@ -1,11 +1,16 @@
 """Model experimentation lab — h=1 within-stock deviation model.
 
 Walk-forward evaluation of the production h=1 pipeline: pooled LightGBM
-(full feature set and top-20) against HAR-RV, GARCH(1,1), EWMA(0.94), and
-persistence, all scored on identical OOS rows with the same target
-construction as model.training — results are directly comparable to the
-Sunday retrain. Prints the acceptance-gate verdict and refreshes the frozen
-top-20 list candidate (HORIZON_FEATURE_SETS[1]).
+against HAR-RV, GARCH(1,1), EWMA(0.94), and persistence, all scored on
+identical OOS rows with the same target construction as model.training —
+results are directly comparable to the Sunday retrain.
+
+Within-ticker deviation R² is the singular strategy metric, and every
+optimization step here targets it: hyperparameters are tuned on it, the
+production feature subset is the candidate top-N (nested by gain-importance
+mean rank) with the best OOS within-ticker R², and the acceptance gate is
+within-ticker R² (LightGBM must beat HAR). Prints the gate verdict and the
+frozen-list candidate for HORIZON_FEATURE_SETS[1].
 
 This script does NOT modify any code outside experiments/. Run as:
 
@@ -31,8 +36,13 @@ logger = logging.getLogger("vol_model_lab")
 
 TRAIN_WINDOW_DAYS = 504
 REFIT_EVERY = 21
-N_TRIALS = 50
-TOP_N_FEATURES = 20
+# The retrain job stays at 50 trials (30-min budget); the lab has no budget
+# and the 14-dim space deserves a denser search.
+N_TRIALS = 100
+# Candidate subset sizes for the frozen production list. Features are ordered
+# by gain-importance mean rank (nesting), but the WINNER is the candidate with
+# the best OOS within-ticker R² — the metric, not importance, decides.
+CANDIDATE_TOP_NS = (10, 15, 20, 25, 30)
 
 RESULTS_DIR = Path(__file__).parent / "results"
 
@@ -72,14 +82,21 @@ def _drop_stale_symbols(store: HistoricalStore, watchlist: list) -> list:
 def run_h1() -> None:
     """Walk-forward evaluation for the h=1 within-stock deviation model.
 
-    Compares pooled LightGBM (full feature set and top-20) against HAR-RV,
-    GARCH(1,1), EWMA(0.94), and persistence — all scored on identical OOS
-    rows, walk-forward only, no shuffle. Prints the acceptance-gate verdict
-    (LightGBM must beat HAR on out-of-sample QLIKE) and writes
-    results/h1_comparison.csv + results/h1_feature_importance.csv.
+    Compares pooled LightGBM (full feature set and the best top-N subset by
+    OOS within-ticker R²) against HAR-RV, GARCH(1,1), EWMA(0.94), and
+    persistence — all scored on identical OOS rows, walk-forward only, no
+    shuffle. Prints the acceptance-gate verdict (LightGBM must beat HAR on
+    OOS within-ticker deviation R²) and writes results/h1_comparison.csv +
+    results/h1_feature_importance.csv.
     """
     from features.target import build_h1_deviation_target
-    from model.evaluation import per_ticker_r2_median, qlike, within_ticker_r2
+    from model.evaluation import (
+        per_ticker_r2_median,
+        per_ticker_spearman_median,
+        qlike,
+        sign_hit_rate,
+        within_ticker_r2,
+    )
     from model.h1_baselines import (
         ewma_deviation,
         garch_deviation,
@@ -106,7 +123,13 @@ def run_h1() -> None:
         watchlist = _drop_stale_symbols(store, watchlist)
         print(f"tickers after staleness filter: {len(watchlist)}")
 
-        pipeline = FeaturePipeline(store, watchlist)
+        from features.feature_pipeline import load_earnings_history, load_iv_history
+        cache_dir = Path(settings.cache_db_path).parent
+        pipeline = FeaturePipeline(
+            store, watchlist,
+            iv_history=load_iv_history(cache_dir / "iv_history.csv"),
+            earnings_history=load_earnings_history(cache_dir / "earnings_history.csv"),
+        )
         t0 = time.monotonic()
         feature_df = pipeline.build_features(start, end)
         print(f"features: {feature_df.shape} (built in {time.monotonic() - t0:.1f}s)")
@@ -145,19 +168,68 @@ def run_h1() -> None:
     )
     print(f"lgbm-full walk-forward: {len(wf_lgbm_full)} OOS rows ({time.monotonic() - t0:.1f}s)")
 
-    top20 = pick_top_features_by_mean_rank(acc_full, top_n=TOP_N_FEATURES)
-    print(f"\ntop-{TOP_N_FEATURES} features for h=1 (freeze into HORIZON_FEATURE_SETS[1]):")
-    for i, f in enumerate(top20, 1):
+    # Subset selection: nested top-N candidates ordered by importance mean
+    # rank, winner = best OOS within-ticker R². All candidates run on the
+    # same target rows, so their walk-forward outputs are directly comparable.
+    full_within = within_ticker_r2(
+        wf_lgbm_full["actual_dev"], wf_lgbm_full["predicted_dev"]
+    )
+    print(f"\nsubset selection (metric: OOS within-ticker R²):")
+    print(f"  full ({len(feature_df.columns):2d} feats)  within_R²={full_within:+.4f}")
+    best_subset: list[str] | None = None  # None = full feature set
+    best_within = full_within
+    wf_lgbm_top = wf_lgbm_full
+    for top_n in CANDIDATE_TOP_NS:
+        candidate = pick_top_features_by_mean_rank(acc_full, top_n=top_n)
+        t0 = time.monotonic()
+        wf_candidate = walk_forward_evaluate_h1(
+            feature_df, bars_by_symbol,
+            model_factory=lambda: ProdLGBM(horizon=1, hyperparams=lgbm_params),
+            feature_subset=candidate,
+            train_window_days=TRAIN_WINDOW_DAYS, refit_every=REFIT_EVERY,
+        )
+        candidate_within = within_ticker_r2(
+            wf_candidate["actual_dev"], wf_candidate["predicted_dev"]
+        )
+        print(f"  top-{top_n:2d}           within_R²={candidate_within:+.4f} "
+              f"({time.monotonic() - t0:.1f}s)")
+        if candidate_within > best_within:
+            best_within = candidate_within
+            best_subset = candidate
+            wf_lgbm_top = wf_candidate
+
+    if best_subset is None:
+        print("\nWINNER: full feature set — freeze ALL feature columns into "
+              "HORIZON_FEATURE_SETS[1]")
+        best_subset = list(feature_df.columns)
+    else:
+        print(f"\nWINNER: top-{len(best_subset)} "
+              f"(within_R²={best_within:+.4f}) — freeze into HORIZON_FEATURE_SETS[1]:")
+    for i, f in enumerate(best_subset, 1):
         print(f"  {i:2d}. {f}")
 
+    # Inverse-variance-weighted variant on the winner subset: rows weighted
+    # 1/var(dev) per ticker, so the fit objective itself is within-ticker
+    # aligned instead of dominated by high-vol-of-vol names.
     t0 = time.monotonic()
-    wf_lgbm_top = walk_forward_evaluate_h1(
+    wf_lgbm_ivw = walk_forward_evaluate_h1(
         feature_df, bars_by_symbol,
-        model_factory=lambda: ProdLGBM(horizon=1, hyperparams=lgbm_params),
-        feature_subset=top20,
+        model_factory=lambda: ProdLGBM(
+            horizon=1, hyperparams=lgbm_params, inverse_variance_weights=True,
+        ),
+        feature_subset=best_subset,
         train_window_days=TRAIN_WINDOW_DAYS, refit_every=REFIT_EVERY,
     )
-    print(f"lgbm-top20 walk-forward ({time.monotonic() - t0:.1f}s)")
+    ivw_within = within_ticker_r2(
+        wf_lgbm_ivw["actual_dev"], wf_lgbm_ivw["predicted_dev"]
+    )
+    print(f"\nIVW variant within_R²={ivw_within:+.4f} vs unweighted "
+          f"{best_within:+.4f} ({time.monotonic() - t0:.1f}s)")
+    print("IVW VERDICT: " + (
+        "WEIGHTED wins — set inverse_variance_weights=True in the retrain job"
+        if ivw_within > best_within
+        else "unweighted wins — keep inverse_variance_weights=False"
+    ))
 
     t0 = time.monotonic()
     wf_har = walk_forward_evaluate_h1(
@@ -181,6 +253,7 @@ def run_h1() -> None:
     frames = {
         "lgbm": wf_lgbm_top,
         "lgbm_full": wf_lgbm_full,
+        "lgbm_ivw": wf_lgbm_ivw,
         "har": wf_har,
     }
     dev_forecasts = {
@@ -200,8 +273,14 @@ def run_h1() -> None:
     baseline_b = ref["baseline_b"]
     actual_var = np.exp(2.0 * ref["actual_lv"])
 
+    # 50/50 lgbm+har blend — a servable production route, so it competes.
+    dev_forecasts["blend"] = (
+        ref["predicted_dev"] + frames["har"].loc[common, "predicted_dev"]
+    ) / 2.0
+
     rows: list[dict] = []
-    for name in ("lgbm", "lgbm_full", "har", "persistence", "ewma", "garch"):
+    for name in ("lgbm", "lgbm_full", "lgbm_ivw", "blend", "har",
+                 "persistence", "ewma", "garch"):
         if name in frames:
             pred_dev = frames[name].loc[common, "predicted_dev"]
         else:
@@ -216,13 +295,42 @@ def run_h1() -> None:
             "dev_r2_ticker_median": per_ticker_r2_median(actual_dev, pred_dev),
             "qlike_level": qlike(actual_var, forecast_var),
             "rmse_dev": m["rmse"],
+            "sign_hit": sign_hit_rate(actual_dev, pred_dev),
+            "spearman_med": per_ticker_spearman_median(actual_dev, pred_dev),
         }
         rows.append(row)
         print(
             f"  {name:<12s} dev_R²={row['dev_r2_pooled']:+.4f} "
             f"(within {row['dev_r2_within']:+.4f}, ticker-median {row['dev_r2_ticker_median']:+.4f}) "
-            f"QLIKE={row['qlike_level']:.4f}"
+            f"QLIKE={row['qlike_level']:.4f} "
+            f"sign={row['sign_hit']:.3f} ρ={row['spearman_med']:+.3f}"
         )
+
+    # Margin + significance vs HAR: panel-safe Diebold-Mariano on QLIKE
+    # losses and squared dev errors (same definition as the retrain report).
+    from model.evaluation import h1_dm_tests
+    dm_parts = []
+    for name in ("lgbm", "har"):
+        pred = (frames[name].loc[common, "predicted_dev"] if name in frames
+                else dev_forecasts[name].loc[common])
+        dm_parts.append(pd.DataFrame({
+            "symbol": common.get_level_values("symbol"),
+            "date": pd.to_datetime(common.get_level_values("date")),
+            "model": name,
+            "predicted_dev": pred.to_numpy(dtype=float),
+            "actual_dev": actual_dev.to_numpy(),
+            "baseline_b": baseline_b.to_numpy(),
+            "actual_lv": ref["actual_lv"].to_numpy(),
+        }))
+    dm = h1_dm_tests(pd.concat(dm_parts, ignore_index=True), "lgbm", "har")
+    by_model_row = {r["model"]: r for r in rows}
+    qlike_margin = by_model_row["lgbm"]["qlike_level"] - by_model_row["har"]["qlike_level"]
+    print(
+        f"\nlgbm vs har: QLIKE margin {qlike_margin:+.4f} "
+        f"(DM t={dm['qlike']['dm']:+.2f}, p={dm['qlike']['p']:.4f}) | "
+        f"dev-MSE DM t={dm['dev_sq']['dm']:+.2f}, p={dm['dev_sq']['p']:.4f} "
+        f"(negative t = lgbm better; {dm['qlike']['n_dates']} dates)"
+    )
 
     results_df = pd.DataFrame(rows)
     results_path = RESULTS_DIR / "h1_comparison.csv"
@@ -249,15 +357,19 @@ def run_h1() -> None:
     # ---------------- ACCEPTANCE GATE ----------------
     _print_section("ACCEPTANCE GATE")
     by_model = {r["model"]: r for r in rows}
-    lgbm_q = by_model["lgbm"]["qlike_level"]
-    har_q = by_model["har"]["qlike_level"]
-    passed = lgbm_q < har_q
-    print(f"rule: lgbm QLIKE < har QLIKE  →  {lgbm_q:.4f} vs {har_q:.4f}")
-    print(f"VERDICT: {'PASS — route h=1 to LightGBM' if passed else 'FAIL — route h=1 to HAR in production'}")
-    full_q = by_model["lgbm_full"]["qlike_level"]
-    if full_q < lgbm_q - 1e-6:
-        print(f"note: full-feature LGBM QLIKE {full_q:.4f} beats top-20 {lgbm_q:.4f} — "
-              f"consider revisiting the top-20 list")
+    best_cfg = max(
+        ("lgbm", "lgbm_ivw", "blend", "har"),
+        key=lambda n: by_model[n]["dev_r2_within"],
+    )
+    best_w = by_model[best_cfg]["dev_r2_within"]
+    har_w = by_model["har"]["dev_r2_within"]
+    passed = best_cfg != "har"
+    print("rule: argmax within-ticker R²  →  " + ", ".join(
+        f"{n}={by_model[n]['dev_r2_within']:+.4f}"
+        for n in ("lgbm", "lgbm_ivw", "blend", "har")
+    ))
+    print(f"VERDICT: {'PASS' if passed else 'FAIL'} — route h=1 to "
+          f"{best_cfg} ({best_w:+.4f})")
 
     print(f"\ntotal runtime: {(time.monotonic() - t_start) / 60.0:.1f} min")
 
