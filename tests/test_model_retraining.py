@@ -77,7 +77,7 @@ def run_h1_retrain(settings) -> int:
     """h=1 within-stock deviation retrain: pooled LightGBM (top-20 features)
     + HAR benchmark + GARCH/EWMA/persistence baselines, acceptance-gated
     routing, OOS predictions persisted for nightly reconciliation."""
-    from model.evaluation import h1_metrics_from_predictions
+    from model.evaluation import h1_dm_tests, h1_metrics_from_predictions
 
     end = _last_weekday(date.today())
     start = end - timedelta(days=4 * 365)
@@ -246,6 +246,18 @@ def run_h1_retrain(settings) -> int:
                 f"sign={m['sign_hit_rate']:.3f} ρ={m['dev_spearman_median']:+.3f}"
             )
 
+        # --- margin + significance vs the HAR benchmark (report-only):
+        # QLIKE margin with a panel-safe Diebold-Mariano test (per-date
+        # mean loss differentials, Newey-West variance) ---
+        dm = h1_dm_tests(preds_long, "lgbm", "har")
+        qlike_margin = metrics["lgbm"]["qlike_level"] - metrics["har"]["qlike_level"]
+        print(
+            f"\nlgbm vs har: QLIKE margin {qlike_margin:+.4f} "
+            f"(DM t={dm['qlike']['dm']:+.2f}, p={dm['qlike']['p']:.4f}) | "
+            f"dev-MSE DM t={dm['dev_sq']['dm']:+.2f}, p={dm['dev_sq']['p']:.4f} "
+            f"(negative t = lgbm better; {dm['qlike']['n_dates']} dates)"
+        )
+
         # --- acceptance gate: within-ticker deviation R², the singular
         # strategy metric (everything else stays report-only). The 50/50
         # lgbm+har blend is a servable route, so it competes too. ---
@@ -327,6 +339,10 @@ def run_h1_retrain(settings) -> int:
                 "acceptance": {
                     "rule": "argmax within_r2 {lgbm,har,blend}",
                     "passed": passed,
+                },
+                "dm_lgbm_vs_har": {
+                    loss: {k: float(v) for k, v in stats.items()}
+                    for loss, stats in dm.items()
                 },
                 "artifacts": promoted,
                 "top_features": top_features,

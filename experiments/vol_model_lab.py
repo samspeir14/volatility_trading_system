@@ -306,6 +306,32 @@ def run_h1() -> None:
             f"sign={row['sign_hit']:.3f} ρ={row['spearman_med']:+.3f}"
         )
 
+    # Margin + significance vs HAR: panel-safe Diebold-Mariano on QLIKE
+    # losses and squared dev errors (same definition as the retrain report).
+    from model.evaluation import h1_dm_tests
+    dm_parts = []
+    for name in ("lgbm", "har"):
+        pred = (frames[name].loc[common, "predicted_dev"] if name in frames
+                else dev_forecasts[name].loc[common])
+        dm_parts.append(pd.DataFrame({
+            "symbol": common.get_level_values("symbol"),
+            "date": pd.to_datetime(common.get_level_values("date")),
+            "model": name,
+            "predicted_dev": pred.to_numpy(dtype=float),
+            "actual_dev": actual_dev.to_numpy(),
+            "baseline_b": baseline_b.to_numpy(),
+            "actual_lv": ref["actual_lv"].to_numpy(),
+        }))
+    dm = h1_dm_tests(pd.concat(dm_parts, ignore_index=True), "lgbm", "har")
+    by_model_row = {r["model"]: r for r in rows}
+    qlike_margin = by_model_row["lgbm"]["qlike_level"] - by_model_row["har"]["qlike_level"]
+    print(
+        f"\nlgbm vs har: QLIKE margin {qlike_margin:+.4f} "
+        f"(DM t={dm['qlike']['dm']:+.2f}, p={dm['qlike']['p']:.4f}) | "
+        f"dev-MSE DM t={dm['dev_sq']['dm']:+.2f}, p={dm['dev_sq']['p']:.4f} "
+        f"(negative t = lgbm better; {dm['qlike']['n_dates']} dates)"
+    )
+
     results_df = pd.DataFrame(rows)
     results_path = RESULTS_DIR / "h1_comparison.csv"
     results_df.to_csv(results_path, index=False)
