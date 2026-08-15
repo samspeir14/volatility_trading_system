@@ -156,39 +156,21 @@ FEATURE_COLUMNS: list[str] = (
 # The production h=1 feature set. Selection criterion (since 2026-08-13):
 # the lab nests top-N candidates by gain-importance mean rank and freezes the
 # subset with the best OOS within-ticker deviation R² — the strategy's
-# singular metric. FROZEN 2026-08-14 from the EC2 lab run: the FULL 63-column
-# set won again (within R² +0.1423 vs +0.1410 for top-20; blend route
-# +0.1466). Kept as an explicit list so later feature-matrix additions cannot
-# silently change the production set — re-freeze only from a lab WINNER
-# printout. Do not load from CSV at runtime.
+# singular metric. FROZEN 2026-08-14 from the EC2 lab run after the
+# macro/earnings/IV backfill phase: top-25 won decisively (within R² +0.2008
+# vs +0.1580 for the full 75-column set — the first time trimming beat
+# keeping everything). 11 of the 25 are backfill-phase features
+# (earnings_tomorrow at #3, iv_chg_5 at #6). Kept as an explicit list so
+# later feature-matrix additions cannot silently change the production set —
+# re-freeze only from a lab WINNER printout. Do not load from CSV at runtime.
 HORIZON_FEATURE_SETS: dict[int, list[str]] = {
     1: [
-        "rv_5", "rv_10", "rv_21", "rv_63",
-        "ewma_vol_94", "ewma_vol_97",
-        "har_rv_daily", "har_rv_weekly", "har_rv_monthly",
-        "acf_sq_ret_lag1", "acf_sq_ret_lag5", "acf_sq_ret_lag10",
-        "garch_forecast_var", "garch_resid_lb_pvalue",
-        "bb_width", "bb_width_roc",
-        "macd_hist_mag", "rsi_14",
-        "volume_ratio",
-        "atr_14", "atr_roc",
-        "intraday_range",
-        "market_avg_rv21", "sector_avg_rv21",
-        "vix_level", "vix9d_to_vix", "vix3m_to_vix",
-        "corr_spy_21",
-        "parkinson_5", "parkinson_10", "parkinson_21",
-        "gk_5", "gk_10", "gk_21",
-        "rskew_21", "rskew_63",
-        "rkurt_21", "rkurt_63",
-        "rv21_vs_market", "rv21_vs_sector",
-        "rv_5_21_ratio", "rv_10_63_ratio",
-        "garch_vs_rv21", "ewma_94_97_ratio", "vix_vs_rv21_ann",
-        "gk_1", "log_gk_1", "log_gk_baseline_63",
-        "dev_gk", "har_dev_5", "har_dev_22",
-        "garch_persistence",
-        "ret_1", "ret_5", "ret_21", "ret_1_neg",
-        "overnight_gap", "overnight_vol_21", "overnight_to_intraday_21",
-        "dow_mon", "dow_fri", "opex_friday", "month_end",
+        "har_dev_5", "dev_gk", "earnings_tomorrow", "volume_ratio",
+        "har_dev_22", "iv_chg_5", "vix3m_to_vix", "vix9d_to_vix",
+        "month_end", "market_avg_rv21", "vix_level", "fomc_tomorrow",
+        "iv_pctile_252", "days_to_earnings", "atr_roc", "corr_spy_21",
+        "rv_10_63_ratio", "ret_5", "macro_any_tomorrow", "ewma_94_97_ratio",
+        "nfp_tomorrow", "iv_minus_hv", "dow_mon", "rv_63", "rsi_14",
     ],
 }
 

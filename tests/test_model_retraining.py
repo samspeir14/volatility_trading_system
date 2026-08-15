@@ -155,15 +155,13 @@ def run_h1_retrain(settings) -> int:
         print(f"lgbm tuned in {time.monotonic() - t0:.1f}s: {lgbm_params}")
 
         t0 = time.monotonic()
-        # inverse_variance_weights=True per the 2026-08-14 lab verdict
-        # (+0.1432 vs +0.1423 unweighted). The gate below still recomputes
-        # the route from THIS run's OOS rows, so a flipped verdict on fresh
-        # data self-corrects at the routing level.
+        # Unweighted per the 2026-08-14 post-backfill lab verdict (+0.2008 vs
+        # +0.1985 IVW). The lab re-tests IVW every run; flip this flag only
+        # from a lab IVW VERDICT printout.
         wf_lgbm = walk_forward_evaluate_h1(
             feature_df, bars_by_symbol,
             model_factory=lambda: LightGBMVolPredictor(
                 horizon=1, hyperparams=lgbm_params,
-                inverse_variance_weights=True,
             ),
             feature_subset=top_features,
             train_window_days=H1_TRAIN_WINDOW_DAYS, refit_every=H1_REFIT_EVERY,
