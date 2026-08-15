@@ -29,6 +29,7 @@ import pandas as pd
 from config import load_settings, load_watchlist
 from data import HistoricalStore, compute_log_returns
 from features.feature_pipeline import FeaturePipeline
+from features.target import PRODUCTION_TARGET_PROXY, target_vol_fn
 from model.evaluation import regression_metrics
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -45,6 +46,9 @@ N_TRIALS = 100
 CANDIDATE_TOP_NS = (10, 15, 20, 25, 30)
 
 RESULTS_DIR = Path(__file__).parent / "results"
+
+# The lab measures the DEPLOYED target — always in lockstep with production.
+VOL_FN = target_vol_fn(PRODUCTION_TARGET_PROXY)
 
 
 def pick_top_features_by_mean_rank(
@@ -129,6 +133,7 @@ def run_h1() -> None:
             store, watchlist,
             iv_history=load_iv_history(cache_dir / "iv_history.csv"),
             earnings_history=load_earnings_history(cache_dir / "earnings_history.csv"),
+            target_proxy=PRODUCTION_TARGET_PROXY,
         )
         t0 = time.monotonic()
         feature_df = pipeline.build_features(start, end)
@@ -146,7 +151,9 @@ def run_h1() -> None:
 
     # ---------------- TUNING ----------------
     _print_section("H1 TUNING (LightGBM, first window only)")
-    X_full, y_full, _b = build_h1_training_matrix(feature_df, bars_by_symbol)
+    X_full, y_full, _b = build_h1_training_matrix(
+        feature_df, bars_by_symbol, vol_fn=VOL_FN,
+    )
     print(f"pooled training matrix: {X_full.shape}, target rows: {len(y_full)}")
     t0 = time.monotonic()
     lgbm_params = tune_h1_hyperparams(
@@ -165,6 +172,7 @@ def run_h1() -> None:
         model_factory=lambda: ProdLGBM(horizon=1, hyperparams=lgbm_params),
         train_window_days=TRAIN_WINDOW_DAYS, refit_every=REFIT_EVERY,
         importance_acc=acc_full,
+        vol_fn=VOL_FN,
     )
     print(f"lgbm-full walk-forward: {len(wf_lgbm_full)} OOS rows ({time.monotonic() - t0:.1f}s)")
 
@@ -187,6 +195,7 @@ def run_h1() -> None:
             model_factory=lambda: ProdLGBM(horizon=1, hyperparams=lgbm_params),
             feature_subset=candidate,
             train_window_days=TRAIN_WINDOW_DAYS, refit_every=REFIT_EVERY,
+            vol_fn=VOL_FN,
         )
         candidate_within = within_ticker_r2(
             wf_candidate["actual_dev"], wf_candidate["predicted_dev"]
@@ -219,6 +228,7 @@ def run_h1() -> None:
         ),
         feature_subset=best_subset,
         train_window_days=TRAIN_WINDOW_DAYS, refit_every=REFIT_EVERY,
+        vol_fn=VOL_FN,
     )
     ivw_within = within_ticker_r2(
         wf_lgbm_ivw["actual_dev"], wf_lgbm_ivw["predicted_dev"]
@@ -236,12 +246,13 @@ def run_h1() -> None:
         feature_df, bars_by_symbol,
         model_factory=HARRVPredictor,
         train_window_days=TRAIN_WINDOW_DAYS, refit_every=REFIT_EVERY,
+        vol_fn=VOL_FN,
     )
     print(f"har walk-forward ({time.monotonic() - t0:.1f}s)")
 
     # Parameter-light baselines: dev forecasts over the full history, then
     # restricted to the walk-forward OOS rows below.
-    y_all, b_all, lv_all = build_h1_deviation_target(bars_by_symbol)
+    y_all, b_all, lv_all = build_h1_deviation_target(bars_by_symbol, vol_fn=VOL_FN)
     dev_persist = persistence_deviation(lv_all, b_all)
     dev_ewma = ewma_deviation(returns_by_symbol, b_all, lam=0.94)
     t0 = time.monotonic()
