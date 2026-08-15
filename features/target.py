@@ -1,11 +1,16 @@
 """Next-day realized-vol target for the h=1 within-stock model.
 
-The target is the deviation of tomorrow's log Garman-Klass vol from the
-stock's own trailing 63-day mean log vol:
+The target is the deviation of tomorrow's log vol from the stock's own
+trailing 63-day mean log vol:
 
-    lv_t  = log(gk_vol_t + GK_EPS)
+    lv_t  = log(vol_t + GK_EPS)
     b_t   = mean(lv_{t-62..t})        # >= 40 observations, data <= t only
     y_t   = lv_{t+1} - b_t
+
+The single-day vol proxy is selectable (PRODUCTION_TARGET_PROXY):
+"total" (production since 2026-08-14) = sqrt(overnight_gap² + GK²), the
+close-to-close vol options actually price; "gk" = the legacy intraday-only
+Garman-Klass proxy, kept for lab comparisons.
 
 Demeaning by b_t makes pooling across tickers legitimate: the model never
 gets credit for knowing a ticker's vol level, only for timing deviations
@@ -21,6 +26,14 @@ from features.ohlc_vol import garman_klass_vol, parkinson_vol
 GK_EPS = 1e-8
 BASELINE_WINDOW = 63
 BASELINE_MIN_OBS = 40
+
+# The vol proxy production trains AND serves on. Switched "gk" -> "total"
+# 2026-08-14 after the yz_lab verdict: against realized TOTAL variance the
+# total-vol arm's QLIKE was 0.3949 vs GK's 0.6428 (DM t=-10.99) — the GK
+# target ignored the overnight ~40% of close-to-close variance that options
+# price, tilting signals toward SELL. main.py and the retrain job both read
+# this constant; the deploy retrain's gate vote is the promotion checkpoint.
+PRODUCTION_TARGET_PROXY = "total"
 
 
 def _positive_or_nan(s: pd.Series) -> pd.Series:
@@ -47,6 +60,31 @@ def daily_ohlc_vol(bars: pd.DataFrame) -> pd.Series:
     return gk.fillna(park).fillna(c2c)
 
 
+def daily_total_vol(bars: pd.DataFrame) -> pd.Series:
+    """Single-day TOTAL vol proxy: sqrt(overnight_gap² + intraday²), with
+    intraday = daily_ohlc_vol (GK-first). The GK family measures the session
+    only; options price close-to-close, and the overnight gap carries ~40%
+    of close-to-close variance on this watchlist (replay_analysis
+    2026-08-14). LAB-ONLY until a checkpoint gate vote — the production
+    target stays GK. Rows where the intraday estimator is NaN (halt /
+    placeholder bar) stay NaN; a missing gap (first row, bad open) degrades
+    to intraday-only."""
+    o = _positive_or_nan(bars["open"])
+    c = _positive_or_nan(bars["close"])
+    gap = np.log(o / c.shift(1))
+    intraday = daily_ohlc_vol(bars)
+    total = np.sqrt(gap.pow(2).fillna(0.0) + intraday.pow(2))
+    return total.where(intraday.notna())
+
+
+def target_vol_fn(proxy: str = PRODUCTION_TARGET_PROXY):
+    """Resolve a target_proxy name to its single-day vol function."""
+    fns = {"gk": daily_ohlc_vol, "total": daily_total_vol}
+    if proxy not in fns:
+        raise ValueError(f"unknown target proxy {proxy!r}")
+    return fns[proxy]
+
+
 def log_vol(vol: pd.Series) -> pd.Series:
     return np.log(vol + GK_EPS)
 
@@ -63,22 +101,25 @@ def rolling_log_vol_baseline(
 
 def build_h1_deviation_target(
     bars_by_symbol: dict[str, pd.DataFrame],
+    vol_fn=daily_ohlc_vol,
 ) -> tuple[pd.Series, pd.Series, pd.Series]:
     """Returns (y, b, lv), each indexed by (symbol, date):
 
-        lv[(s,t)] = log(daily_ohlc_vol_t + GK_EPS)
+        lv[(s,t)] = log(vol_fn_t + GK_EPS)
         b[(s,t)]  = rolling_log_vol_baseline(lv_s) at t
         y[(s,t)]  = lv[(s,t+1)] - b[(s,t)]
 
-    y is NaN-dropped (needs both tomorrow's vol and today's baseline); b and
-    lv are returned full-length for level reconstruction and HAR inputs."""
+    `vol_fn` is the single-day vol proxy (default GK-first daily_ohlc_vol;
+    the lab's Yang-Zhang arm passes daily_total_vol). y is NaN-dropped
+    (needs both tomorrow's vol and today's baseline); b and lv are returned
+    full-length for level reconstruction and HAR inputs."""
     y_parts: list[pd.Series] = []
     b_parts: list[pd.Series] = []
     lv_parts: list[pd.Series] = []
     for symbol, bars in bars_by_symbol.items():
         if bars.empty:
             continue
-        lv = log_vol(daily_ohlc_vol(bars))
+        lv = log_vol(vol_fn(bars))
         b = rolling_log_vol_baseline(lv)
         y = lv.shift(-1) - b
         idx = pd.MultiIndex.from_product(

@@ -25,7 +25,12 @@ from features.cross_ticker import (
 from features.distribution_shape import realized_kurt, realized_skew
 from features.garch import garch_features_walk_forward
 from features.ohlc_vol import garman_klass_vol, parkinson_vol
-from features.target import daily_ohlc_vol, log_vol, rolling_log_vol_baseline
+from features.target import (
+    daily_ohlc_vol,
+    daily_total_vol,
+    log_vol,
+    rolling_log_vol_baseline,
+)
 from features.realized_vol import (
     acf_squared_returns,
     ewma_vol,
@@ -207,12 +212,19 @@ class FeaturePipeline:
         garch_refit_every: int = 21,
         iv_history: pd.DataFrame | None = None,
         earnings_history: pd.DataFrame | None = None,
+        target_proxy: str = "gk",
     ):
         self._store = store
         self._watchlist = watchlist
         self._indices = market_indices
         self._garch_min_history = garch_min_history
         self._garch_refit_every = garch_refit_every
+        # "gk" (production) or "total" (lab Yang-Zhang arm): which single-day
+        # vol proxy feeds the h=1 target-side columns (gk_1, baseline, dev_*).
+        # Column NAMES are unchanged so the frozen feature set works in both.
+        if target_proxy not in ("gk", "total"):
+            raise ValueError(f"target_proxy must be 'gk' or 'total', got {target_proxy!r}")
+        self._target_vol_fn = daily_ohlc_vol if target_proxy == "gk" else daily_total_vol
 
         # label -> frozenset[date] for the macro dummies
         self._macro_events = events_by_label()
@@ -351,11 +363,12 @@ class FeaturePipeline:
         df["rkurt_21"] = realized_kurt(r, 21)
         df["rkurt_63"] = realized_kurt(r, 63)
 
-        # h=1 target-side columns: single-day GK vol (with fallbacks), its log,
-        # the 63-day baseline b_t, and demeaned HAR components. Computed here
+        # h=1 target-side columns: single-day vol proxy (GK-first in
+        # production; the lab's total-vol arm swaps the fn), its log, the
+        # 63-day baseline b_t, and demeaned HAR components. Computed here
         # (not only at target build) so signal-time inference reads the exact
         # same b_t / dev the model trained on.
-        gk1 = daily_ohlc_vol(b)
+        gk1 = self._target_vol_fn(b)
         lv = log_vol(gk1)
         baseline = rolling_log_vol_baseline(lv)
         df["gk_1"] = gk1

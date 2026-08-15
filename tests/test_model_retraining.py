@@ -2,8 +2,9 @@
 the cron entry in deploy/README.md points here, atomic JSON write + restart
 chain preserved).
 
-Trains the pooled LightGBM on the next-day log-GK-vol deviation target plus
-the HAR-RV benchmark, scores both against GARCH/EWMA/persistence baselines on
+Trains the pooled LightGBM on the next-day log TOTAL-vol deviation target
+(overnight gap² + GK²; PRODUCTION_TARGET_PROXY) plus the HAR-RV benchmark,
+scores both against GARCH/EWMA/persistence baselines on
 identical walk-forward OOS rows, applies the acceptance gate (route = argmax
 OOS within-ticker deviation R² over lgbm / har / their 50/50 blend — the
 singular strategy metric), persists OOS predictions for the nightly
@@ -32,7 +33,11 @@ from data import (
 from features import FeaturePipeline
 from features.feature_pipeline import HORIZON_FEATURE_SETS
 from features.garch import fit_garch11
-from features.target import build_h1_deviation_target
+from features.target import (
+    PRODUCTION_TARGET_PROXY,
+    build_h1_deviation_target,
+    target_vol_fn,
+)
 from model import (
     HARRVPredictor,
     LightGBMVolPredictor,
@@ -144,6 +149,7 @@ def run_h1_retrain(settings) -> int:
             garch_min_history=100, garch_refit_every=21,
             iv_history=load_iv_history(cache_dir / "iv_history.csv"),
             earnings_history=load_earnings_history(cache_dir / "earnings_history.csv"),
+            target_proxy=PRODUCTION_TARGET_PROXY,
         )
         t0 = time.monotonic()
         feature_df = pipeline.build_features(start, end)
@@ -159,7 +165,10 @@ def run_h1_retrain(settings) -> int:
 
         # --- tune + walk-forward ---
         t_budget = time.monotonic()
-        X, y, _b = build_h1_training_matrix(feature_df, bars_by_symbol, top_features)
+        vol_fn = target_vol_fn(PRODUCTION_TARGET_PROXY)
+        X, y, _b = build_h1_training_matrix(
+            feature_df, bars_by_symbol, top_features, vol_fn=vol_fn,
+        )
         t0 = time.monotonic()
         lgbm_params = tune_h1_hyperparams(
             X, y, train_window_days=H1_TRAIN_WINDOW_DAYS,
@@ -178,6 +187,7 @@ def run_h1_retrain(settings) -> int:
             feature_subset=top_features,
             train_window_days=H1_TRAIN_WINDOW_DAYS, refit_every=H1_REFIT_EVERY,
             artifact_dir=ARTIFACT_DIR, artifact_prefix="lgbm_h1",
+            vol_fn=vol_fn,
         )
         print(f"lgbm walk-forward: {len(wf_lgbm)} OOS rows ({time.monotonic() - t0:.1f}s)")
 
@@ -187,10 +197,11 @@ def run_h1_retrain(settings) -> int:
             model_factory=HARRVPredictor,
             train_window_days=H1_TRAIN_WINDOW_DAYS, refit_every=H1_REFIT_EVERY,
             artifact_dir=ARTIFACT_DIR, artifact_prefix="har_h1",
+            vol_fn=vol_fn,
         )
         print(f"har walk-forward ({time.monotonic() - t0:.1f}s)")
 
-        _y_all, b_all, lv_all = build_h1_deviation_target(bars_by_symbol)
+        _y_all, b_all, lv_all = build_h1_deviation_target(bars_by_symbol, vol_fn=vol_fn)
         dev_forecasts = {
             "persistence": persistence_deviation(lv_all, b_all),
             "ewma": ewma_deviation(returns_by_symbol, b_all, lam=0.94),
@@ -311,7 +322,7 @@ def run_h1_retrain(settings) -> int:
             "n_tickers": len(tickers),
             "excluded_symbols": excluded_symbols,
             "target": {
-                "proxy": "garman_klass",
+                "proxy": PRODUCTION_TARGET_PROXY,
                 "log_eps": 1e-8,
                 "baseline_window": 63,
                 "baseline_min_obs": 40,

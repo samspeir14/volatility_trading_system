@@ -134,13 +134,16 @@ def build_h1_training_matrix(
     feature_df: pd.DataFrame,
     bars_by_symbol: dict[str, pd.DataFrame],
     feature_subset: list[str] | None = None,
+    vol_fn=None,
 ) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
     """Build (X, y, b) for the h=1 deviation model, pooled across tickers.
-    y[(s,t)] = log(gk_vol_{t+1}+eps) - b_t (see features.target); b is the
+    y[(s,t)] = log(vol_{t+1}+eps) - b_t (see features.target; vol proxy is
+    GK-first by default, overridable via `vol_fn` for lab arms); b is the
     aligned baseline b_t (finite wherever y is, since y requires it).
     Drops rows where y is NaN. Feature NaNs preserved (LightGBM handles
     natively; HAR drops them at fit)."""
-    y, b, _lv = build_h1_deviation_target(bars_by_symbol)
+    kwargs = {} if vol_fn is None else {"vol_fn": vol_fn}
+    y, b, _lv = build_h1_deviation_target(bars_by_symbol, **kwargs)
 
     if y.empty:
         cols = feature_subset if feature_subset is not None else list(feature_df.columns)
@@ -192,6 +195,7 @@ def walk_forward_evaluate_h1(
     artifact_prefix: str | None = None,
     importance_log_path: Path | None = None,
     importance_acc: list[pd.Series] | None = None,
+    vol_fn=None,
 ) -> pd.DataFrame:
     """Walk-forward evaluation on the h=1 deviation target: strictly
     time-ordered, no shuffle — train on the trailing `train_window_days`
@@ -204,7 +208,9 @@ def walk_forward_evaluate_h1(
     Returns a (symbol, date)-indexed DataFrame with columns:
     predicted_dev, actual_dev, baseline_b, actual_lv (= actual_dev + baseline_b).
     """
-    X, y, b = build_h1_training_matrix(feature_df, bars_by_symbol, feature_subset)
+    X, y, b = build_h1_training_matrix(
+        feature_df, bars_by_symbol, feature_subset, vol_fn=vol_fn,
+    )
 
     dates = pd.Series(X.index.get_level_values("date"))
     unique_dates = pd.Index(np.sort(dates.unique()))

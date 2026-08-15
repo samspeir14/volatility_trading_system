@@ -10,7 +10,9 @@ real-money profile), running autonomously on EC2 under systemd.
 ## The strategy
 
 1. **Forecast.** A pooled LightGBM predicts each ticker's next-day
-   log-GK-volatility *deviation* from its own 63-day baseline (within-stock
+   log total-volatility *deviation* — overnight gap² + Garman-Klass², the
+   close-to-close vol options actually price — from its own 63-day baseline
+   (within-stock
    timing skill, not "TSLA is more volatile than KO"). A HAR-RV benchmark
    trains alongside it; a weekly acceptance gate (out-of-sample within-ticker
    deviation R² — the strategy's singular metric) routes production to
