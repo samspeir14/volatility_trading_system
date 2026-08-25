@@ -206,7 +206,7 @@ class PositionReconciler:
         # because open_unclosed_positions() filters on final_status IN
         # ('filled','partially_filled') — without this phase, expired ITM
         # positions that never confirmed their fill stay dark forever.
-        timeouts_resolved = await self._recover_timeouts()
+        timeouts_resolved = await self._recover_timeouts(today)
 
         try:
             tradier_positions = await self._client.get_positions(self._account_id)
@@ -362,7 +362,7 @@ class PositionReconciler:
             timeouts_resolved=timeouts_resolved,
         )
 
-    async def _recover_timeouts(self) -> list[TimeoutResolution]:
+    async def _recover_timeouts(self, today: date) -> list[TimeoutResolution]:
         """Walk every timeout-status row, query Tradier for its real terminal
         state, update the log. Recovered fills then move into the main
         reconciliation pass (the expiration check below will close them out
@@ -374,7 +374,13 @@ class PositionReconciler:
         now = datetime.now(timezone.utc)
         for row in timeout_rows:
             order_id = row["tradier_order_id"]
-            new_status, fill_price = await self._query_terminal_status(order_id)
+            try:
+                expiration = date.fromisoformat(row["expiration"])
+            except (TypeError, ValueError):
+                expiration = None
+            new_status, fill_price = await self._query_terminal_status(
+                order_id, expiration=expiration, today=today,
+            )
             if new_status is None:
                 resolutions.append(TimeoutResolution(order_id, "unknown", None))
                 continue
@@ -394,10 +400,20 @@ class PositionReconciler:
             resolutions.append(TimeoutResolution(order_id, new_status, fill_price))
         return resolutions
 
-    async def _query_terminal_status(self, order_id: int) -> tuple[str | None, float | None]:
+    async def _query_terminal_status(
+        self,
+        order_id: int,
+        expiration: date | None = None,
+        today: date | None = None,
+    ) -> tuple[str | None, float | None]:
         """Returns (status, fill_price). status=None means we couldn't determine
         (404, network error, or Tradier reports a non-terminal state). Caller
-        should leave the row as 'timeout' and retry next cycle."""
+        should leave the row as 'timeout' and retry next cycle.
+
+        Exception: an order Tradier still reports as non-terminal (e.g. wedged
+        in the sandbox's PendingNew state) with zero executed quantity, whose
+        legs' expiration is already past, can never fill — resolve it as
+        'expired' instead of warning forever."""
         try:
             resp = await self._client.get_order_status(self._account_id, order_id)
         except Exception as e:
@@ -414,6 +430,22 @@ class PositionReconciler:
         status = (order_node.get("status") or "").lower()
         TERMINAL = {"filled", "partially_filled", "rejected", "canceled", "expired"}
         if status not in TERMINAL:
+            try:
+                exec_qty = float(order_node.get("exec_quantity") or 0)
+            except (TypeError, ValueError):
+                exec_qty = 0.0
+            if (
+                expiration is not None
+                and today is not None
+                and today > expiration
+                and exec_qty == 0
+            ):
+                logger.info(
+                    "order %s: stuck non-terminal (%r) with 0 executed and "
+                    "expiration %s past — resolving as expired",
+                    order_id, status, expiration.isoformat(),
+                )
+                return "expired", None
             logger.warning(
                 "order %s: Tradier reports non-terminal status %r — leaving as timeout",
                 order_id, status,

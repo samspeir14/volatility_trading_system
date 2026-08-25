@@ -784,6 +784,92 @@ def test_timeout_recovery_handles_still_pending():
     print("timeout_recovery: non-terminal status → leave as timeout ✓")
 
 
+def test_timeout_recovery_expires_stuck_pending_past_expiration():
+    """An order wedged non-terminal at Tradier (sandbox PendingNew) with zero
+    executed quantity, whose legs' expiration has passed, can never fill —
+    resolve it as 'expired' instead of warning every cycle forever."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "orders.db")
+        _seed_open_order(
+            log, order_id=9106, symbol="UNH", expiration=date(2026, 5, 15),
+            direction="BUY", structure="straddle", entry_premium=14.66,
+            legs=_straddle_legs(),
+            submitted_at=datetime(2026, 5, 13, 15, 0, tzinfo=timezone.utc),
+            final_status="timeout",
+        )
+        client = mock.AsyncMock()
+        client.get_positions.return_value = []
+        client.get_order_status.return_value = {
+            "order": {"id": 9106, "status": "pending", "exec_quantity": 0.0},
+        }
+
+        reconciler = PositionReconciler(client=client, order_log=log, account_id="VA1")
+        result = asyncio.run(reconciler.reconcile(date(2026, 5, 20)))
+
+        assert result.timeouts_resolved[0].new_status == "expired"
+        assert result.timeouts_resolved[0].fill_price is None
+        assert len(log.timeout_orders()) == 0  # resolved, no more warnings
+        # Never filled — must not enter open positions or expiration P&L.
+        assert len(log.open_unclosed_positions()) == 0
+        assert result.expired_closed == []
+        log.close()
+    print("timeout_recovery: stuck pending past expiration → expired ✓")
+
+
+def test_timeout_recovery_keeps_stuck_pending_on_expiration_day():
+    """Same wedge but on expiration day itself — the order could in theory
+    still fill, so leave it as timeout until the day is over."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "orders.db")
+        _seed_open_order(
+            log, order_id=9107, symbol="UNH", expiration=date(2026, 5, 15),
+            direction="BUY", structure="straddle", entry_premium=14.66,
+            legs=_straddle_legs(),
+            submitted_at=datetime(2026, 5, 13, 15, 0, tzinfo=timezone.utc),
+            final_status="timeout",
+        )
+        client = mock.AsyncMock()
+        client.get_positions.return_value = []
+        client.get_order_status.return_value = {
+            "order": {"id": 9107, "status": "pending", "exec_quantity": 0.0},
+        }
+
+        reconciler = PositionReconciler(client=client, order_log=log, account_id="VA1")
+        result = asyncio.run(reconciler.reconcile(date(2026, 5, 15)))
+
+        assert result.timeouts_resolved[0].new_status == "unknown"
+        assert len(log.timeout_orders()) == 1  # untouched
+        log.close()
+    print("timeout_recovery: stuck pending on expiration day → keep timeout ✓")
+
+
+def test_timeout_recovery_keeps_stuck_pending_with_partial_exec():
+    """Non-terminal past expiration but with executed quantity — something
+    partially filled, needs the normal timeout path, not auto-expiry."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "orders.db")
+        _seed_open_order(
+            log, order_id=9108, symbol="UNH", expiration=date(2026, 5, 15),
+            direction="BUY", structure="straddle", entry_premium=14.66,
+            legs=_straddle_legs(),
+            submitted_at=datetime(2026, 5, 13, 15, 0, tzinfo=timezone.utc),
+            final_status="timeout",
+        )
+        client = mock.AsyncMock()
+        client.get_positions.return_value = []
+        client.get_order_status.return_value = {
+            "order": {"id": 9108, "status": "pending", "exec_quantity": 1.0},
+        }
+
+        reconciler = PositionReconciler(client=client, order_log=log, account_id="VA1")
+        result = asyncio.run(reconciler.reconcile(date(2026, 5, 20)))
+
+        assert result.timeouts_resolved[0].new_status == "unknown"
+        assert len(log.timeout_orders()) == 1  # untouched
+        log.close()
+    print("timeout_recovery: partial exec past expiration → keep timeout ✓")
+
+
 def test_timeout_recovery_chains_into_expiration_marking():
     """End-to-end: timeout order that filled AND expired ITM. Single
     reconcile() call must recover the timeout, fetch underlying close,
