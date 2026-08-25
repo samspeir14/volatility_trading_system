@@ -149,8 +149,9 @@ async def main_async() -> int:
             # Sanity assertions
             assert all(isinstance(m.pnl_dollars, float) for m in marks)
             for m in marks:
-                # P&L sanity bound: |pnl| < 200% of entry premium
-                cap = abs(m.position.entry_premium) * 200
+                # P&L sanity bound: |pnl| < 200% of entry premium (per lot ×
+                # lot count — pnl_dollars is whole-position dollars)
+                cap = abs(m.position.entry_premium) * 200 * m.position.lots
                 assert abs(m.pnl_dollars) < cap, f"P&L {m.pnl_dollars} exceeds sanity cap {cap}"
             assert len(decisions) == len(marks)
             for d in decisions:

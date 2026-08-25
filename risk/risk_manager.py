@@ -77,10 +77,12 @@ class RiskManager:
         committed_risk = 0.0
         committed_ticker: dict[str, float] = {}
         committed_sector: dict[str, int] = {}
+        committed_margin = 0.0
         decisions: list[RiskDecision] = []
         for s in signals:
             d = self._evaluate(
                 s, scan, snapshot, committed_risk, committed_ticker, committed_sector,
+                committed_margin,
             )
             if d.approved:
                 committed_risk += d.projected_max_loss
@@ -89,6 +91,8 @@ class RiskManager:
                 )
                 sector = self._sector_map.get(s.symbol, "unknown")
                 committed_sector[sector] = committed_sector.get(sector, 0) + 1
+                if s.direction == "SELL" and d.quantity > 0:
+                    committed_margin += self._margin_required(s, d.quantity)
             decisions.append(d)
         return decisions
 
@@ -100,6 +104,7 @@ class RiskManager:
         committed_risk: float = 0.0,
         committed_ticker: dict[str, float] | None = None,
         committed_sector: dict[str, int] | None = None,
+        committed_margin: float = 0.0,
     ) -> RiskDecision:
         committed_ticker = committed_ticker or {}
         committed_sector = committed_sector or {}
@@ -193,13 +198,17 @@ class RiskManager:
                         f"cap ${cap:.2f} ({limit_pct:.1%} equity)"
                     )
 
-        # 6. Margin buffer (only meaningful for credit/short positions)
+        # 6. Margin buffer (only meaningful for credit/short positions).
+        # committed_margin carries this cycle's earlier SELL approvals — at
+        # multi-lot sizes a batch of approvals can overrun the cycle-start
+        # buying power that each one passes against individually.
         if signal.direction == "SELL" and sized_qty > 0:
             margin_required = self._margin_required(signal, sized_qty)
             usable_bp = snapshot.buying_power * (1 - self._bp_buffer_pct)
-            if margin_required > usable_bp:
+            if committed_margin + margin_required > usable_bp:
                 reasons.append(
-                    f"required margin ${margin_required:.2f} exceeds usable buying power "
+                    f"required margin ${margin_required:.2f} (+ ${committed_margin:.2f} "
+                    f"committed this cycle) exceeds usable buying power "
                     f"${usable_bp:.2f} (buffer {self._bp_buffer_pct:.0%} reserved)"
                 )
 

@@ -401,9 +401,11 @@ def test_settle_intrinsic_pnl_unit():
     assert settle_intrinsic_pnl(long_straddle, 110.0, "BUY", 5.00) == 500.0
     # Put $7 ITM, call OTM: +700 - 500 = +200
     assert settle_intrinsic_pnl(long_straddle, 93.0, "BUY", 5.00) == 200.0
-    # Quantity scaling
+    # Quantity scaling: entry_premium is PER LOT (Tradier multileg prices are
+    # per unit), so the entry debit scales with the lot count alongside the
+    # payoff — 2 lots: payoff 2×$1,000, debit 2×$500.
     long_qty2 = [{**l, "quantity": 2} for l in long_straddle]
-    assert settle_intrinsic_pnl(long_qty2, 110.0, "BUY", 5.00) == 2000.0 - 500.0
+    assert settle_intrinsic_pnl(long_qty2, 110.0, "BUY", 5.00) == 2000.0 - 1000.0
 
     short_ic = [
         {"strike": 150.0, "option_type": "call", "side": "sell", "quantity": 1},

@@ -67,6 +67,17 @@ def underlying_of_option(option_symbol: str) -> str:
     return m.group(1) if m else option_symbol
 
 
+def _lots(legs: list[dict]) -> int:
+    """Structure lot count from raw leg dicts: legs are scaled uniformly at
+    entry, so the min quantity is the number of structure units."""
+    if not legs:
+        return 1
+    try:
+        return max(1, min(int(leg.get("quantity", 1)) for leg in legs))
+    except (TypeError, ValueError):
+        return 1
+
+
 def settle_intrinsic_pnl(
     legs: list[dict],
     underlying_close: float,
@@ -79,10 +90,12 @@ def settle_intrinsic_pnl(
 
     legs: list of {strike, option_type ('call'|'put'), side ('buy'|'sell'), quantity}
     direction: 'BUY' (debit) or 'SELL' (credit) — sign of entry cash flow
-    entry_premium: positive absolute per-contract premium
+    entry_premium: positive absolute per-lot premium (Tradier multileg fill
+    prices are per structure unit); scaled here by the lot count so it matches
+    the per-leg payoff sum, which already multiplies by quantity.
     """
     entry_sign = -1 if direction == "BUY" else +1
-    entry_cash = entry_sign * entry_premium * 100.0
+    entry_cash = entry_sign * entry_premium * 100.0 * _lots(legs)
     total_payoff = 0.0
     for leg in legs:
         strike = float(leg["strike"])
@@ -105,12 +118,12 @@ def max_loss_dollars(legs: list[dict], direction: str, entry_premium: float) -> 
     intrinsic settlement — a computed realized below this is a calculation
     bug.
 
-    Long (BUY): −entry_premium·100 (debit is the floor).
-    Short defined-risk (SELL iron condor): −(wing_distance·100 − credit).
+    Long (BUY): −entry_premium·100·lots (debit is the floor).
+    Short defined-risk (SELL iron condor): −(wing_distance·100 − credit·100)·lots.
     Short undefined (naked short): unbounded; returns −inf.
     """
     if direction == "BUY":
-        return -entry_premium * 100.0
+        return -entry_premium * 100.0 * _lots(legs)
     # Short: look for symmetric wings to bound max loss.
     calls = sorted([l for l in legs if l["option_type"] == "call"], key=lambda l: float(l["strike"]))
     puts = sorted([l for l in legs if l["option_type"] == "put"], key=lambda l: float(l["strike"]))
@@ -119,7 +132,7 @@ def max_loss_dollars(legs: list[dict], direction: str, entry_premium: float) -> 
         call_wing = float(calls[1]["strike"]) - float(calls[0]["strike"])
         put_wing = float(puts[1]["strike"]) - float(puts[0]["strike"])
         wing = max(call_wing, put_wing)
-        return -(wing * 100.0 - entry_premium * 100.0)
+        return -(wing * 100.0 - entry_premium * 100.0) * _lots(legs)
     return float("-inf")  # naked / undefined-risk — no bound
 
 

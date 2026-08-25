@@ -185,7 +185,9 @@ def test_calibration_standard_preserves_live_values():
     assert c.min_buying_power_buffer_pct == 0.05
     assert c.max_premium_per_trade == 5000.0
     assert c.min_credit == 0.0
-    assert c.max_contracts_per_trade == 10  # historical RiskManager cap
+    # 5 since 2026-08-25: sized quantity is now applied to orders, so the cap
+    # is real traded size, not a phantom projection bound (was 10).
+    assert c.max_contracts_per_trade == 5
     print("calibration_standard: all pre-refactor values preserved")
 
 
@@ -202,8 +204,9 @@ def test_calibration_small_values():
     assert c.min_buying_power_buffer_pct == 0.05
     assert c.max_premium_per_trade == 500.0
     assert c.min_credit == 0.25
-    # Orders always submit 1-lot; capping RiskManager's sized quantity at 1
-    # keeps committed-risk/Greek/margin projections equal to what trades.
+    # Sized quantity is applied to orders since 2026-08-25; the small
+    # (real-money) profile stays hard 1-lot — this cap enforces it in both
+    # RiskManager sizing and the OrderManager leg clamp.
     assert c.max_contracts_per_trade == 1
     print("calibration_small: 2.5%/12%/gamma 10%/$500 premium/$0.25 credit floor")
 
