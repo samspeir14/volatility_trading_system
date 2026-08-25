@@ -17,7 +17,7 @@ import json
 import logging
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -114,13 +114,15 @@ class RiskCalibration:
     # of their wing width — a per-trade EV test that scales across cheap and
     # expensive names where the absolute min_credit can't.
     min_credit_to_width: float
-    # Cap on RiskManager's sized quantity. Orders always submit 1-lot (signal
-    # legs are quantity=1 and RiskDecision.quantity is never applied), so any
-    # value above 1 books phantom multi-lot risk into the committed-risk /
-    # Greek / margin projections. Standard keeps the historical 10 to preserve
-    # paper behavior; small uses 1 so the gates account for what actually
-    # trades — at a $1,200 wing-risk cap, $130-250 of phantom commitment per
-    # approval would otherwise throttle the ladder at ~half its design size.
+    # Cap on RiskManager's sized quantity, which IS applied to orders since
+    # 2026-08-25: approved signals scale their legs to the sized lot count, so
+    # per-trade max loss equalizes at the budget across structures (a $137
+    # max-loss condor sizes to several lots; a $700 straddle to 1-2). The
+    # committed-risk / Greek / margin projections were always computed at this
+    # quantity, so applying it aligns booked risk with traded risk. Standard
+    # starts at a conservative 5 (was 10 when sizing was phantom) to shake out
+    # multi-lot fill behavior; small stays 1 — the real-money profile keeps
+    # 1-lot orders and its per-trade pct as an eligibility gate.
     max_contracts_per_trade: int
 
 
@@ -146,7 +148,7 @@ CALIBRATION_STANDARD = RiskCalibration(
     max_premium_per_trade=5000.0,
     min_credit=0.0,
     min_credit_to_width=0.25,
-    max_contracts_per_trade=10,
+    max_contracts_per_trade=5,
 )
 
 # small profile: same strategy, ~$10k bankroll, watchlist_small.yaml. Orders
@@ -421,6 +423,14 @@ class MainLoop:
         except Exception as e:
             logger.error("stale-close reconcile failed: %s — continuing", e)
 
+        # 2c-bis. Retry unresolved partial entry fills (rows stuck at
+        # final_status='partially_filled'): re-cancel the residual and book
+        # the executed size once the order is confirmed dead.
+        try:
+            await self._order_manager.resolve_partial_entries(now)
+        except Exception as e:
+            logger.error("partial-entry resolve failed: %s — continuing", e)
+
         # 2d. Pull chains for any still-open position whose expiration has aged
         # below the scan's lower window bound (_scan_window's floor). Such a
         # position has no legs in the scan — it silently drops out of
@@ -534,7 +544,22 @@ class MainLoop:
             for d in risk_decisions:
                 if d.approved and in_entry_window:
                     snap = scan[d.signal.symbol]
-                    res = await self._order_manager.submit(d.signal, snap, today)
+                    # Apply the risk manager's max-loss-normalized size: scale
+                    # every leg by the approved lot count so the API order,
+                    # legs_json, and all downstream P&L math see one truth.
+                    sized_signal = d.signal
+                    if d.quantity > 1:
+                        sized_signal = replace(d.signal, legs=[
+                            replace(leg, quantity=leg.quantity * d.quantity)
+                            for leg in d.signal.legs
+                        ])
+                        logger.info(
+                            "sizing %s %s to %d lots (projected max loss $%.0f "
+                            "within per-trade budget)",
+                            d.signal.symbol, d.signal.direction, d.quantity,
+                            d.projected_max_loss,
+                        )
+                    res = await self._order_manager.submit(sized_signal, snap, today)
                     if res.status == "filled":
                         submissions_filled += 1
                         signals_approved += 1
@@ -905,6 +930,10 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
 
     order_manager = OrderManager(
         client=client, order_log=order_log, settings=settings,
+        # Same cap as RiskManager sizing: keeps the clamp a no-op in normal
+        # flow (legs arrive pre-sized ≤ cap) and hard-enforces 1-lot on the
+        # small (real-money) profile inside the order path too.
+        max_quantity_per_leg=cal.max_contracts_per_trade,
         max_premium_per_trade=cal.max_premium_per_trade,
         stale_order_threshold_minutes=settings.stale_order_threshold_minutes,
         max_close_retries=settings.max_close_retries,

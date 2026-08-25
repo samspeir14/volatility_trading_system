@@ -129,7 +129,9 @@ def test_normal_cycle_with_no_signals():
 def test_approved_signal_submits_order():
     fake_signal = mock.MagicMock()
     fake_signal.symbol = "NVDA"
-    approved_decision = mock.MagicMock(approved=True, signal=fake_signal)
+    approved_decision = mock.MagicMock(
+        approved=True, signal=fake_signal, quantity=1,
+    )
     loop, mocks = _mk_loop(
         actionable_signals=[fake_signal],
         risk_decisions=[approved_decision],
@@ -141,6 +143,41 @@ def test_approved_signal_submits_order():
     mocks["order_manager"].submit.assert_called_once()
     mocks["risk_rejection_log"].record_rejection.assert_not_called()
     print("approved_signal: order_manager.submit called once")
+
+
+def test_approved_multi_lot_decision_scales_signal_legs():
+    """The risk manager's sized quantity is applied at submission: a
+    quantity=3 approval must reach order_manager.submit with every leg's
+    quantity multiplied by 3, on a copy (the original signal is untouched)."""
+    from signals.signal_generator import TradeLeg, TradeSignal
+
+    legs = [
+        TradeLeg(100.0, "call", "buy", 1, "NVDA260904C00100000"),
+        TradeLeg(100.0, "put", "buy", 1, "NVDA260904P00100000"),
+    ]
+    real_signal = TradeSignal(
+        symbol="NVDA", expiration=date(2026, 9, 4), dte=10,
+        horizon_lower=1, horizon_upper=1, weight_lower=1.0,
+        direction="BUY", underlying_price=100.0, atm_iv=0.25,
+        predicted_iv_equivalent=0.35, divergence=0.10,
+        cross_sectional_z=1.0, time_series_z=None, liquidity_score=1.0,
+        legs=legs, is_actionable=True,
+    )
+    approved_decision = mock.MagicMock(
+        approved=True, signal=real_signal, quantity=3,
+        projected_max_loss=1200.0,
+    )
+    loop, mocks = _mk_loop(
+        actionable_signals=[real_signal],
+        risk_decisions=[approved_decision],
+    )
+    with mock.patch("main._within_entry_window", return_value=True):
+        asyncio.run(loop.run_once())
+
+    submitted = mocks["order_manager"].submit.call_args.args[0]
+    assert [l.quantity for l in submitted.legs] == [3, 3], submitted.legs
+    assert [l.quantity for l in real_signal.legs] == [1, 1], "original mutated"
+    print("approved_multi_lot: legs scaled to sized quantity at submit")
 
 
 def test_approved_signal_held_outside_entry_window():
@@ -306,6 +343,7 @@ def main() -> int:
     test_market_closed_returns_early()
     test_normal_cycle_with_no_signals()
     test_approved_signal_submits_order()
+    test_approved_multi_lot_decision_scales_signal_legs()
     test_approved_signal_held_outside_entry_window()
     test_rejected_signal_logs_rejection_no_submit()
     test_kill_switch_active_skips_signal_generation()

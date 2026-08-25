@@ -7,7 +7,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 from config import Settings
@@ -32,6 +32,11 @@ STALE_ORDER_THRESHOLD_MINUTES_DEFAULT = 15
 MAX_CLOSE_RETRIES_DEFAULT = 3
 TERMINAL_STATES = {"filled", "partially_filled", "rejected", "canceled", "expired"}
 TERMINAL_FAILED = {"rejected", "canceled", "expired"}
+# States in which an order can no longer execute additional units. NOTE:
+# Tradier's 'partially_filled' is a WORKING state (units filled, remainder
+# live) — the partial-fill resolvers must never book executed quantities
+# until the order reaches one of these.
+DEAD_ORDER_STATES = {"filled", "rejected", "canceled", "expired"}
 
 
 @dataclass(frozen=True)
@@ -51,7 +56,7 @@ class _OrderRequest:
     order_type: str                 # "debit" | "credit"
     price: float                    # always positive — order_type determines sign
     structure: str                  # "straddle" | "iron_condor"
-    estimated_premium: float        # absolute dollar premium per contract
+    estimated_premium: float        # absolute dollar premium, whole trade (× lots)
 
 
 def fingerprint_signal(signal: TradeSignal, scan_date) -> str:
@@ -125,6 +130,12 @@ def signal_to_request(
         })
         leg_contracts.append(contract)
 
+    # Structure lot count: legs are scaled uniformly by the risk manager's
+    # sized quantity, so min leg quantity = number of structure units. The
+    # limit price stays per unit (Tradier multileg semantics); only the
+    # premium-cap estimate below needs the whole-trade dollar figure.
+    lots = max(1, min(leg["quantity"] for leg in api_legs))
+
     if signal.direction == "BUY":
         if len(leg_contracts) != 2:
             raise ValueError(f"BUY straddle expects 2 legs, got {len(leg_contracts)}")
@@ -132,7 +143,7 @@ def signal_to_request(
         price = compute_straddle_debit(call, put, slippage=slippage)
         structure = "straddle"
         order_type = "debit"
-        estimated_premium = price * 100  # one contract = 100 shares
+        estimated_premium = price * 100 * lots  # one contract = 100 shares
     else:
         if len(leg_contracts) != 4:
             raise ValueError(f"SELL iron condor expects 4 legs, got {len(leg_contracts)}")
@@ -153,8 +164,8 @@ def signal_to_request(
         structure = "iron_condor"
         order_type = "credit"
         # Max risk on a credit spread = (wing distance × 100) − net credit
-        # Premium-cap proxy: use absolute credit × 100 for sanity
-        estimated_premium = price * 100
+        # Premium-cap proxy: use absolute credit × 100 × lots for sanity
+        estimated_premium = price * 100 * lots
 
     return _OrderRequest(
         legs=api_legs,
@@ -358,6 +369,15 @@ class OrderManager:
                 error="order did not reach terminal state within ladder",
             )
 
+        if terminal_status == "partially_filled":
+            # Reachable only for multi-lot orders: cancel the residual and
+            # book the executed units as the position (legs_json shrunk to
+            # match), so the tracker manages exactly what is held.
+            terminal_status, resolved_fill = await self._resolve_partial_entry(
+                order_id, signal.symbol,
+            )
+            fill_price = resolved_fill if resolved_fill is not None else fill_price
+
         filled_at = datetime.now(timezone.utc) if terminal_status == "filled" else None
         self._log.update_terminal_state(
             order_id=order_id, status=terminal_status, fill_price=fill_price,
@@ -404,6 +424,160 @@ class OrderManager:
         if status in TERMINAL_STATES:
             return status, self._extract_fill_price(order_node)
         return None, None
+
+    @staticmethod
+    def _node_units(order_node: dict) -> tuple[int | None, bool]:
+        """(executed structure units, legs_even) from an order node. Units =
+        min over legs of exec_quantity — the count of COMPLETE structures;
+        uneven leg fills (legs_even=False) leave odd single-leg residue at
+        the broker. Returns (None, True) when the response can't be parsed —
+        a leg MISSING the exec_quantity field entirely is a parse failure,
+        never a zero, so schema drift can't book a fill as 'nothing
+        executed'."""
+        legs = order_node.get("leg")
+        try:
+            if isinstance(legs, list) and legs:
+                if any("exec_quantity" not in l for l in legs):
+                    return None, True
+                quantities = [int(float(l["exec_quantity"] or 0)) for l in legs]
+                return min(quantities), len(set(quantities)) == 1
+            if "exec_quantity" not in order_node:
+                return None, True
+            return int(float(order_node["exec_quantity"] or 0)), True
+        except (TypeError, ValueError):
+            return None, True
+
+    async def _executed_units(
+        self, order_id: int,
+    ) -> tuple[str | None, int | None, float | None, bool]:
+        """(order status, executed structure units, avg fill price,
+        legs_even) for a (possibly partially) filled multileg order.
+        status/units are None when Tradier's response can't be parsed. The
+        STATUS is load-bearing for the partial-fill resolvers: only a dead
+        order (DEAD_ORDER_STATES) may be booked from these numbers — a
+        still-working order can keep filling after we read them."""
+        try:
+            resp = await self._client.get_order_status(
+                self._settings.account_id, order_id,
+            )
+        except Exception as e:
+            logger.warning("_executed_units(%d): status query failed: %r", order_id, e)
+            return None, None, None, True
+        order_node = resp.get("order") if isinstance(resp, dict) else None
+        if not isinstance(order_node, dict):
+            return None, None, None, True
+        status = (order_node.get("status") or "").lower() or None
+        avg_fill = self._extract_fill_price(order_node)
+        units, legs_even = self._node_units(order_node)
+        return status, units, avg_fill, legs_even
+
+    async def _resolve_partial_entry(
+        self, order_id: int, symbol: str,
+    ) -> tuple[str, float | None]:
+        """A multi-lot entry ended the ladder partially filled: cancel the
+        still-working residual, and once the order is CONFIRMED DEAD shrink
+        the stored legs to the executed unit count so the tracker manages
+        exactly what is held. Returns the (status, fill_price) to book:
+        'filled' at the executed size, 'canceled' when nothing executed, or
+        'partially_filled' (unresolved) when the order may still be working
+        or Tradier's answer is unusable. An unresolved row stays tracked at
+        the SUBMITTED size and resolve_partial_entries() retries it every
+        cycle until the order is dead and the row is corrected."""
+        try:
+            cancel_resp = await self._client.cancel_order(
+                self._settings.account_id, order_id,
+            )
+            cancel_err = self._extract_error(cancel_resp)
+        except Exception as e:
+            cancel_err = repr(e)
+        if cancel_err is not None:
+            # Either a race with the remaining units filling, or the cancel
+            # genuinely failed and the order is still working — the status
+            # check below distinguishes the two.
+            logger.warning(
+                "cancel of partially-filled entry %d returned %r — re-querying",
+                order_id, cancel_err,
+            )
+        status, units, avg_fill, legs_even = await self._executed_units(order_id)
+        if status not in DEAD_ORDER_STATES:
+            logger.critical(
+                "PARTIAL ENTRY FILL UNRESOLVED: order %d (%s) status=%r after "
+                "cancel — the order may STILL BE WORKING and filling more "
+                "units. Row left partially_filled (tracked at submitted "
+                "size); will retry resolution next cycle.",
+                order_id, symbol, status,
+            )
+            return "partially_filled", avg_fill
+        if units is None:
+            logger.critical(
+                "PARTIAL ENTRY FILL UNRESOLVED: order %d (%s) is dead (%s) "
+                "but executed quantity could not be read; row left as "
+                "partially_filled and tracked at SUBMITTED size. Verify at "
+                "the broker (RUNBOOK section 2); will retry next cycle.",
+                order_id, symbol, status,
+            )
+            return "partially_filled", avg_fill
+        if units <= 0:
+            if status == "filled":
+                # Contradiction: dead-filled with zero executed units read.
+                logger.critical(
+                    "PARTIAL ENTRY FILL UNRESOLVED: order %d (%s) reports "
+                    "status=filled but 0 executed units parsed — refusing to "
+                    "book; will retry next cycle.", order_id, symbol,
+                )
+                return "partially_filled", avg_fill
+            logger.info(
+                "partial entry %d resolved as canceled (order %s, no complete "
+                "units executed)", order_id, status,
+            )
+            return "canceled", None
+        if not self._log.update_leg_quantities(order_id, units):
+            logger.critical(
+                "PARTIAL ENTRY FILL UNRESOLVED: order %d (%s) executed %d "
+                "unit(s) but legs_json could not be rewritten — row left as "
+                "partially_filled and tracked at SUBMITTED size. Flatten "
+                "manually per RUNBOOK section 2.", order_id, symbol, units,
+            )
+            return "partially_filled", avg_fill
+        if not legs_even:
+            logger.critical(
+                "PARTIAL ENTRY FILL UNEVEN: order %d (%s) legs executed "
+                "unevenly — %d complete unit(s) booked, odd single-leg "
+                "residue may remain at the broker. Check positions manually.",
+                order_id, symbol, units,
+            )
+        logger.warning(
+            "partial entry %d (%s): kept %d executed unit(s), residual "
+            "dead (%s), legs rewritten", order_id, symbol, units, status,
+        )
+        return "filled", avg_fill
+
+    async def resolve_partial_entries(self, now: datetime) -> int:
+        """Re-attempt resolution of entry rows stuck at final_status=
+        'partially_filled' — the unresolved outcomes of _resolve_partial_entry
+        and the reconciler's timeout recovery. Runs every cycle from the main
+        loop; each row is re-canceled/re-read until the order is confirmed
+        dead and the row is booked at its true executed size. Returns the
+        number of rows resolved."""
+        rows = self._log.partial_entry_orders()
+        resolved = 0
+        for row in rows:
+            status, fill = await self._resolve_partial_entry(
+                row["tradier_order_id"], row["symbol"],
+            )
+            if status == "partially_filled":
+                continue  # still unresolved — retry next cycle
+            self._log.update_terminal_state(
+                order_id=row["tradier_order_id"], status=status,
+                fill_price=fill if fill is not None else row.get("fill_price"),
+                filled_at=now if status == "filled" else None,
+            )
+            resolved += 1
+            logger.warning(
+                "resolve_partial_entries: order %d (%s) resolved to %s",
+                row["tradier_order_id"], row["symbol"], status,
+            )
+        return resolved
 
     async def _poll_until_terminal(
         self, order_id: int, timeout_seconds: float | None = None,
@@ -617,8 +791,10 @@ class OrderManager:
             })
 
         # Determine close net premium and order type. Priced at the mark's
-        # theoretical mid; the price ladder concedes from there.
-        close_cash_per_contract = mark.close_cash_flow / 100.0
+        # theoretical mid; the price ladder concedes from there. close_cash_flow
+        # is whole-position dollars (scaled by leg quantity), but the multileg
+        # limit price is PER STRUCTURE UNIT — divide the lots back out.
+        close_cash_per_contract = mark.close_cash_flow / (100.0 * position.lots)
         order_type = "credit" if close_cash_per_contract >= 0 else "debit"
         close_mid = round(abs(close_cash_per_contract), 2)
         price = self._ladder_price(close_mid, order_type, self._ladder_steps[0])
@@ -641,6 +817,14 @@ class OrderManager:
         if preview_error is not None:
             logger.warning("close preview failed for order %s: %s",
                            position.tradier_order_id, preview_error)
+            # Burns retry budget: repeated rejections (e.g. size mismatch
+            # after an unresolved partial fill) must escalate to the
+            # stale-close alert instead of retrying silently forever.
+            self._log.record_failed_close_submission(
+                opening_order_id=position.tradier_order_id,
+                exit_trigger=exit_trigger, submitted_at=now,
+                reason=f"preview: {preview_error}",
+            )
             return OrderResult(
                 signal=None, status="preview_failed", order_id=None,
                 submitted_price=price, fill_price=None, error=preview_error,
@@ -660,6 +844,11 @@ class OrderManager:
             err = place_error or f"unexpected place response: {place_resp}"
             logger.error("close place failed for order %s: %s",
                          position.tradier_order_id, err)
+            self._log.record_failed_close_submission(
+                opening_order_id=position.tradier_order_id,
+                exit_trigger=exit_trigger, submitted_at=now,
+                reason=f"place: {err}",
+            )
             return OrderResult(
                 signal=None, status="error", order_id=None,
                 submitted_price=price, fill_price=None, error=err,
@@ -703,6 +892,36 @@ class OrderManager:
 
         terminal_at = datetime.now(timezone.utc)
 
+        if terminal_status == "partially_filled":
+            # Multi-lot close executed only some units: cancel the residual,
+            # rebook the opening at the remaining size, burn a retry. Only a
+            # cancel-raced COMPLETE fill falls through to the filled path.
+            resolution, resolved_fill = await self._handle_partial_close(
+                closing_order_id=closing_order_id,
+                opening_order_id=position.tradier_order_id,
+                exit_trigger=exit_trigger,
+                now=terminal_at,
+            )
+            if resolution == "filled":
+                terminal_status = "filled"
+                fill_price = resolved_fill if resolved_fill is not None else fill_price
+            elif resolution == "pending":
+                # Cancel unconfirmed — the attempt stays pending and the
+                # stale-close reconciler owns it from here (same contract as
+                # the poll-timeout path above).
+                return OrderResult(
+                    signal=None, status="pending", order_id=closing_order_id,
+                    submitted_price=price, fill_price=None,
+                    error="close partially filled; cancel unconfirmed — left pending",
+                )
+            else:
+                return OrderResult(
+                    signal=None, status="partially_filled",
+                    order_id=closing_order_id, submitted_price=price,
+                    fill_price=resolved_fill,
+                    error=f"close partially filled (resolution: {resolution})",
+                )
+
         if terminal_status == "filled":
             # Open + close sides both executed: fees on every leg, twice.
             fees = self._fee_per_contract * 2 * sum(
@@ -715,6 +934,7 @@ class OrderManager:
                 fill_price=fill_price,
                 fallback_pnl=mark.pnl_dollars,
                 fees=fees,
+                lots=position.lots,
             )
             self._log.update_close_attempt(
                 closing_order_id=closing_order_id, status="filled",
@@ -735,7 +955,8 @@ class OrderManager:
                 submitted_price=price, fill_price=fill_price, error=None,
             )
 
-        # Terminal failed (rejected / canceled / expired / partially_filled)
+        # Terminal failed (rejected / canceled / expired) — partially_filled
+        # was intercepted and resolved above.
         self._log.update_close_attempt(
             closing_order_id=closing_order_id, status=terminal_status,
             terminal_at=terminal_at, fill_price=fill_price,
@@ -801,13 +1022,52 @@ class OrderManager:
 
             status = (order_node.get("status") or "").lower()
 
-            if status in {"filled", "partially_filled"}:
+            if status == "filled":
                 fill_price = self._extract_fill_price(order_node)
                 self._reconcile_between_cycle_fill(row, fill_price, now)
                 filled += 1
                 continue
 
+            if status == "partially_filled":
+                # Not a complete close: cancel the residual and rebook the
+                # opening at its remaining size instead of booking a full
+                # close at the full lot count (which would both overstate
+                # realized P&L and orphan the still-open units at Tradier).
+                resolution, fp = await self._handle_partial_close(
+                    closing_order_id=closing_order_id,
+                    opening_order_id=opening_order_id,
+                    exit_trigger=row.get("exit_trigger") or "unknown",
+                    now=now,
+                )
+                if resolution == "filled":
+                    self._reconcile_between_cycle_fill(row, fp, now)
+                    filled += 1
+                elif resolution == "pending":
+                    pass  # cancel unconfirmed — attempt left pending, retry next pass
+                else:
+                    failed_terminal += 1
+                continue
+
             if status in {"rejected", "canceled", "expired"}:
+                # A canceled/expired close can still carry partial executions
+                # (some units filled before it died) — those must go through
+                # the partial handler, not be booked as a clean failure.
+                dead_units, _even = self._node_units(order_node)
+                if dead_units is not None and dead_units > 0:
+                    resolution, fp = await self._handle_partial_close(
+                        closing_order_id=closing_order_id,
+                        opening_order_id=opening_order_id,
+                        exit_trigger=row.get("exit_trigger") or "unknown",
+                        now=now,
+                    )
+                    if resolution == "filled":
+                        self._reconcile_between_cycle_fill(row, fp, now)
+                        filled += 1
+                    elif resolution == "pending":
+                        pass
+                    else:
+                        failed_terminal += 1
+                    continue
                 self._log.update_close_attempt(
                     closing_order_id=closing_order_id, status=status,
                     terminal_at=now, fill_price=None,
@@ -852,10 +1112,25 @@ class OrderManager:
                     node2 = resp2.get("order") if isinstance(resp2, dict) else None
                     if isinstance(node2, dict):
                         s2 = (node2.get("status") or "").lower()
-                        if s2 in {"filled", "partially_filled"}:
+                        if s2 == "filled":
                             fp = self._extract_fill_price(node2)
                             self._reconcile_between_cycle_fill(row, fp, now)
                             filled += 1
+                            continue
+                        if s2 == "partially_filled":
+                            resolution, fp = await self._handle_partial_close(
+                                closing_order_id=closing_order_id,
+                                opening_order_id=opening_order_id,
+                                exit_trigger=row.get("exit_trigger") or "unknown",
+                                now=now,
+                            )
+                            if resolution == "filled":
+                                self._reconcile_between_cycle_fill(row, fp, now)
+                                filled += 1
+                            elif resolution == "pending":
+                                pass  # attempt left pending, retry next pass
+                            else:
+                                failed_terminal += 1
                             continue
                         if s2 in {"rejected", "canceled", "expired"}:
                             self._log.update_close_attempt(
@@ -886,6 +1161,142 @@ class OrderManager:
                 canceled, filled, failed_terminal,
             )
         return {"canceled": canceled, "filled": filled, "failed_terminal": failed_terminal}
+
+    async def _handle_partial_close(
+        self,
+        closing_order_id: int,
+        opening_order_id: int,
+        exit_trigger: str,
+        now: datetime,
+    ) -> tuple[str, float | None]:
+        """A multi-lot close executed only some units. Cancel the residual,
+        shrink the OPENING order's legs to the units still held, and book the
+        attempt as failed (partially_filled burns retry budget) so the exit
+        manager re-closes the remainder at its true size next cycle. The
+        closed chunk's cash lands in equity rather than realized P&L — the
+        equity-derived unrealized split absorbs it, and the persisted
+        stale-close alert puts the event in the daily summary.
+
+        Returns (resolution, avg_fill): 'filled' when everything executed
+        (caller books the normal full close), 'canceled' when nothing did,
+        'partial' when the remainder was rebooked, 'pending' when the close
+        order may STILL BE WORKING (attempt left pending so the stale-close
+        reconciler re-queries it next cycle), or 'unresolved' when the order
+        is dead but Tradier's numbers were unusable."""
+        try:
+            cancel_resp = await self._client.cancel_order(
+                self._settings.account_id, closing_order_id,
+            )
+            cancel_err = self._extract_error(cancel_resp)
+        except Exception as e:
+            cancel_err = repr(e)
+        if cancel_err is not None:
+            logger.warning(
+                "cancel of partially-filled close %d returned %r — re-querying",
+                closing_order_id, cancel_err,
+            )
+        status, units, avg_fill, legs_even = await self._executed_units(closing_order_id)
+
+        if status not in DEAD_ORDER_STATES:
+            # Cancel unconfirmed — the close may keep filling. Do NOT touch
+            # the attempt (it stays/returns to 'pending'), so
+            # reconcile_pending_closes re-queries it next cycle instead of
+            # this event being handled twice or the order being forgotten.
+            logger.warning(
+                "partial close %d for opening %d: status=%r after cancel — "
+                "order may still be working; leaving attempt pending for the "
+                "next reconcile pass", closing_order_id, opening_order_id, status,
+            )
+            return "pending", avg_fill
+
+        opening = self._log.get_submitted_order(opening_order_id)
+        held_lots: int | None = None
+        symbol, structure, expiration = "?", "?", None
+        if opening is not None:
+            symbol, structure = opening["symbol"], opening["structure"]
+            try:
+                expiration = date.fromisoformat(opening["expiration"])
+                legs = json.loads(opening["legs_json"])
+                held_lots = max(1, min(int(l["quantity"]) for l in legs))
+            except (json.JSONDecodeError, TypeError, KeyError, ValueError):
+                held_lots = None
+
+        def _alert() -> None:
+            if opening is None or expiration is None:
+                return
+            self._log.record_stale_close_alert(
+                opening_order_id=opening_order_id, symbol=symbol,
+                expiration=expiration, structure=structure,
+                attempts=self._log.failed_close_attempt_count(opening_order_id),
+                last_exit_trigger=f"partial_close:{exit_trigger}",
+                detected_at=now,
+            )
+
+        def _unresolved(reason: str) -> tuple[str, float | None]:
+            self._log.update_close_attempt(
+                closing_order_id=closing_order_id, status="partially_filled",
+                terminal_at=now, fill_price=avg_fill,
+            )
+            _alert()
+            logger.critical(
+                "PARTIAL CLOSE UNRESOLVED: close %d for opening %d (%s) — %s; "
+                "position left at recorded size, verify held units at the "
+                "broker (RUNBOOK section 2)",
+                closing_order_id, opening_order_id, symbol, reason,
+            )
+            return "unresolved", avg_fill
+
+        if units is None:
+            return _unresolved(f"order dead ({status}) but executed quantity unreadable")
+        if held_lots is None:
+            # Never guess the held size: a bad guess of 1 would let any
+            # partial pass the units >= held test and book a full close.
+            return _unresolved("opening order's legs_json unreadable")
+        if units <= 0:
+            if status == "filled":
+                return _unresolved("status=filled but 0 executed units parsed")
+            self._log.update_close_attempt(
+                closing_order_id=closing_order_id, status="canceled",
+                terminal_at=now, fill_price=None,
+            )
+            logger.info(
+                "partial close %d resolved as canceled (order %s, no complete "
+                "units executed)", closing_order_id, status,
+            )
+            return "canceled", None
+        if units >= held_lots:
+            return "filled", avg_fill
+
+        # Attempt status FIRST, leg shrink second: if the process dies
+        # between the two writes, the attempt is already failed so the next
+        # cycle re-closes at the (unshrunk) full size and gets rejected —
+        # loud but not corrupting. The reverse order would leave the attempt
+        # pending against already-shrunk legs and shrink them AGAIN on the
+        # next reconcile pass.
+        remaining = held_lots - units
+        self._log.update_close_attempt(
+            closing_order_id=closing_order_id, status="partially_filled",
+            terminal_at=now, fill_price=avg_fill,
+        )
+        rewrote = self._log.update_leg_quantities(opening_order_id, remaining)
+        _alert()
+        if not legs_even:
+            logger.critical(
+                "PARTIAL CLOSE UNEVEN: close %d (%s) legs executed unevenly — "
+                "%d complete unit(s) booked closed; per-leg residue at the "
+                "broker will reject the remainder close. Check positions "
+                "manually.", closing_order_id, symbol, units,
+            )
+        logger.critical(
+            "PARTIAL CLOSE: close %d for opening %d (%s %s) closed %d of %d "
+            "lot(s); opening rebooked at %d lot(s)%s — closed chunk's P&L "
+            "shows in equity/unrealized, exit manager re-closes the remainder "
+            "next cycle",
+            closing_order_id, opening_order_id, symbol, structure,
+            units, held_lots, remaining,
+            "" if rewrote else " (LEG REWRITE FAILED — size now wrong, fix manually)",
+        )
+        return "partial", avg_fill
 
     def _reconcile_between_cycle_fill(
         self,
@@ -921,17 +1332,19 @@ class OrderManager:
         try:
             opening_legs = json.loads(opening["legs_json"])
             contracts = sum(int(leg["quantity"]) for leg in opening_legs)
+            lots = max(1, min(int(leg["quantity"]) for leg in opening_legs))
         except (json.JSONDecodeError, TypeError, KeyError, ValueError):
             logger.warning(
                 "reconcile: bad legs_json on opening order %s — booking close "
                 "without fee netting", opening_order_id,
             )
             contracts = 0
+            lots = 1
         fees = self._fee_per_contract * 2 * contracts
         realized_pnl = self._compute_close_realized_pnl(
             is_long=is_long, entry_premium=entry_premium,
             order_type=order_type, fill_price=fill_price,
-            fallback_pnl=0.0, fees=fees,
+            fallback_pnl=0.0, fees=fees, lots=lots,
         )
 
         self._log.update_close_attempt(
@@ -960,20 +1373,23 @@ class OrderManager:
         fill_price: float | None,
         fallback_pnl: float,
         fees: float = 0.0,
+        lots: int = 1,
     ) -> float:
         """Realized P&L using Tradier's signed avg_fill_price + order_type.
         Tradier returns credit fills as NEGATIVE; abs() + order_type carries
         the canonical sign so credits add and debits subtract from realized.
-        If fill_price is missing (rare), falls back to the mark estimate.
+        Entry premium and fill price are per structure unit; `lots` scales
+        both to whole-position dollars. If fill_price is missing (rare),
+        falls back to the mark estimate (already whole-position dollars).
         `fees` (estimated round-trip contract fees) are netted out; the
         equity-derived unrealized split in portfolio_state absorbs the
         difference, so the bookkeeping identity still holds."""
         if fill_price is None:
             return fallback_pnl - fees
         abs_fill = abs(fill_price)
-        close_cash_realized = abs_fill * 100 if order_type == "credit" else -abs_fill * 100
+        close_cash_realized = (abs_fill if order_type == "credit" else -abs_fill) * 100 * lots
         entry_sign = -1 if is_long else 1
-        entry_cash = entry_sign * entry_premium * 100
+        entry_cash = entry_sign * entry_premium * 100 * lots
         return entry_cash + close_cash_realized - fees
 
     @staticmethod

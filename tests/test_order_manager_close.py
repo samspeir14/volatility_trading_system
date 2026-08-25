@@ -196,10 +196,219 @@ def test_close_long_straddle_loss_at_credit_fill():
     print(f"long_straddle partial-loss close: realized={recorded:+.2f} ✓")
 
 
+def _mk_iron_condor_position_5lot() -> OpenPosition:
+    legs = [
+        TradeLeg(210.0, "call", "sell", 5, "NVDA260522C00210000"),
+        TradeLeg(210.0, "put", "sell", 5, "NVDA260522P00210000"),
+        TradeLeg(230.0, "call", "buy", 5, "NVDA260522C00230000"),
+        TradeLeg(190.0, "put", "buy", 5, "NVDA260522P00190000"),
+    ]
+    return OpenPosition(
+        tradier_order_id=5003, symbol="NVDA",
+        expiration=date(2026, 5, 22), direction="SELL",
+        structure="iron_condor", legs=legs, entry_premium=3.60,
+        entry_atm_iv=0.40, entry_predicted_iv=0.32, entry_divergence=-0.08,
+        entry_horizon_lower=1, entry_horizon_upper=1, entry_weight_lower=1.0,
+        submitted_at=datetime(2026, 4, 27, 16, 0, tzinfo=timezone.utc),
+    )
+
+
+def test_close_multi_lot_condor_prices_per_unit_and_scales_pnl():
+    """5-lot condor: sold for $3.60 credit per lot, closing at $3.00 per lot.
+    mark.close_cash_flow is whole-position dollars (−$1,500); the close limit
+    price must be the PER-UNIT $3.00 (the pre-fix code would submit $15.00 —
+    a 5× overpay on a debit close). Realized P&L must scale by lots:
+    (3.60 − 3.00) × 100 × 5 = +$300."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "log.db")
+        pos = _mk_iron_condor_position_5lot()
+        _seed_open_order(log, pos)
+        mark = _mk_mark(pos, close_cash_flow=-1500.0)  # pay $3.00/lot × 5 × 100
+
+        manager = _mk_manager(log, fill_price=3.00, closing_order_id=9003)
+        result = asyncio.run(manager.submit_close(
+            position=pos, mark=mark, exit_trigger="profit_target",
+        ))
+
+        assert result.status == "filled", f"expected filled, got {result.status}: {result.error}"
+
+        place_kwargs = manager._client.place_order.call_args.kwargs
+        assert abs(place_kwargs["price"] - 3.00) < 0.01, (
+            f"close limit must be per-unit $3.00, got {place_kwargs['price']}"
+        )
+        assert all(leg["quantity"] == 5 for leg in place_kwargs["legs"]), (
+            f"close legs must carry the full 5-lot quantity: {place_kwargs['legs']}"
+        )
+
+        recorded = log.closed_today_pnl(datetime.now(timezone.utc).date())
+        expected = 300.0
+        assert abs(recorded - expected) <= 5.0, (
+            f"multi-lot close P&L mismatch: recorded={recorded:+.2f} "
+            f"expected={expected:+.2f}"
+        )
+        log.close()
+    print(f"multi-lot condor close: per-unit price ✓ realized={recorded:+.2f} ✓")
+
+
+def test_partial_close_rebooks_remainder_and_does_not_close_position():
+    """A 5-lot close that fills only 2 units must NOT book the position
+    closed: the residual close is canceled, the attempt is recorded as
+    partially_filled (burning a retry), the opening order's legs shrink to
+    the 3 units still held, and a stale-close alert row surfaces the event."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "log.db")
+        pos = _mk_iron_condor_position_5lot()
+        _seed_open_order(log, pos)
+        mark = _mk_mark(pos, close_cash_flow=-1500.0)
+
+        fake_client = mock.AsyncMock()
+        fake_client.preview_order.return_value = {"order": {"status": "ok"}}
+        fake_client.place_order.return_value = {"order": {"id": 9100, "status": "pending"}}
+        # Working partial during the submit poll; confirmed dead (canceled,
+        # 2 units executed) once the residual cancel lands.
+        working = {"order": {
+            "id": 9100, "status": "partially_filled", "avg_fill_price": 3.00,
+            "leg": [{"exec_quantity": 2}] * 4,
+        }}
+        dead = {"order": {
+            "id": 9100, "status": "canceled", "avg_fill_price": 3.00,
+            "leg": [{"exec_quantity": 2}] * 4,
+        }}
+        fake_client.get_order_status.side_effect = [working, dead, dead, dead]
+        fake_client.cancel_order.return_value = {"order": {"status": "ok"}}
+        manager = OrderManager(
+            client=fake_client, order_log=log, settings=_mk_settings(),
+            poll_interval_seconds=0.001, poll_timeout_seconds=1.0,
+            slippage_buffer=0.0,
+        )
+
+        result = asyncio.run(manager.submit_close(
+            position=pos, mark=mark, exit_trigger="profit_target",
+        ))
+
+        assert result.status == "partially_filled", result.status
+        fake_client.cancel_order.assert_awaited()
+
+        opening = log.get_submitted_order(pos.tradier_order_id)
+        assert opening["closing_order_id"] is None, "position must remain open"
+        import json as _json
+        stored = _json.loads(opening["legs_json"])
+        assert [l["quantity"] for l in stored] == [3, 3, 3, 3], stored
+
+        attempt = log._conn.execute(
+            "SELECT status, fill_price FROM close_attempts WHERE closing_order_id = 9100"
+        ).fetchone()
+        assert attempt[0] == "partially_filled", attempt
+        alert = log._conn.execute(
+            "SELECT last_exit_trigger FROM stale_close_alerts WHERE opening_order_id = ?",
+            (pos.tradier_order_id,),
+        ).fetchone()
+        assert alert is not None and alert[0] == "partial_close:profit_target", alert
+        log.close()
+    print("partial_close: remainder rebooked at 3 lots, attempt failed, alert row ✓")
+
+
+def test_between_cycle_partial_close_not_booked_as_full_close():
+    """reconcile_pending_closes finds a pending close that Tradier reports
+    partially_filled (2 of 5 units). It must go through the partial handler —
+    residual canceled, opening rebooked at 3 lots, attempt failed — NOT
+    through _reconcile_between_cycle_fill, which would book a full 5-lot
+    close (overstating realized 2.5×) and orphan the 3 open units."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "log.db")
+        pos = _mk_iron_condor_position_5lot()
+        _seed_open_order(log, pos)
+        log.record_close_attempt(
+            opening_order_id=pos.tradier_order_id, closing_order_id=9200,
+            submitted_at=datetime.now(timezone.utc), exit_trigger="stop_loss",
+            order_type="debit", submitted_price=3.00,
+        )
+
+        fake_client = mock.AsyncMock()
+        working = {"order": {
+            "id": 9200, "status": "partially_filled", "avg_fill_price": 3.00,
+            "leg": [{"exec_quantity": 2}] * 4,
+        }}
+        dead = {"order": {
+            "id": 9200, "status": "canceled", "avg_fill_price": 3.00,
+            "leg": [{"exec_quantity": 2}] * 4,
+        }}
+        fake_client.get_order_status.side_effect = [working, dead, dead]
+        fake_client.cancel_order.return_value = {"order": {"status": "ok"}}
+        manager = OrderManager(
+            client=fake_client, order_log=log, settings=_mk_settings(),
+            poll_interval_seconds=0.001, poll_timeout_seconds=1.0,
+        )
+
+        counts = asyncio.run(manager.reconcile_pending_closes(datetime.now(timezone.utc)))
+
+        assert counts["filled"] == 0, counts
+        opening = log.get_submitted_order(pos.tradier_order_id)
+        assert opening["closing_order_id"] is None, "position must remain open"
+        import json as _json
+        stored = _json.loads(opening["legs_json"])
+        assert [l["quantity"] for l in stored] == [3, 3, 3, 3], stored
+        attempt = log._conn.execute(
+            "SELECT status FROM close_attempts WHERE closing_order_id = 9200"
+        ).fetchone()
+        assert attempt[0] == "partially_filled", attempt
+        log.close()
+    print("between-cycle partial close: handler path, remainder rebooked ✓")
+
+
+def test_partial_close_cancel_unconfirmed_stays_pending():
+    """If the close is still WORKING after the cancel attempt (cancel failed
+    or raced), nothing may be booked: the attempt stays pending so the next
+    reconcile pass re-queries it, and the opening order's legs are untouched."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "log.db")
+        pos = _mk_iron_condor_position_5lot()
+        _seed_open_order(log, pos)
+        mark = _mk_mark(pos, close_cash_flow=-1500.0)
+
+        fake_client = mock.AsyncMock()
+        # Order remains partially_filled (working) on every query — the
+        # cancel never demonstrably lands.
+        fake_client.get_order_status.return_value = {"order": {
+            "id": 9300, "status": "partially_filled", "avg_fill_price": 3.00,
+            "leg": [{"exec_quantity": 2}] * 4,
+        }}
+        fake_client.preview_order.return_value = {"order": {"status": "ok"}}
+        fake_client.place_order.return_value = {"order": {"id": 9300, "status": "pending"}}
+        fake_client.cancel_order.side_effect = RuntimeError("connection dropped")
+        manager = OrderManager(
+            client=fake_client, order_log=log, settings=_mk_settings(),
+            poll_interval_seconds=0.001, poll_timeout_seconds=1.0,
+        )
+
+        result = asyncio.run(manager.submit_close(
+            position=pos, mark=mark, exit_trigger="stop_loss",
+        ))
+
+        assert result.status == "pending", result.status
+        opening = log.get_submitted_order(pos.tradier_order_id)
+        assert opening["closing_order_id"] is None
+        import json as _json
+        stored = _json.loads(opening["legs_json"])
+        assert [l["quantity"] for l in stored] == [5, 5, 5, 5], (
+            f"legs must be untouched while the order may still fill: {stored}"
+        )
+        attempt = log._conn.execute(
+            "SELECT status FROM close_attempts WHERE closing_order_id = 9300"
+        ).fetchone()
+        assert attempt[0] == "pending", attempt
+        log.close()
+    print("cancel-unconfirmed partial close: left pending, legs untouched ✓")
+
+
 def main() -> int:
     test_close_long_straddle_at_credit_fill_records_correct_pnl()
     test_close_short_iron_condor_at_debit_fill_records_correct_pnl()
     test_close_long_straddle_loss_at_credit_fill()
+    test_close_multi_lot_condor_prices_per_unit_and_scales_pnl()
+    test_partial_close_rebooks_remainder_and_does_not_close_position()
+    test_between_cycle_partial_close_not_booked_as_full_close()
+    test_partial_close_cancel_unconfirmed_stays_pending()
     print("all order_manager close tests passed")
     return 0
 

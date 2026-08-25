@@ -113,7 +113,11 @@ CREATE_INDEXES_SQL = [
 
 PENDING_CLOSE_STATUS = "pending"
 STALE_CANCELED_STATUS = "stale_canceled"
-FAILED_CLOSE_STATUSES = {"stale_canceled", "canceled", "rejected", "expired"}
+# partially_filled counts as failed: the executed chunk is booked by shrinking
+# the opening order's leg quantities to the remainder, and the attempt must
+# burn retry budget so a repeatedly-partial close still escalates to the
+# stale-close alert instead of retrying forever.
+FAILED_CLOSE_STATUSES = {"stale_canceled", "canceled", "rejected", "expired", "partially_filled"}
 
 CLOSE_COLUMNS_MIGRATIONS = [
     ("closing_order_id", "ALTER TABLE submitted_orders ADD COLUMN closing_order_id INTEGER"),
@@ -429,6 +433,72 @@ class OrderLog:
             return None
         cols = [d[0] for d in cur.description]
         return dict(zip(cols, row))
+
+    def record_failed_close_submission(
+        self,
+        opening_order_id: int,
+        exit_trigger: str,
+        submitted_at: datetime,
+        reason: str,
+    ) -> None:
+        """A close that never reached the exchange (preview/place rejected)
+        still burns retry budget: without a row here, a close that Tradier
+        rejects every cycle (e.g. a size mismatch after an unresolved partial
+        fill) would retry forever without ever tripping max_close_retries or
+        the stale-close alert. Synthetic negative closing_order_id keeps the
+        primary key clear of real Tradier ids."""
+        cur = self._conn.execute(
+            "SELECT COALESCE(MIN(closing_order_id), 0) FROM close_attempts "
+            "WHERE closing_order_id < 0",
+        )
+        synthetic_id = int(cur.fetchone()[0]) - 1
+        self._conn.execute(
+            "INSERT INTO close_attempts ("
+            "closing_order_id, opening_order_id, submitted_at, exit_trigger, "
+            "order_type, submitted_price, status, terminal_at, fill_price"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                synthetic_id, opening_order_id, submitted_at.isoformat(),
+                f"{exit_trigger} [{reason[:80]}]", "rejected_submission", 0.0,
+                "rejected", submitted_at.isoformat(), None,
+            ),
+        )
+        self._conn.commit()
+
+    def partial_entry_orders(self) -> list[dict]:
+        """Entry rows stuck at final_status='partially_filled' — unresolved
+        partial fills awaiting resolve_partial_entries(). Includes rows the
+        reconciler's timeout recovery marked partially_filled."""
+        cur = self._conn.execute(
+            "SELECT tradier_order_id, symbol, fill_price FROM submitted_orders "
+            "WHERE final_status = 'partially_filled' ORDER BY submitted_at",
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def update_leg_quantities(self, order_id: int, units: int) -> bool:
+        """Rewrite every leg's quantity in legs_json to `units` — the
+        partial-fill resolution path: after a multi-lot order executes only
+        `units` structure units (entry) or leaves `units` open (close), the
+        stored legs must describe what is actually held so the tracker,
+        exit manager, and close orders act on real size. Returns False when
+        the row is missing or its legs_json cannot be parsed."""
+        row = self.get_submitted_order(order_id)
+        if row is None:
+            return False
+        try:
+            legs = json.loads(row["legs_json"])
+            for leg in legs:
+                leg["quantity"] = int(units)
+            new_json = json.dumps(legs)
+        except (json.JSONDecodeError, TypeError, KeyError, ValueError):
+            return False
+        self._conn.execute(
+            "UPDATE submitted_orders SET legs_json = ? WHERE tradier_order_id = ?",
+            (new_json, order_id),
+        )
+        self._conn.commit()
+        return True
 
     def record_close_attempt(
         self,

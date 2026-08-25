@@ -41,18 +41,30 @@ class OpenPosition:
         return self.direction == "BUY"
 
     @property
+    def lots(self) -> int:
+        """Structure lot count. Legs are scaled uniformly at entry, so the min
+        leg quantity IS the number of structure units; min() stays conservative
+        if a malformed row ever carries mixed quantities. entry_premium and
+        fill prices are per-lot net premiums (Tradier multileg prices are
+        per-unit), so every dollar conversion must multiply by this."""
+        if not self.legs:
+            return 1
+        return max(1, min(leg.quantity for leg in self.legs))
+
+    @property
     def max_loss_dollars(self) -> float:
-        """For iron condors: wing distance × 100 − entry credit. For long
-        straddles: entry debit × 100 (premium paid is the max loss)."""
+        """For iron condors: (wing distance × 100 − entry credit × 100) × lots.
+        For long straddles: entry debit × 100 × lots (premium paid is the max
+        loss)."""
         if self.is_long:
-            return self.entry_premium * 100
+            return self.entry_premium * 100 * self.lots
         # iron condor: assume symmetric wings → wing_distance is max(call_wing, put_wing)
         if self.structure == "iron_condor":
             calls = sorted([l for l in self.legs if l.option_type == "call"], key=lambda l: l.strike)
             puts = sorted([l for l in self.legs if l.option_type == "put"], key=lambda l: l.strike)
             if len(calls) == 2 and len(puts) == 2:
                 wing_distance = max(calls[1].strike - calls[0].strike, puts[1].strike - puts[0].strike)
-                return (wing_distance * 100) - (self.entry_premium * 100)
+                return ((wing_distance * 100) - (self.entry_premium * 100)) * self.lots
         return float("nan")
 
 
@@ -159,14 +171,16 @@ class PositionTracker:
                 theta_sum += sign * current.theta * qty * 100
                 vega_sum += sign * current.vega * qty * 100
 
-            # entry cash flow: debit (BUY) → -premium, credit (SELL) → +premium
+            # entry cash flow: debit (BUY) → -premium, credit (SELL) → +premium.
+            # entry_premium is per lot; close_cash_flow above already scales by
+            # leg quantity, so scale the entry side to match.
             entry_sign = -1 if pos.is_long else 1
-            entry_cash_flow = entry_sign * pos.entry_premium * 100
+            entry_cash_flow = entry_sign * pos.entry_premium * 100 * pos.lots
             pnl = entry_cash_flow + close_cash_flow
 
             cost_to_close = abs(close_cash_flow) if close_cash_flow < 0 else -close_cash_flow
 
-            entry_dollars = pos.entry_premium * 100
+            entry_dollars = pos.entry_premium * 100 * pos.lots
             pnl_pct_premium = pnl / entry_dollars if entry_dollars > 0 else float("nan")
             max_loss = pos.max_loss_dollars
             pnl_pct_max = pnl / max_loss if max_loss > 0 else float("nan")

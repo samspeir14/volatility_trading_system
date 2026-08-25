@@ -277,7 +277,7 @@ class ExitManager:
         if mark.pnl_dollars <= sl_threshold:
             return "stop_loss", (
                 f"pnl ${mark.pnl_dollars:.2f} <= stop ${sl_threshold:.2f} "
-                f"({sl_threshold / (pos.entry_premium * 100):+.0%} of entry premium)"
+                f"({sl_threshold / (pos.entry_premium * 100 * pos.lots):+.0%} of entry premium)"
             )
 
         # 3. Earnings risk (short-vol positions never hold through a report)
@@ -315,7 +315,7 @@ class ExitManager:
         if mark.pnl_dollars >= pt_threshold:
             return "profit_target", (
                 f"pnl ${mark.pnl_dollars:.2f} >= target ${pt_threshold:.2f} "
-                f"({pt_threshold / (pos.entry_premium * 100):+.0%} of entry premium)"
+                f"({pt_threshold / (pos.entry_premium * 100 * pos.lots):+.0%} of entry premium)"
             )
 
         return None, "hold"
@@ -496,14 +496,16 @@ class ExitManager:
         return None
 
     def _profit_target_threshold(self, pos: OpenPosition) -> float:
+        # Thresholds compare against mark.pnl_dollars (whole-position dollars),
+        # so scale the per-lot entry premium by the lot count.
         if pos.is_long:
-            return self._straddle_pt * pos.entry_premium * 100
-        return self._ic_pt * pos.entry_premium * 100
+            return self._straddle_pt * pos.entry_premium * 100 * pos.lots
+        return self._ic_pt * pos.entry_premium * 100 * pos.lots
 
     def _stop_loss_threshold(self, pos: OpenPosition) -> float:
         if pos.is_long:
-            return self._straddle_sl * pos.entry_premium * 100
-        return self._ic_sl * pos.entry_premium * 100
+            return self._straddle_sl * pos.entry_premium * 100 * pos.lots
+        return self._ic_sl * pos.entry_premium * 100 * pos.lots
 
     async def execute(
         self,

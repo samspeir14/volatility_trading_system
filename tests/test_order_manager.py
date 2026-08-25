@@ -172,6 +172,64 @@ def test_quantity_clamped():
     print(f"quantity_clamped: 50 → 10")
 
 
+def test_partial_entry_fill_resolved_to_executed_units():
+    """A 5-lot entry that ends the ladder partially filled (2 units executed)
+    must cancel the residual, shrink the stored legs to 2, and book the row
+    as filled — the tracker then manages exactly what is held."""
+    legs = [
+        TradeLeg(100.0, "call", "buy", 5, "AAPL_100C"),
+        TradeLeg(100.0, "put", "buy", 5, "AAPL_100P"),
+    ]
+    base = _mk_signal("BUY")
+    sig = TradeSignal(
+        symbol=base.symbol, expiration=base.expiration, dte=base.dte,
+        horizon_lower=base.horizon_lower, horizon_upper=base.horizon_upper,
+        weight_lower=base.weight_lower, direction=base.direction,
+        underlying_price=base.underlying_price, atm_iv=base.atm_iv,
+        predicted_iv_equivalent=base.predicted_iv_equivalent,
+        divergence=base.divergence, cross_sectional_z=base.cross_sectional_z,
+        time_series_z=base.time_series_z, liquidity_score=base.liquidity_score,
+        legs=legs, is_actionable=True,
+    )
+    snap = _mk_snapshot("BUY")
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "log.db")
+        fake_client = mock.AsyncMock()
+        fake_client.preview_order.return_value = {"order": {"status": "ok"}}
+        fake_client.place_order.return_value = {"order": {"id": 8001, "status": "pending"}}
+        # Ladder poll sees the working partial; after the cancel the order is
+        # CONFIRMED DEAD (canceled) with 2 units executed — only then may the
+        # resolver book the executed size.
+        working = {"order": {
+            "id": 8001, "status": "partially_filled", "avg_fill_price": 4.05,
+            "leg": [{"exec_quantity": 2}, {"exec_quantity": 2}],
+        }}
+        dead = {"order": {
+            "id": 8001, "status": "canceled", "avg_fill_price": 4.05,
+            "leg": [{"exec_quantity": 2}, {"exec_quantity": 2}],
+        }}
+        fake_client.get_order_status.side_effect = [working, dead, dead, dead]
+        fake_client.cancel_order.return_value = {"order": {"status": "ok"}}
+        manager = OrderManager(
+            client=fake_client, order_log=log, settings=_mk_settings("sandbox"),
+            poll_interval_seconds=0.001, poll_timeout_seconds=0.1,
+        )
+
+        result = asyncio.run(manager.submit(sig, snap, scan_date=date(2026, 8, 25)))
+
+        assert result.status == "filled", f"expected filled, got {result.status}: {result.error}"
+        fake_client.cancel_order.assert_awaited()
+
+        row = log.get_submitted_order(8001)
+        assert row["final_status"] == "filled"
+        assert abs(row["fill_price"] - 4.05) < 1e-9
+        import json as _json
+        stored = _json.loads(row["legs_json"])
+        assert [l["quantity"] for l in stored] == [2, 2], stored
+        log.close()
+    print("partial_entry: residual canceled, legs shrunk to 2, booked filled")
+
+
 # ----- production guard -----
 
 def _mk_settings(env: str) -> Settings:
@@ -250,6 +308,7 @@ def main() -> int:
     test_signal_to_request_buy_straddle()
     test_signal_to_request_sell_iron_condor()
     test_quantity_clamped()
+    test_partial_entry_fill_resolved_to_executed_units()
     test_production_guard_blocks_without_confirmation()
     test_premium_cap_blocks()
     print("all order_manager tests passed")
