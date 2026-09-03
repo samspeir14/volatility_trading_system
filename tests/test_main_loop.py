@@ -302,7 +302,8 @@ def test_kill_switch_active_still_runs_exits():
         snapshot=snapshot,
         exit_decisions=[fake_exit_decision],
     )
-    result = asyncio.run(loop.run_once())
+    with mock.patch("main._exits_allowed", return_value=True):
+        result = asyncio.run(loop.run_once())
     assert result.kill_switch_active is True
     # Exit logic MUST still have run
     mocks["exit_manager"].evaluate.assert_called_once()
@@ -310,6 +311,37 @@ def test_kill_switch_active_still_runs_exits():
     # Signal generation skipped
     mocks["sig_gen"].generate.assert_not_called()
     print("kill_switch_active + exits: exits ran, signal gen skipped")
+
+
+def test_close_decisions_held_before_exit_window():
+    """Before 09:45 ET exits are evaluated but not submitted: no order goes
+    out at the open's prices; the next in-window cycle re-evaluates."""
+    fake_position_mark = mock.MagicMock()
+    snapshot = mock.MagicMock()
+    snapshot.equity = 100000.0
+    snapshot.starting_equity_today = 100000.0
+    snapshot.today_total_pnl = 0.0
+    snapshot.today_realized_pnl = 0.0
+    snapshot.today_unrealized_pnl = 0.0
+    snapshot.open_marks = [fake_position_mark]
+    snapshot.open_positions = [mock.MagicMock()]
+    fake_exit_decision = mock.MagicMock(action="close", trigger="assignment_risk")
+    loop, mocks = _mk_loop(snapshot=snapshot, exit_decisions=[fake_exit_decision])
+    with mock.patch("main._exits_allowed", return_value=False):
+        result = asyncio.run(loop.run_once())
+    mocks["exit_manager"].evaluate.assert_called_once()
+    mocks["exit_manager"].execute.assert_not_called()
+    assert result.exits_evaluated == 1
+    print("exit_window: close decision held before 09:45 ET, nothing submitted")
+
+
+def test_exits_allowed_boundary():
+    from zoneinfo import ZoneInfo
+    et = ZoneInfo("America/New_York")
+    assert main_module._exits_allowed(datetime(2026, 9, 3, 9, 44, tzinfo=et)) is False
+    assert main_module._exits_allowed(datetime(2026, 9, 3, 9, 45, tzinfo=et)) is True
+    assert main_module._exits_allowed(datetime(2026, 9, 3, 15, 59, tzinfo=et)) is True
+    print("exit_window: opens at 09:45 ET with no close bound")
 
 
 def test_cycle_refreshes_daily_bars_through_yesterday():
@@ -349,6 +381,8 @@ def main() -> int:
     test_kill_switch_active_skips_signal_generation()
     test_run_once_calls_reconcile_pending_closes_before_snapshot()
     test_kill_switch_active_still_runs_exits()
+    test_close_decisions_held_before_exit_window()
+    test_exits_allowed_boundary()
     test_cycle_refreshes_daily_bars_through_yesterday()
     test_cycle_survives_bar_refresh_failure()
     print("all main_loop tests passed")

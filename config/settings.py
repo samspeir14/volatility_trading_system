@@ -31,6 +31,11 @@ class Settings:
     )
     finnhub_api_key: str | None = None
     earnings_filter_enabled: bool = True
+    # Minutes a pending close may go without a price refresh before it is
+    # canceled. The exit manager reprices a working close in place every
+    # cycle, so this is the fallback; it must exceed a FULL cycle (sleep +
+    # scan + every 30 s order ladder that cycle), not just scan_interval.
+    # A close that keeps being repriced is capped separately at 2x this.
     stale_order_threshold_minutes: int = 15
     max_close_retries: int = 3
     # "standard": the ~$100k calibration the watchlist/risk numbers were tuned

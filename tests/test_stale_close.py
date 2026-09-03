@@ -84,6 +84,7 @@ def _seed_open_order(log: OrderLog, pos: OpenPosition) -> None:
 def _mk_manager_pending_poll(
     log: OrderLog, *, closing_order_id: int = 9000,
     stale_threshold_min: int = 15, max_retries: int = 3,
+    slippage: float = 0.0,
 ) -> tuple[OrderManager, mock.AsyncMock]:
     """OrderManager whose get_order_status keeps returning 'pending' so poll
     never reaches terminal state."""
@@ -99,7 +100,7 @@ def _mk_manager_pending_poll(
     mgr = OrderManager(
         client=fake_client, order_log=log, settings=_mk_settings(),
         poll_interval_seconds=0.001, poll_timeout_seconds=0.05,
-        slippage_buffer=0.0,
+        slippage_buffer=slippage,
         stale_order_threshold_minutes=stale_threshold_min,
         max_close_retries=max_retries,
     )
@@ -404,31 +405,248 @@ def test_stale_close_alert_orphan_row_still_surfaces():
     print("stale_close_alert orphan row surfaces ✓")
 
 
-# ---------- Scenario 5: prevent duplicate submissions while pending ----------
+# ---------- Scenario 5: a pending close is repriced in place, never duplicated ----------
 
-def test_submit_close_skips_when_pending_attempt_exists():
-    """If there's already a pending close for the opening order, submit_close
-    must NOT submit another one."""
+def _seed_pending_close(log: OrderLog, *, opening_id: int, closing_id: int,
+                        price: float, order_type: str = "credit",
+                        priced_at: datetime | None = None) -> None:
+    log.record_close_attempt(
+        opening_order_id=opening_id, closing_order_id=closing_id,
+        submitted_at=priced_at or datetime.now(timezone.utc),
+        exit_trigger="profit_target", order_type=order_type,
+        submitted_price=price, status=PENDING_CLOSE_STATUS,
+    )
+
+
+def test_submit_close_reprices_pending_attempt_instead_of_resubmitting():
+    """A pending close for the opening order is moved to this cycle's mid
+    (top ladder step) via modify — no second order is placed, and the ledger
+    row carries the new price, the current trigger and a fresh last_priced_at."""
     with tempfile.TemporaryDirectory() as tmp:
         log = OrderLog(Path(tmp) / "log.db")
         pos = _mk_long_straddle_position(order_id=6501)
         _seed_open_order(log, pos)
-        mark = _mk_mark(pos, close_cash_flow=200.0)
-
-        log.record_close_attempt(
-            opening_order_id=6501, closing_order_id=9501,
-            submitted_at=datetime.now(timezone.utc),
-            exit_trigger="profit_target", order_type="credit",
-            submitted_price=2.00, status=PENDING_CLOSE_STATUS,
-        )
+        old = datetime.now(timezone.utc) - timedelta(minutes=20)
+        _seed_pending_close(log, opening_id=6501, closing_id=9501,
+                            price=2.00, priced_at=old)
+        # Mark moved: credit close mid is now 2.50 (slippage 0 → ladder top = mid)
+        mark = _mk_mark(pos, close_cash_flow=250.0)
 
         mgr, fake = _mk_manager_pending_poll(log, closing_order_id=9502)
+        fake.modify_order.return_value = {"order": {"id": 9501, "status": "ok"}}
+        result = asyncio.run(mgr.submit_close(pos, mark, "stop_loss"))
+
+        assert result.status == "pending_close_repriced", result
+        assert result.order_id == 9501
+        fake.place_order.assert_not_called()
+        fake.modify_order.assert_called_once()
+        assert fake.modify_order.call_args.kwargs["order_id"] == 9501
+        assert fake.modify_order.call_args.kwargs["price"] == 2.50
+        row = log.pending_close_attempt(6501)
+        assert row["submitted_price"] == 2.50
+        assert row["exit_trigger"] == "stop_loss"
+        assert datetime.fromisoformat(row["last_priced_at"]) > old
+        log.close()
+    print("submit_close: pending close repriced in place ✓")
+
+
+def test_reprice_uses_top_ladder_step():
+    """With a real slippage buffer the reprice lands at the far end of the
+    ladder (mid * (1 - 1.5 * buffer) for a credit), not at mid."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "log.db")
+        pos = _mk_long_straddle_position(order_id=6505)
+        _seed_open_order(log, pos)
+        _seed_pending_close(log, opening_id=6505, closing_id=9508, price=2.00)
+        mark = _mk_mark(pos, close_cash_flow=300.0)  # mid 3.00
+
+        mgr, fake = _mk_manager_pending_poll(log, closing_order_id=9509, slippage=0.02)
+        fake.modify_order.return_value = {"order": {"id": 9508, "status": "ok"}}
+        result = asyncio.run(mgr.submit_close(pos, mark, "profit_target"))
+
+        assert result.status == "pending_close_repriced"
+        assert fake.modify_order.call_args.kwargs["price"] == round(3.00 * 0.97, 2)
+        log.close()
+    print("submit_close: reprice uses the top ladder step ✓")
+
+
+def test_reprice_failure_holds_old_price_for_reconciler():
+    """If Tradier rejects the modify (e.g. sandbox PendingNew), the order keeps
+    its old limit and its stale clock — the reconciler will cancel it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "log.db")
+        pos = _mk_long_straddle_position(order_id=6502)
+        _seed_open_order(log, pos)
+        old = datetime.now(timezone.utc) - timedelta(minutes=20)
+        _seed_pending_close(log, opening_id=6502, closing_id=9503,
+                            price=2.00, priced_at=old)
+        mark = _mk_mark(pos, close_cash_flow=250.0)
+
+        mgr, fake = _mk_manager_pending_poll(log, closing_order_id=9504)
+        fake.modify_order.return_value = {
+            "errors": {"error": "Order not in valid state for modifications: PendingNew"},
+        }
         result = asyncio.run(mgr.submit_close(pos, mark, "profit_target"))
 
         assert result.status == "pending_close_exists"
         fake.place_order.assert_not_called()
+        row = log.pending_close_attempt(6502)
+        assert row["submitted_price"] == 2.00
+        assert datetime.fromisoformat(row["last_priced_at"]) == old
         log.close()
-    print("submit_close: skips when prior attempt still pending ✓")
+    print("submit_close: failed reprice holds old price ✓")
+
+
+def test_reprice_modify_exception_holds_old_price():
+    """A modify that raises (network error) is treated like a rejection."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "log.db")
+        pos = _mk_long_straddle_position(order_id=6506)
+        _seed_open_order(log, pos)
+        old = datetime.now(timezone.utc) - timedelta(minutes=20)
+        _seed_pending_close(log, opening_id=6506, closing_id=9510,
+                            price=2.00, priced_at=old)
+        mark = _mk_mark(pos, close_cash_flow=250.0)
+
+        mgr, fake = _mk_manager_pending_poll(log, closing_order_id=9511)
+        fake.modify_order.side_effect = RuntimeError("connection reset")
+        result = asyncio.run(mgr.submit_close(pos, mark, "profit_target"))
+
+        assert result.status == "pending_close_exists"
+        fake.place_order.assert_not_called()
+        row = log.pending_close_attempt(6506)
+        assert row["submitted_price"] == 2.00
+        assert datetime.fromisoformat(row["last_priced_at"]) == old
+        log.close()
+    print("submit_close: modify exception holds old price ✓")
+
+
+def test_reprice_holds_when_order_type_flips():
+    """A modify cannot turn a debit into a credit; leave it for the reconciler."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "log.db")
+        pos = _mk_long_straddle_position(order_id=6507)
+        _seed_open_order(log, pos)
+        _seed_pending_close(log, opening_id=6507, closing_id=9512,
+                            price=0.50, order_type="debit")
+        mark = _mk_mark(pos, close_cash_flow=250.0)  # now a credit
+
+        mgr, fake = _mk_manager_pending_poll(log, closing_order_id=9513)
+        result = asyncio.run(mgr.submit_close(pos, mark, "profit_target"))
+
+        assert result.status == "pending_close_exists"
+        fake.modify_order.assert_not_called()
+        fake.place_order.assert_not_called()
+        log.close()
+    print("submit_close: order-type flip is held, not modified ✓")
+
+
+def test_reprice_unchanged_price_skips_modify_and_leaves_clock():
+    """Same target as the working limit: no modify call, and the stale clock
+    is NOT refreshed — only a broker-accepted modify proves the order is live."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "log.db")
+        pos = _mk_long_straddle_position(order_id=6503)
+        _seed_open_order(log, pos)
+        old = datetime.now(timezone.utc) - timedelta(minutes=20)
+        _seed_pending_close(log, opening_id=6503, closing_id=9505,
+                            price=2.00, priced_at=old)
+        mark = _mk_mark(pos, close_cash_flow=200.0)
+
+        mgr, fake = _mk_manager_pending_poll(log, closing_order_id=9506)
+        result = asyncio.run(mgr.submit_close(pos, mark, "profit_target"))
+
+        assert result.status == "pending_close_exists"
+        fake.modify_order.assert_not_called()
+        fake.place_order.assert_not_called()
+        row = log.pending_close_attempt(6503)
+        assert row["submitted_price"] == 2.00
+        assert datetime.fromisoformat(row["last_priced_at"]) == old
+        log.close()
+    print("submit_close: unchanged price leaves the stale clock alone ✓")
+
+
+def test_reconcile_ages_pending_close_from_last_reprice():
+    """The stale threshold counts from the last price refresh, not from the
+    original submission."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "log.db")
+        pos = _mk_long_straddle_position(order_id=6504)
+        _seed_open_order(log, pos)
+        mark = _mk_mark(pos, close_cash_flow=200.0)
+
+        mgr, fake = _mk_manager_pending_poll(
+            log, closing_order_id=9507, stale_threshold_min=10,
+        )
+        asyncio.run(mgr.submit_close(pos, mark, "profit_target"))
+        t0 = datetime.now(timezone.utc)
+
+        # Repriced 8 min in; at 12 min the price is only 4 min old → keep.
+        log.record_close_reprice(9507, 2.10, "profit_target", t0 + timedelta(minutes=8))
+        result = asyncio.run(mgr.reconcile_pending_closes(t0 + timedelta(minutes=12)))
+        assert result["canceled"] == 0
+        fake.cancel_order.assert_not_called()
+
+        # At 19 min the price is 11 min old → stale → canceled.
+        result = asyncio.run(mgr.reconcile_pending_closes(t0 + timedelta(minutes=19)))
+        assert result["canceled"] == 1
+        fake.cancel_order.assert_called_once()
+        assert log.has_pending_close(6504) is False
+        log.close()
+    print("reconcile_pending_closes: stale age counted from last reprice ✓")
+
+
+def test_reconcile_caps_total_pending_lifetime():
+    """A close that keeps getting repriced still goes terminal at 2x the
+    threshold after submission, so it burns retry budget and can escalate."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "log.db")
+        pos = _mk_long_straddle_position(order_id=6508)
+        _seed_open_order(log, pos)
+        mark = _mk_mark(pos, close_cash_flow=200.0)
+
+        mgr, fake = _mk_manager_pending_poll(
+            log, closing_order_id=9514, stale_threshold_min=10,
+        )
+        asyncio.run(mgr.submit_close(pos, mark, "profit_target"))
+        t0 = datetime.now(timezone.utc)
+
+        log.record_close_reprice(9514, 2.10, "profit_target", t0 + timedelta(minutes=8))
+        assert asyncio.run(mgr.reconcile_pending_closes(t0 + timedelta(minutes=12)))["canceled"] == 0
+        log.record_close_reprice(9514, 2.20, "profit_target", t0 + timedelta(minutes=16))
+        assert asyncio.run(mgr.reconcile_pending_closes(t0 + timedelta(minutes=19)))["canceled"] == 0
+        fake.cancel_order.assert_not_called()
+
+        # Price is only 5 min old, but the order has worked 21 min > 2x10 → canceled.
+        result = asyncio.run(mgr.reconcile_pending_closes(t0 + timedelta(minutes=21)))
+        assert result["canceled"] == 1
+        assert log.has_pending_close(6508) is False
+        assert log.failed_close_attempt_count(6508) == 1
+        log.close()
+    print("reconcile_pending_closes: lifetime cap cancels a forever-repriced close ✓")
+
+
+def test_reconcile_pre_migration_row_ages_from_submitted_at():
+    """A close_attempts row from before last_priced_at existed (NULL) is aged
+    from submitted_at."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "log.db")
+        pos = _mk_long_straddle_position(order_id=6509)
+        _seed_open_order(log, pos)
+        t0 = datetime.now(timezone.utc)
+        _seed_pending_close(log, opening_id=6509, closing_id=9515,
+                            price=2.00, priced_at=t0 - timedelta(minutes=20))
+        log._conn.execute("UPDATE close_attempts SET last_priced_at = NULL")
+        log._conn.commit()
+
+        mgr, fake = _mk_manager_pending_poll(
+            log, closing_order_id=9515, stale_threshold_min=15,
+        )
+        result = asyncio.run(mgr.reconcile_pending_closes(t0))
+        assert result["canceled"] == 1
+        assert log.has_pending_close(6509) is False
+        log.close()
+    print("reconcile_pending_closes: NULL last_priced_at falls back to submitted_at ✓")
 
 
 # ---------- Scenario 6: cancel race → re-query reveals fill ----------
@@ -502,7 +720,15 @@ def main() -> int:
     test_max_retries_alert_idempotent()
     test_stale_close_alert_auto_resolves_when_position_closes()
     test_stale_close_alert_orphan_row_still_surfaces()
-    test_submit_close_skips_when_pending_attempt_exists()
+    test_submit_close_reprices_pending_attempt_instead_of_resubmitting()
+    test_reprice_uses_top_ladder_step()
+    test_reprice_failure_holds_old_price_for_reconciler()
+    test_reprice_modify_exception_holds_old_price()
+    test_reprice_holds_when_order_type_flips()
+    test_reprice_unchanged_price_skips_modify_and_leaves_clock()
+    test_reconcile_ages_pending_close_from_last_reprice()
+    test_reconcile_caps_total_pending_lifetime()
+    test_reconcile_pre_migration_row_ages_from_submitted_at()
     test_reconcile_cancel_race_reveals_fill()
     test_reconcile_leaves_pending_on_cancel_network_error()
     print("all stale-close tests passed")

@@ -95,6 +95,21 @@ def _within_entry_window(now_utc: datetime) -> bool:
     return ENTRY_WINDOW_ET[0] <= et <= ENTRY_WINDOW_ET[1]
 
 
+# No exit order before this time. The first minutes after the open have the
+# widest spreads and least reliable prints, and a close submitted at 09:31
+# rests at that price until the next cycle can reprice it. (The Tradier
+# sandbox does not even acknowledge orders placed then.) Same open as the
+# entry window; no close bound — expiry-day and earnings exits run to the bell.
+# Deliberately applies to EVERY trigger, assignment_risk on expiration day
+# included: assignment happens after the close, so 15 minutes of delay buys
+# a real price at no extra assignment risk.
+EXIT_OPEN_ET = ENTRY_WINDOW_ET[0]
+
+
+def _exits_allowed(now_utc: datetime) -> bool:
+    return now_utc.astimezone(_EASTERN).time() >= EXIT_OPEN_ET
+
+
 @dataclass(frozen=True)
 class RiskCalibration:
     """The equity-relative risk knobs plus the few absolute-dollar backstops,
@@ -500,12 +515,20 @@ class MainLoop:
                 snapshot.open_marks, scan, feature_rows,
                 market_close_utc=market_close_utc,
             )
-            exit_results = await self._exit_manager.execute(
-                exit_decisions, dry_run=False,
-            )
-            for decision, result in exit_results:
-                if result is not None and result.status == "filled":
-                    exits_closed += 1
+            if _exits_allowed(now):
+                exit_results = await self._exit_manager.execute(
+                    exit_decisions, dry_run=False,
+                )
+                for decision, result in exit_results:
+                    if result is not None and result.status == "filled":
+                        exits_closed += 1
+            else:
+                held = sum(1 for d in exit_decisions if d.action == "close")
+                if held:
+                    logger.info(
+                        "before exit window open %s ET — holding %d close(s) "
+                        "until the next cycle", EXIT_OPEN_ET, held,
+                    )
 
         # 6. New entries only when no guard tripped
         signals_total = signals_actionable = signals_approved = 0
