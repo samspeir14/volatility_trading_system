@@ -4,6 +4,7 @@ every dollar conversion that treated entry_premium / fill_price as
 whole-position values must scale by the lot count. These tests pin the
 per-lot → whole-position math in the tracker, exit thresholds, reconciler
 settlement, close realized P&L, and the order-request premium cap."""
+import math
 import sys
 from datetime import date, datetime, timezone
 from unittest import mock
@@ -105,11 +106,11 @@ def test_mark_to_market_scales_entry_cash_by_lots():
 
 def test_exit_thresholds_scale_with_lots():
     em = ExitManager(position_tracker=mock.Mock(), order_manager=mock.Mock())
-    s = _straddle(3)   # pt +100%, sl −50% of 3 × $400
-    assert abs(em._profit_target_threshold(s) - 1200.0) < 1e-9
+    s = _straddle(3)   # no pt (winners run), sl −50% of 3 × $400
+    assert em._profit_target_threshold(s) == math.inf
     assert abs(em._stop_loss_threshold(s) - (-600.0)) < 1e-9
-    c = _condor(5)     # pt +50%, sl −100% of 5 × $360
-    assert abs(em._profit_target_threshold(c) - 900.0) < 1e-9
+    c = _condor(5)     # pt +75%, sl −100% of 5 × $360
+    assert abs(em._profit_target_threshold(c) - 1350.0) < 1e-9
     assert abs(em._stop_loss_threshold(c) - (-1800.0)) < 1e-9
     print("exit thresholds ✓")
 

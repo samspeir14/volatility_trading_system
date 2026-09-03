@@ -34,10 +34,14 @@ real-money profile), running autonomously on EC2 under systemd.
    wings priced off the model's own forecast). Orders walk a price ladder
    from mid; every fill logs slippage (`grep TCA`).
 5. **Manage.** Exits run every cycle regardless of entry guards: thesis
-   reversal, profit target / stop, fail-closed earnings exit, assignment-risk
-   close-outs, and expiry handling built for deliberately short-dated entries
-   (a 1-2 DTE position rides to expiration day and closes in the final 2
-   hours before the bell).
+   reversal, stops (−50% straddle / −100% condor), a 75% profit target on
+   condors only (straddle winners run), fail-closed earnings exit,
+   assignment-risk close-outs (parity check before expiry day; near-money
+   close at 1 trading day left for condors that aged into the window), and
+   expiry handling: every straddle and every deliberately short-dated
+   condor rides to expiration day and closes in the final 2 hours before
+   the bell. DTE windows count trading days, so a Friday entry for a
+   Monday expiry is a 1-day trade.
 
 Risk sits outside the strategy: per-trade / per-ticker / sector / portfolio
 caps, Greek limits, buying-power buffer, a daily-loss kill switch, weekly and

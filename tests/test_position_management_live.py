@@ -79,12 +79,11 @@ async def main_async() -> int:
             exit_manager = ExitManager(
                 position_tracker=tracker, order_manager=order_manager,
                 h1_predictor=h1_predictor,
-                # explicit defaults from the plan:
-                straddle_profit_target_pct=1.00,
+                # explicit defaults (2026-09 exit review):
+                straddle_profit_target_pct=None,
                 straddle_stop_loss_pct=-0.50,
-                iron_condor_profit_target_pct=0.50,
+                iron_condor_profit_target_pct=0.75,
                 iron_condor_stop_loss_pct=-1.00,
-                expiration_proximity_dte=2,
                 thesis_reversal_min_magnitude=0.05,
             )
 
