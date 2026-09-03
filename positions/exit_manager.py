@@ -15,6 +15,7 @@ from model.h1_predictor import H1DeviationPredictor
 from model.term_structure import project_term_vol
 from positions.position_tracker import OpenPosition, PositionMark, PositionTracker
 from signals.signal_generator import DEFAULT_PHI, find_atm_iv
+from data.trading_calendar import is_trading_day
 
 logger = logging.getLogger(__name__)
 
@@ -37,17 +38,49 @@ EXIT_TRIGGER_PRIORITY = (
 CALENDAR_STALE_DAYS = 3
 
 
+def _trading_dte(from_day: date, expiration: date) -> int:
+    """Signed count of sessions (weekdays minus US market holidays) in
+    (from_day, expiration]: trading days still to run before the option
+    expires. 0 on expiry day, non-positive after. Holidays must be real
+    here: a miscounted holiday makes _entry_dte call a fresh entry "aged"
+    (closes early — safe) but makes _remaining_trading_dte think a session
+    is left that isn't (closes late — unsafe)."""
+    if expiration >= from_day:
+        lo, hi, sign = from_day, expiration, 1
+    else:
+        lo, hi, sign = expiration, from_day, -1
+    n = 0
+    d = lo + timedelta(days=1)
+    while d <= hi:
+        if is_trading_day(d):
+            n += 1
+        d += timedelta(days=1)
+    return sign * n
+
+
 def _entry_dte(pos: OpenPosition) -> int:
-    """Calendar days from entry to expiration. Distinguishes a position that
+    """TRADING days from entry to expiration. Distinguishes a position that
     AGED into the near-expiry window (close it) from one deliberately opened
-    there by the h=1 short-dated entries (let it ride into expiry day)."""
-    return (pos.expiration - pos.submitted_at.date()).days
+    there by the h=1 short-dated entries (let it ride into expiry day).
+    Trading days, not calendar: a Friday entry for Monday expiry is a 1-day
+    trade, not a 3-day one — counted in calendar days it missed the
+    short-dated window and was closed at Monday's open (TSLA 2026-08-31)."""
+    return _trading_dte(pos.submitted_at.date(), pos.expiration)
 
 
-# A deliberately short-dated entry (entry_dte at/below the close windows) is
-# closed this long before the market closes on its expiration day — late
-# enough to capture nearly the whole overnight+day move it was bought/sold
-# for, early enough that the close isn't racing the bell.
+def _remaining_trading_dte(mark: PositionMark) -> int:
+    """Trading days left, derived from the mark's calendar dte so the two can
+    never disagree about 'today'. The calendar dte stays on the mark: the
+    term-vol projection wants calendar days."""
+    exp = mark.position.expiration
+    return _trading_dte(exp - timedelta(days=mark.dte), exp)
+
+
+# Every straddle, and every deliberately short-dated condor (entry_dte at or
+# below the close window), is closed this long before the market closes on
+# its expiration day — late enough to capture nearly the whole overnight+day
+# move it was bought/sold for, early enough that the close isn't racing the
+# bell or auto-exercise.
 EXPIRY_CLOSE_BUFFER = timedelta(hours=2)
 
 
@@ -66,15 +99,16 @@ def _in_expiry_close_window(
 
 
 def _trading_days_between(a: date, b: date) -> int:
-    """Weekdays strictly between a and b (a < d < b). Holidays are counted as
-    trading days — the approximation only ever closes a position one weekday
-    EARLIER than strictly needed, which is the safe direction."""
+    """Sessions (weekdays minus US market holidays) strictly between a and b
+    (a < d < b). Used by the earnings exit: an over-count here would hold a
+    short-vol position one session closer to the report than intended, so
+    holidays are taken from the explicit table rather than approximated."""
     if b <= a:
         return 0
     n = 0
     d = a + timedelta(days=1)
     while d < b:
-        if d.weekday() < 5:
+        if is_trading_day(d):
             n += 1
         d += timedelta(days=1)
     return n
@@ -96,11 +130,10 @@ class ExitManager:
         position_tracker: PositionTracker,
         order_manager: OrderManager,
         h1_predictor: H1DeviationPredictor | None = None,
-        straddle_profit_target_pct: float = 1.00,
+        straddle_profit_target_pct: float | None = None,
         straddle_stop_loss_pct: float = -0.50,
-        iron_condor_profit_target_pct: float = 0.50,
+        iron_condor_profit_target_pct: float | None = 0.75,
         iron_condor_stop_loss_pct: float = -1.00,
-        expiration_proximity_dte: int = 2,
         thesis_reversal_min_magnitude: float = 0.05,
         thesis_exit_enabled: bool = True,
         short_close_dte: int = 1,
@@ -120,7 +153,6 @@ class ExitManager:
         self._straddle_sl = straddle_stop_loss_pct
         self._ic_pt = iron_condor_profit_target_pct
         self._ic_sl = iron_condor_stop_loss_pct
-        self._exp_dte = expiration_proximity_dte
         self._thesis_min = thesis_reversal_min_magnitude
         self._thesis_enabled = thesis_exit_enabled
         # Earnings exit (fail-CLOSED): no short-vol position may hold through
@@ -142,19 +174,20 @@ class ExitManager:
         # stock outside every risk gate. Three rules, all labeled
         # "assignment_risk":
         #   (a) never carry short legs into expiration day (dte <= 0);
-        #   (b) at dte <= short_close_dte, close if any short leg is in or
+        #   (b) at dte <= short_close_dte (trading days), close if any short leg is in or
         #       within short_strike_buffer_pct of the money (fails SAFE when
         #       the underlying quote is missing);
-        #   (c) at ANY dte, close when a short leg trades at parity —
+        #   (c) at any dte BEFORE expiry day, close when a short leg trades at parity —
         #       extrinsic <= short_extrinsic_floor makes early exercise
         #       rational for the counterparty (dividend capture on calls,
         #       cost-of-carry on puts).
         # Note the ATM-body condor's shorts sit at the entry ATM strike, so
         # near expiry one of them is almost always in the money: in practice
-        # (b) closes such positions at dte = short_close_dte, one day
-        # earlier than the ride-to-expiry backtest assumed. That is the
-        # intended trade: the last day of theta is not worth carrying
-        # assignment risk the bot cannot manage after its final cycle.
+        # (b) closes an AGED condor short_close_dte sessions out (the Friday
+        # before a Monday expiry), one session earlier than the
+        # ride-to-expiry backtest assumed. That is the intended trade: the
+        # last session of theta is not worth carrying a near-money short
+        # across a weekend or holiday gap the bot cannot manage.
         self._short_close_dte = short_close_dte
         self._short_buffer = short_strike_buffer_pct
         self._extrinsic_floor = short_extrinsic_floor
@@ -292,23 +325,21 @@ class ExitManager:
         if assignment_rationale is not None:
             return "assignment_risk", assignment_rationale
 
-        # 5. Expiration proximity (long straddles: wings don't apply, but the
-        # position bleeds its remaining premium into expiry). Short structures
-        # are covered by the assignment-risk close-out above. Scoped by ENTRY
-        # dte: a position deliberately opened at dte <= exp_dte (the h=1
-        # short-dated entries) must not be closed the moment it opens — it
-        # rides through expiry day and closes in the final EXPIRY_CLOSE_BUFFER
-        # before the bell, before auto-exercise can leave a stock position.
+        # 5. Expiration proximity (long straddles; short structures are
+        # covered by the assignment-risk close-out above). Every straddle,
+        # whatever its entry dte, rides through expiry day and closes in the
+        # final EXPIRY_CLOSE_BUFFER before the bell — late enough to keep the
+        # move it was bought for, early enough that auto-exercise of an ITM
+        # leg can't leave a stock position overnight. The former "aged
+        # position closes at dte <= 2" branch was removed 2026-09: over 14
+        # such closes it realized -$6.4k against -$1.1k had they run to expiry.
         if pos.structure != "iron_condor":
-            if _entry_dte(pos) <= self._exp_dte:
-                if mark.dte <= 0 and _in_expiry_close_window(
-                        now_utc, market_close_utc):
-                    return "expiration_proximity", (
-                        f"final {EXPIRY_CLOSE_BUFFER} before expiration "
-                        f"(short-dated entry, entry_dte={_entry_dte(pos)})"
-                    )
-            elif mark.dte <= self._exp_dte:
-                return "expiration_proximity", f"dte={mark.dte} <= {self._exp_dte}"
+            if mark.dte <= 0 and _in_expiry_close_window(
+                    now_utc, market_close_utc):
+                return "expiration_proximity", (
+                    f"final {EXPIRY_CLOSE_BUFFER} before expiration "
+                    f"(entry_dte={_entry_dte(pos)})"
+                )
 
         # 6. Profit target
         pt_threshold = self._profit_target_threshold(pos)
@@ -323,8 +354,8 @@ class ExitManager:
     def _earnings_risk(self, mark: PositionMark, today: date) -> str | None:
         """No short-vol position holds through earnings: close when fewer than
         `earnings_exit_buffer_trading_days` trading days remain strictly
-        between today and the report date (weekday arithmetic; a holiday only
-        makes us close a day early — the safe direction).
+        between today and the report date (sessions: weekdays minus the US
+        market holiday table).
 
         Fail-CLOSED source chain: a healthy calendar (refreshed within
         CALENDAR_STALE_DAYS) is authoritative and refreshes the per-position
@@ -428,9 +459,9 @@ class ExitManager:
         # (a) Expiry-day backstop. Whatever premium is left is pennies against
         # a pin that resolves AFTER the bot's last cycle of the day. A
         # deliberately short-dated entry holds until the final
-        # EXPIRY_CLOSE_BUFFER before the bell (rule (c)'s parity check keeps
-        # guarding it in the meantime); anything else that somehow reaches
-        # expiry day still closes on the first cycle.
+        # EXPIRY_CLOSE_BUFFER before the bell — deliberately unguarded in
+        # between, see (c); anything else that somehow reaches expiry day
+        # still closes on the first cycle.
         if mark.dte <= 0 and (
                 _entry_dte(pos) > self._short_close_dte
                 or _in_expiry_close_window(now_utc, market_close_utc)):
@@ -439,9 +470,16 @@ class ExitManager:
                 "(pin risk resolves after the last cycle)"
             )
 
-        # (c) Parity check runs at any DTE — early assignment doesn't wait for
-        # expiry week. Needs current quotes; skipped when legs didn't mark.
-        if have_underlying and len(mark.current_legs) == len(pos.legs):
+        # (c) Parity check runs at any DTE before expiry day — early
+        # assignment doesn't wait for expiry week. Needs current quotes;
+        # skipped when legs didn't mark. NOT on expiry day: a 0DTE ITM short
+        # trades at parity all session, so here this rule closed short-dated
+        # condors at the open (2026-08-28: six closes at 9:36 ET for +$178
+        # that settled near +$3.2k). Exercise on expiry day gains the
+        # counterparty nothing that assignment at the bell wouldn't, and
+        # rule (a)'s final-2h close already covers that.
+        if (mark.dte > 0 and have_underlying
+                and len(mark.current_legs) == len(pos.legs)):
             for opened, current in zip(pos.legs, mark.current_legs):
                 if opened.side != "sell":
                     continue
@@ -473,13 +511,20 @@ class ExitManager:
         # the near-money buffer by construction — so this rule would close it
         # at entry. Such positions rely on (a)'s expiry-morning close and
         # (c)'s parity check instead.
-        if (mark.dte <= self._short_close_dte
+        remaining = _remaining_trading_dte(mark)
+        if (remaining <= self._short_close_dte
                 and _entry_dte(mark.position) > self._short_close_dte):
             if not have_underlying:
-                return (
-                    f"dte={mark.dte} <= {self._short_close_dte} and underlying "
-                    "quote unavailable — failing safe"
-                )
+                # Blind close only on the last calendar day. A transient bad
+                # quote on the Friday before a Monday expiry must not dump a
+                # position that rule (a) closes at Monday's open anyway.
+                if mark.dte <= self._short_close_dte:
+                    return (
+                        f"{remaining} trading day(s) to expiration <= "
+                        f"{self._short_close_dte} and underlying "
+                        "quote unavailable — failing safe"
+                    )
+                return None
             for leg in short_legs:
                 near = (
                     underlying >= leg.strike * (1 - self._short_buffer)
@@ -490,17 +535,22 @@ class ExitManager:
                     return (
                         f"short {leg.option_type} K={leg.strike} in/near the money "
                         f"(underlying {underlying:.2f}, buffer "
-                        f"{self._short_buffer:.1%}) at dte={mark.dte}"
+                        f"{self._short_buffer:.1%}) with {remaining} trading day(s) left"
                     )
 
         return None
 
     def _profit_target_threshold(self, pos: OpenPosition) -> float:
         # Thresholds compare against mark.pnl_dollars (whole-position dollars),
-        # so scale the per-lot entry premium by the lot count.
-        if pos.is_long:
-            return self._straddle_pt * pos.entry_premium * 100 * pos.lots
-        return self._ic_pt * pos.entry_premium * 100 * pos.lots
+        # so scale the per-lot entry premium by the lot count. A None target
+        # disables the rule (math.inf never trips). Straddles have none: long
+        # gamma's upside is the trade, so a winner runs to the final-2h expiry
+        # close (or a stop / thesis exit). Condors keep one — capped upside,
+        # and the last quarter of the credit is the worst-paid gamma risk.
+        pct = self._straddle_pt if pos.is_long else self._ic_pt
+        if pct is None:
+            return math.inf
+        return pct * pos.entry_premium * 100 * pos.lots
 
     def _stop_loss_threshold(self, pos: OpenPosition) -> float:
         if pos.is_long:

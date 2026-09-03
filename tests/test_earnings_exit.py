@@ -78,7 +78,9 @@ def test_trading_days_between():
     assert _trading_days_between(mon, wed) == 1        # Tuesday
     assert _trading_days_between(mon, mon) == 0
     assert _trading_days_between(mon, date(2026, 8, 17)) == 4  # Tue-Fri
-    print("trading_days: weekend-aware arithmetic verified")
+    # Thanksgiving Thu 11/26 is not a session: Wed → Mon has only Friday between.
+    assert _trading_days_between(date(2026, 11, 25), date(2026, 11, 30)) == 1
+    print("trading_days: weekend- and holiday-aware arithmetic verified")
 
 
 def test_short_vol_closes_before_earnings():

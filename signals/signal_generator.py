@@ -35,15 +35,14 @@ CALENDAR_DAYS_PER_YEAR = 365
 # positions.
 #
 # Floor = 1: the h=1 model's purest expression is the shortest-dated option —
-# a 1-DTE entry is one overnight of vol exposure, closed on expiry morning.
-# The old floor of 7 dated from the 2026-06 straddle-churn bug, where the
-# expiration_proximity exit (dte <= 2) force-closed fresh near-expiry entries
-# within a session. The exit manager now scopes that exit (and the
-# assignment-risk near-money close) by ENTRY dte, so a deliberately
-# short-dated entry rides to its expiry-morning close instead of
-# round-tripping into bid/ask + theta. Floor of 0 stays forbidden: the
-# expiry-day assignment backstop (dte <= 0) would close a same-day entry on
-# the spot.
+# a 1-DTE entry is one overnight of vol exposure, closed in the final 2h of
+# expiry day. The old floor of 7 dated from the 2026-06 straddle-churn bug,
+# where the then "expiration_proximity at dte <= 2" exit force-closed fresh
+# near-expiry entries within a session. That branch is gone (2026-09): every
+# straddle rides to the final-2h close, and the assignment-risk near-money
+# close is scoped by ENTRY dte (sessions, not calendar days), so a
+# deliberately short-dated condor rides too. Floor of 0 stays forbidden: a
+# same-day entry has no overnight move to capture, only a session of theta.
 #
 # Cap = 14: the 1-day forecast decays toward the stock's 63-day mean vol at
 # the GARCH persistence rate, so by ~1 month the projection is mostly "IV vs

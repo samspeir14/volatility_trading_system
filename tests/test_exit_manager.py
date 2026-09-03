@@ -12,7 +12,7 @@ TODAY = date(2026, 5, 12)
 from unittest import mock
 
 from data.async_client import OptionContract
-from positions.exit_manager import EXIT_TRIGGER_PRIORITY, ExitManager
+from positions.exit_manager import EXIT_TRIGGER_PRIORITY, ExitManager, _entry_dte, _trading_dte
 from positions.position_tracker import OpenPosition, PositionMark
 from signals.signal_generator import TradeLeg
 
@@ -81,26 +81,28 @@ def _exit_mgr() -> ExitManager:
 
 # ---------- profit target ----------
 
-def test_iron_condor_profit_target_at_50pct():
+def test_iron_condor_profit_target_at_75pct():
     pos = _mk_iron_condor_position(entry_credit=13.55)
-    # 50% target = 0.50 × 13.55 × 100 = $677.50
-    mark = _mark(pos, pnl_dollars=678.0)
+    # 75% target = 0.75 × 13.55 × 100 = $1016.25
+    mark = _mark(pos, pnl_dollars=1017.0)
     trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=-0.08)  # thesis intact
     assert trigger == "profit_target"
     # Just below threshold: hold
-    mark = _mark(pos, pnl_dollars=677.0)
+    mark = _mark(pos, pnl_dollars=1016.0)
     trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=-0.08)
     assert trigger is None
-    print("iron_condor profit_target: $677.50 cutoff verified")
+    print("iron_condor profit_target: $1016.25 cutoff verified")
 
 
-def test_long_straddle_profit_target_at_100pct():
+def test_long_straddle_has_no_profit_target():
+    """Long gamma's upside is the trade: no profit target on straddles, a
+    winner runs to the final-2h expiry close (or a stop / thesis exit)."""
     pos = _mk_long_straddle_position(entry_debit=4.08)
-    # 100% target = 1.0 × 4.08 × 100 = $408
-    mark = _mark(pos, pnl_dollars=409.0)
-    trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=0.15)  # thesis intact
-    assert trigger == "profit_target"
-    print("long_straddle profit_target: $408 cutoff verified")
+    for pnl in (409.0, 4080.0):  # +100%, +1000% of premium
+        mark = _mark(pos, pnl_dollars=pnl)
+        trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=0.15)
+        assert trigger is None, f"straddle closed on profit at +${pnl:.0f}: {trigger}"
+    print("long_straddle: no profit target, winner runs ✓")
 
 
 # ---------- stop loss ----------
@@ -125,24 +127,32 @@ def test_long_straddle_stop_loss_at_neg_50pct():
 
 # ---------- expiration proximity ----------
 
-def test_expiration_proximity_long_straddle_dte_2():
-    """Long straddles trigger expiration_proximity at dte<=2 (default).
-    The proximity exit applies to long straddles only — IC wings cap risk."""
-    pos = _mk_long_straddle_position()
-    mark = _mark(pos, pnl_dollars=0.0, dte=2)
-    trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=0.15)
-    assert trigger == "expiration_proximity"
-    # DTE=3 doesn't trigger
-    mark = _mark(pos, pnl_dollars=0.0, dte=3)
-    trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=0.15)
-    assert trigger is None
-    print("expiration_proximity (long_straddle): dte<=2 fires, dte=3 holds")
+def test_straddle_rides_to_expiry_day_regardless_of_entry_dte():
+    """No aged 'dte <= 2' close for straddles any more: whatever the entry
+    dte, a straddle holds until the final 2h of expiry day. Over 14 aged
+    closes the old branch realized -$6.4k against -$1.1k at expiry."""
+    pos = _mk_long_straddle_position()  # entered 4/27 for 5/15: aged
+    for dte in (3, 2, 1):
+        trigger, _ = _exit_mgr()._evaluate_one(
+            _mark(pos, pnl_dollars=0.0, dte=dte), today=TODAY, current_divergence=0.15)
+        assert trigger is None, f"aged straddle closed at dte={dte}: {trigger}"
+    close_utc = datetime(2026, 5, 15, 20, 0, tzinfo=timezone.utc)  # 16:00 ET
+    mark0 = _mark(pos, pnl_dollars=0.0, dte=0)
+    trigger, _ = _exit_mgr()._evaluate_one(
+        mark0, today=date(2026, 5, 15), current_divergence=0.15,
+        market_close_utc=close_utc, now_utc=close_utc - timedelta(hours=3))
+    assert trigger is None, f"aged straddle closed at the expiry-day open: {trigger}"
+    trigger, rationale = _exit_mgr()._evaluate_one(
+        mark0, today=date(2026, 5, 15), current_divergence=0.15,
+        market_close_utc=close_utc, now_utc=close_utc - timedelta(hours=1, minutes=55))
+    assert trigger == "expiration_proximity" and "before expiration" in rationale
+    print("straddle: rides to expiry day, closes in final 2h whatever the entry dte ✓")
 
 
 def test_expiration_proximity_skipped_for_iron_condor():
     """Iron condors do NOT trigger expiration_proximity — their end-of-life
-    handling is the assignment_risk close-out, which starts at dte <= 1
-    (short_close_dte), not at the straddle's dte <= 2."""
+    handling is the assignment_risk close-out (near-money close at dte <= 1
+    for aged condors, final-2h backstop on expiry day)."""
     pos = _mk_iron_condor_position()
     # dte=2 (would fire expiration_proximity for a straddle): holds — outside
     # the assignment close window, quotes present, shorts not at parity.
@@ -295,7 +305,7 @@ def test_short_dated_straddle_entry_rides_to_expiry_morning():
         market_close_utc=close_utc,
         now_utc=close_utc - timedelta(hours=1, minutes=55))
     assert trigger == "expiration_proximity", f"expected final-2h close, got {trigger}"
-    assert "short-dated entry" in rationale
+    assert "before expiration" in rationale
     # Unknown close time fails SAFE → closes on the first expiry-day cycle.
     trigger, _ = _exit_mgr()._evaluate_one(
         mark0, today=TODAY + timedelta(days=1), current_divergence=0.15)
@@ -316,8 +326,9 @@ def test_short_dated_condor_entry_skips_near_money_close():
     trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=-0.08)
     assert trigger is None, f"1-DTE condor closed at entry: {trigger}"
 
-    # Expiry day: rides outside the final-2h window (parity check still
-    # guards it), closes inside the window.
+    # Expiry day: rides outside the final-2h window (the parity check is off
+    # on expiry day — see test_parity_check_skipped_on_expiry_day), closes
+    # inside the window.
     close_utc = datetime(2026, 5, 13, 20, 0, tzinfo=timezone.utc)  # 16:00 ET
     mark0 = _mark(pos, pnl_dollars=0.0, dte=0, underlying_price=209.0)
     trigger, _ = _exit_mgr()._evaluate_one(
@@ -337,6 +348,175 @@ def test_short_dated_condor_entry_skips_near_money_close():
     trigger, _ = _exit_mgr()._evaluate_one(aged_mark, today=TODAY, current_divergence=-0.08)
     assert trigger == "assignment_risk", f"aged condor kept near the money: {trigger}"
     print("short-dated condor: rides at dte=1, expiry-morning backstop + aged close intact ✓")
+
+
+# ---------- trading-day DTE (Friday entry, Monday expiry) ----------
+
+FRI = date(2026, 8, 28)
+MON = date(2026, 8, 31)
+MON_CLOSE_UTC = datetime(2026, 8, 31, 20, 0, tzinfo=timezone.utc)  # 16:00 ET
+
+
+def test_entry_dte_counts_trading_days():
+    """Friday→Monday is 3 calendar days but ONE trading day. Counted in
+    calendar days it fell outside the short-dated window and was closed on
+    Monday's first cycle (TSLA 2026-08-31: sold at 9:35 ET, ahead of the
+    20-point rally the straddles had been bought for)."""
+    pos = replace(_mk_long_straddle_position(), expiration=MON,
+                  submitted_at=datetime(2026, 8, 28, 14, 19, tzinfo=timezone.utc))
+    assert _entry_dte(pos) == 1
+    # Intra-week entries are unchanged by the unit switch.
+    assert _entry_dte(replace(
+        pos, expiration=date(2026, 9, 2),
+        submitted_at=datetime(2026, 9, 1, 15, 0, tzinfo=timezone.utc))) == 1
+    assert _entry_dte(replace(
+        pos, expiration=date(2026, 9, 4),
+        submitted_at=datetime(2026, 9, 2, 15, 0, tzinfo=timezone.utc))) == 2
+    print("entry_dte: Fri→Mon = 1 trading day ✓")
+
+
+def test_friday_straddle_rides_to_monday_final_2h():
+    pos = replace(_mk_long_straddle_position(), expiration=MON,
+                  submitted_at=datetime(2026, 8, 28, 14, 19, tzinfo=timezone.utc))
+    mark0 = _mark(pos, pnl_dollars=0.0, dte=0, underlying_price=352.5)
+    # Monday 9:35 ET: hold.
+    trigger, _ = _exit_mgr()._evaluate_one(
+        mark0, today=MON, current_divergence=0.15,
+        market_close_utc=MON_CLOSE_UTC,
+        now_utc=datetime(2026, 8, 31, 13, 35, tzinfo=timezone.utc))
+    assert trigger is None, f"Friday straddle closed at Monday open: {trigger}"
+    # Monday 14:05 ET: final-2h close.
+    trigger, rationale = _exit_mgr()._evaluate_one(
+        mark0, today=MON, current_divergence=0.15,
+        market_close_utc=MON_CLOSE_UTC,
+        now_utc=datetime(2026, 8, 31, 18, 5, tzinfo=timezone.utc))
+    assert trigger == "expiration_proximity", f"expected final-2h close, got {trigger}"
+    assert "before expiration" in rationale
+    print("Fri→Mon straddle: holds Monday morning, closes in final 2h ✓")
+
+
+def test_friday_condor_rides_to_monday_final_2h():
+    pos = replace(_mk_iron_condor_position(), expiration=MON,
+                  submitted_at=datetime(2026, 8, 28, 14, 19, tzinfo=timezone.utc))
+    # Spot inside the near-money buffer of the short 210 strike; no leg quotes,
+    # so the parity rule is skipped and only the DTE window logic decides.
+    mark0 = _mark(pos, pnl_dollars=0.0, dte=0, underlying_price=209.0)
+    trigger, _ = _exit_mgr()._evaluate_one(
+        mark0, today=MON, current_divergence=-0.08,
+        market_close_utc=MON_CLOSE_UTC,
+        now_utc=datetime(2026, 8, 31, 13, 35, tzinfo=timezone.utc))
+    assert trigger is None, f"Friday condor closed at Monday open: {trigger}"
+    trigger, _ = _exit_mgr()._evaluate_one(
+        mark0, today=MON, current_divergence=-0.08,
+        market_close_utc=MON_CLOSE_UTC,
+        now_utc=datetime(2026, 8, 31, 18, 5, tzinfo=timezone.utc))
+    assert trigger == "assignment_risk", f"expected final-2h backstop, got {trigger}"
+    print("Fri→Mon condor: holds Monday morning, closes in final 2h ✓")
+
+
+def test_aged_condor_window_counts_remaining_trading_days():
+    """The aged-condor near-money window (rule (b), dte <= 1) counts trading
+    days: on the Friday before a Monday expiry one trading day remains
+    (calendar dte=3), so an aged condor with a short leg near the money
+    closes Friday instead of riding the weekend. Aged straddles have no such
+    window — they ride to expiry day like short-dated ones."""
+    aged_ic = replace(_mk_iron_condor_position(), expiration=MON)  # entered 4/27
+    # Thu 8/27: 2 trading days left → outside the window, hold.
+    trigger, _ = _exit_mgr()._evaluate_one(
+        _mark(aged_ic, pnl_dollars=0.0, dte=4, underlying_price=209.0),
+        today=date(2026, 8, 27), current_divergence=-0.08)
+    assert trigger is None, f"aged condor closed at 2 trading days: {trigger}"
+    # Fri 8/28 (calendar dte=3, formerly a hold): 1 trading day left → close.
+    trigger, _ = _exit_mgr()._evaluate_one(
+        _mark(aged_ic, pnl_dollars=0.0, dte=3, underlying_price=209.0),
+        today=FRI, current_divergence=-0.08)
+    assert trigger == "assignment_risk", f"aged condor held over the weekend: {trigger}"
+    # Missing underlying on that Friday (calendar dte=3): no blind close —
+    # rule (a) closes at Monday's open regardless, and a transient quote
+    # miss must not dump three calendar days of premium.
+    trigger, _ = _exit_mgr()._evaluate_one(
+        _mark(aged_ic, pnl_dollars=0.0, dte=3), today=FRI, current_divergence=-0.08)
+    assert trigger is None, f"blind close on a transient quote miss: {trigger}"
+    # Aged straddle on the same Friday: rides.
+    aged = replace(_mk_long_straddle_position(), expiration=MON)
+    trigger, _ = _exit_mgr()._evaluate_one(
+        _mark(aged, pnl_dollars=0.0, dte=3), today=FRI, current_divergence=0.15)
+    assert trigger is None, f"aged straddle closed before expiry day: {trigger}"
+    print("aged condor window: remaining trading days, Friday-before-Monday closes ✓")
+
+
+def test_parity_check_skipped_on_expiry_day():
+    """Rule (c) guards early assignment BEFORE expiry day only. A 0DTE ITM
+    short trades at parity all session, so on expiry day the parity check
+    would close a short-dated condor at the open; rule (a)'s final-2h close
+    handles expiry-day assignment instead."""
+    legs_at_parity = [
+        _contract(210.0, "call", 29.95, 30.09),
+        _contract(210.0, "put", 0.01, 0.05),
+        _contract(230.0, "call", 10.00, 10.10),
+        _contract(190.0, "put", 0.00, 0.02),
+    ]
+    short_dated = replace(_mk_iron_condor_position(), expiration=TODAY + timedelta(days=1),
+                          submitted_at=datetime(2026, 5, 12, 15, 0, tzinfo=timezone.utc))
+    close_utc = datetime(2026, 5, 13, 20, 0, tzinfo=timezone.utc)  # 16:00 ET
+    # Day before expiry (dte=1): parity still closes.
+    mark1 = _mark(short_dated, pnl_dollars=0.0, dte=1, underlying_price=240.0,
+                  current_legs=legs_at_parity)
+    trigger, rationale = _exit_mgr()._evaluate_one(mark1, today=TODAY, current_divergence=-0.08)
+    assert trigger == "assignment_risk" and "parity" in rationale, (trigger, rationale)
+    # Expiry day, 3h before the bell: parity ignored, ride.
+    mark0 = _mark(short_dated, pnl_dollars=0.0, dte=0, underlying_price=240.0,
+                  current_legs=legs_at_parity)
+    trigger, _ = _exit_mgr()._evaluate_one(
+        mark0, today=TODAY + timedelta(days=1), current_divergence=-0.08,
+        market_close_utc=close_utc, now_utc=close_utc - timedelta(hours=3))
+    assert trigger is None, f"parity closed a 0DTE condor at the open: {trigger}"
+    # Final 2h: rule (a) closes it.
+    trigger, rationale = _exit_mgr()._evaluate_one(
+        mark0, today=TODAY + timedelta(days=1), current_divergence=-0.08,
+        market_close_utc=close_utc, now_utc=close_utc - timedelta(hours=1, minutes=55))
+    assert trigger == "assignment_risk" and "expiration" in rationale, (trigger, rationale)
+    print("parity check: active at dte=1, skipped on expiry day, final-2h close intact ✓")
+
+
+def test_trading_dte_skips_market_holidays():
+    """Wed 2026-11-25 → Fri 2026-11-27 spans Thanksgiving: ONE session, not
+    two. Counted as two, a condor opened Wednesday would be "aged" and dumped
+    at Friday's open — the Friday→Monday bug in holiday clothing."""
+    pos = replace(_mk_iron_condor_position(), expiration=date(2026, 11, 27),
+                  submitted_at=datetime(2026, 11, 25, 15, 0, tzinfo=timezone.utc))
+    assert _entry_dte(pos) == 1
+    close_utc = datetime(2026, 11, 27, 18, 0, tzinfo=timezone.utc)  # 13:00 ET half day
+    mark0 = _mark(pos, pnl_dollars=0.0, dte=0, underlying_price=209.0)
+    trigger, _ = _exit_mgr()._evaluate_one(
+        mark0, today=date(2026, 11, 27), current_divergence=-0.08,
+        market_close_utc=close_utc,
+        now_utc=datetime(2026, 11, 27, 14, 35, tzinfo=timezone.utc))
+    assert trigger is None, f"holiday-spanning condor closed at the open: {trigger}"
+    trigger, _ = _exit_mgr()._evaluate_one(
+        mark0, today=date(2026, 11, 27), current_divergence=-0.08,
+        market_close_utc=close_utc,
+        now_utc=datetime(2026, 11, 27, 16, 5, tzinfo=timezone.utc))
+    assert trigger == "assignment_risk", f"expected final-2h backstop, got {trigger}"
+    # Aged condor on Wed 11/25 (calendar dte=2): one session left → rule (b)
+    # closes rather than carrying the near-money short across the holiday.
+    aged = replace(_mk_iron_condor_position(), expiration=date(2026, 11, 27))
+    trigger, _ = _exit_mgr()._evaluate_one(
+        _mark(aged, pnl_dollars=0.0, dte=2, underlying_price=209.0),
+        today=date(2026, 11, 25), current_divergence=-0.08)
+    assert trigger == "assignment_risk", f"aged condor held across Thanksgiving: {trigger}"
+    print("holidays: Thanksgiving skipped in both entry and remaining counts ✓")
+
+
+def test_trading_dte_sign_and_edges():
+    fri, sat, mon = date(2026, 8, 28), date(2026, 8, 29), date(2026, 8, 31)
+    assert _trading_dte(fri, fri) == 0                  # expiry day
+    assert _trading_dte(date(2026, 8, 27), fri) == 1     # Thursday before
+    assert _trading_dte(fri, mon) == 1                   # weekend skipped
+    assert _trading_dte(sat, fri) == 0                   # no session elapsed yet
+    assert _trading_dte(mon, fri) == -1                  # one session past expiry
+    assert _trading_dte(date(2026, 9, 4), date(2026, 9, 8)) == 1   # Labor Day skipped
+    print("trading_dte: sign, weekend, holiday edges ✓")
 
 
 # ---------- thesis reversal ----------
@@ -397,8 +577,8 @@ def test_thesis_overrides_profit_target():
     """Same priority logic on the upside — if thesis flips while in profit, close
     rather than wait for the rest. The remaining edge is gone."""
     pos = _mk_iron_condor_position(entry_credit=13.55)
-    # P&L = +$1000 (well past +50% profit target)
-    mark = _mark(pos, pnl_dollars=1000.0)
+    # P&L = +$1100 (past the +75% profit target of $1016.25)
+    mark = _mark(pos, pnl_dollars=1100.0)
     # Thesis intact: profit_target
     trigger, _ = _exit_mgr()._evaluate_one(mark, today=TODAY, current_divergence=-0.08)
     assert trigger == "profit_target"
@@ -461,11 +641,11 @@ def test_current_divergence_none_skips_thesis_check():
 
 
 def main() -> int:
-    test_iron_condor_profit_target_at_50pct()
-    test_long_straddle_profit_target_at_100pct()
+    test_iron_condor_profit_target_at_75pct()
+    test_long_straddle_has_no_profit_target()
     test_iron_condor_stop_loss_at_neg_100pct()
     test_long_straddle_stop_loss_at_neg_50pct()
-    test_expiration_proximity_long_straddle_dte_2()
+    test_straddle_rides_to_expiry_day_regardless_of_entry_dte()
     test_expiration_proximity_skipped_for_iron_condor()
     test_assignment_risk_expiry_day_unconditional()
     test_assignment_risk_near_money_short_at_dte1()
@@ -475,6 +655,13 @@ def main() -> int:
     test_stop_loss_overrides_assignment_risk()
     test_short_dated_straddle_entry_rides_to_expiry_morning()
     test_short_dated_condor_entry_skips_near_money_close()
+    test_entry_dte_counts_trading_days()
+    test_friday_straddle_rides_to_monday_final_2h()
+    test_friday_condor_rides_to_monday_final_2h()
+    test_aged_condor_window_counts_remaining_trading_days()
+    test_parity_check_skipped_on_expiry_day()
+    test_trading_dte_skips_market_holidays()
+    test_trading_dte_sign_and_edges()
     test_thesis_reversal_fires_when_sign_flips_and_magnitude_clears()
     test_thesis_exit_can_be_disabled()
     test_thesis_overrides_stop_loss()
