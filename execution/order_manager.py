@@ -28,7 +28,17 @@ logger = logging.getLogger(__name__)
 
 MAX_QUANTITY_PER_LEG_DEFAULT = 10
 MAX_PREMIUM_PER_TRADE_DEFAULT = 5000.0
+# Minutes a pending close may go without a price refresh before the
+# reconciler cancels it. The exit manager reprices a working close in place
+# every cycle, so this is the fallback for when that modify keeps failing.
+# Must exceed a full cycle — sleep (5 min) plus scan plus every 30 s order
+# ladder run that cycle — or a close being repriced normally gets canceled.
 STALE_ORDER_THRESHOLD_MINUTES_DEFAULT = 15
+# A pending close is also canceled once it has been working for this many
+# stale thresholds in total. The in-place reprice restarts the stale clock
+# each cycle; without this cap an unfillable close would never go terminal,
+# never burn retry budget, and never raise the max-retries alert.
+PENDING_CLOSE_MAX_AGE_MULTIPLE = 2
 MAX_CLOSE_RETRIES_DEFAULT = 3
 TERMINAL_STATES = {"filled", "partially_filled", "rejected", "canceled", "expired"}
 TERMINAL_FAILED = {"rejected", "canceled", "expired"}
@@ -602,6 +612,12 @@ class OrderManager:
         return None, None
 
     @staticmethod
+    def _as_utc(ts: datetime) -> datetime:
+        """Ledger timestamps are written tz-aware UTC; read a naive one (a
+        hand-edited row) as UTC instead of aborting the whole pass."""
+        return ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
+
+    @staticmethod
     def _ladder_price(base_mid: float, order_type: str, step: float) -> float:
         """Price at a ladder step: credits concede downward from mid, debits
         upward. step is a fraction of mid (0.0 = at mid)."""
@@ -714,9 +730,10 @@ class OrderManager:
         a different fingerprint by construction).
 
         Records a close_attempt row at submission time. On poll timeout the
-        attempt is left status='pending' so reconcile_pending_closes() can
-        cancel it after the stale threshold elapses and let exit_manager
-        retry next cycle with a fresh limit price."""
+        attempt is left status='pending'; each later cycle the exit manager
+        lands here again and the working limit is moved to that cycle's mid
+        (_reprice_pending_close). reconcile_pending_closes() cancels it only
+        if the price has not been refreshed within the stale threshold."""
         now = datetime.now(timezone.utc)
 
         guard_error = self._check_production_guard()
@@ -727,19 +744,22 @@ class OrderManager:
                 submitted_price=None, fill_price=None, error=guard_error,
             )
 
-        # Don't pile up duplicate closes — if one is already in flight, defer.
-        # The stale-close-manager will cancel it next cycle if it goes stale,
-        # at which point exit_manager re-evaluates and resubmits with a fresh
-        # limit.
-        if self._log.has_pending_close(position.tradier_order_id):
-            logger.info(
-                "close already pending for opening %s (%s) — skipping submit",
-                position.tradier_order_id, position.symbol,
-            )
-            return OrderResult(
-                signal=None, status="pending_close_exists", order_id=None,
-                submitted_price=None, fill_price=None,
-                error=f"close already pending for opening {position.tradier_order_id}",
+        # Close net premium and order type. Priced at the mark's theoretical
+        # mid; the price ladder concedes from there. close_cash_flow is
+        # whole-position dollars (scaled by leg quantity), but the multileg
+        # limit price is PER STRUCTURE UNIT — divide the lots back out.
+        close_cash_per_contract = mark.close_cash_flow / (100.0 * position.lots)
+        order_type = "credit" if close_cash_per_contract >= 0 else "debit"
+        close_mid = round(abs(close_cash_per_contract), 2)
+
+        # A close is already working: don't pile up a duplicate. Move its
+        # limit to this cycle's mid instead, so the order tracks the market
+        # every cycle rather than resting at a stale price until the
+        # stale-close reconciler cancels it.
+        pending = self._log.pending_close_attempt(position.tradier_order_id)
+        if pending is not None:
+            return await self._reprice_pending_close(
+                pending, position, close_mid, order_type, exit_trigger, now,
             )
 
         # Max retries: refuse and raise a CRITICAL alert (idempotent — the
@@ -790,13 +810,6 @@ class OrderManager:
                 "quantity": leg.quantity,
             })
 
-        # Determine close net premium and order type. Priced at the mark's
-        # theoretical mid; the price ladder concedes from there. close_cash_flow
-        # is whole-position dollars (scaled by leg quantity), but the multileg
-        # limit price is PER STRUCTURE UNIT — divide the lots back out.
-        close_cash_per_contract = mark.close_cash_flow / (100.0 * position.lots)
-        order_type = "credit" if close_cash_per_contract >= 0 else "debit"
-        close_mid = round(abs(close_cash_per_contract), 2)
         price = self._ladder_price(close_mid, order_type, self._ladder_steps[0])
         if price <= 0:
             err = f"computed close price not positive: {price}"
@@ -967,10 +980,84 @@ class OrderManager:
             error=f"close terminal status: {terminal_status}",
         )
 
+    async def _reprice_pending_close(
+        self,
+        pending: dict,
+        position: "OpenPosition",
+        close_mid: float,
+        order_type: str,
+        exit_trigger: str,
+        now: datetime,
+    ) -> OrderResult:
+        """Move a working close's limit to the current mid at the top ladder
+        step — the price the original walk ended at, re-anchored to this
+        cycle's market. A confirmed modify records the price, the current
+        exit trigger and last_priced_at, so the stale-close reconciler ages
+        the order from this reprice. A failed or unnecessary modify leaves
+        the row alone: the order keeps its old limit and the reconciler
+        cancels it once it is past the stale threshold."""
+        closing_order_id = int(pending["closing_order_id"])
+        current_price = float(pending["submitted_price"])
+        held = OrderResult(
+            signal=None, status="pending_close_exists", order_id=closing_order_id,
+            submitted_price=current_price, fill_price=None,
+            error=f"close already pending for opening {position.tradier_order_id}",
+        )
+        if order_type != pending["order_type"]:
+            # A modify cannot flip credit <-> debit; leave it for the reconciler.
+            logger.info(
+                "pending close %d for opening %d is a %s but the mark now says "
+                "%s — holding for the stale-close reconciler",
+                closing_order_id, position.tradier_order_id,
+                pending["order_type"], order_type,
+            )
+            return held
+        target = self._ladder_price(close_mid, order_type, self._ladder_steps[-1])
+        if target <= 0:
+            return held
+        if target == current_price:
+            # Nothing to send. The stale clock is NOT refreshed here — only a
+            # modify the broker accepted counts as evidence the order is live.
+            logger.debug(
+                "pending close %d for opening %d already at %.2f — no modify",
+                closing_order_id, position.tradier_order_id, current_price,
+            )
+            return held
+        try:
+            resp = await self._client.modify_order(
+                account_id=self._settings.account_id,
+                order_id=closing_order_id,
+                order_type=order_type,
+                price=target,
+            )
+            modify_error = self._extract_error(resp)
+        except Exception as e:
+            modify_error = repr(e)
+        if modify_error is not None:
+            logger.info(
+                "reprice of pending close %d for opening %d -> %.2f failed "
+                "(%s); holding %.2f for the stale-close reconciler",
+                closing_order_id, position.tradier_order_id, target,
+                modify_error, current_price,
+            )
+            return held
+        self._log.record_close_reprice(closing_order_id, target, exit_trigger, now)
+        logger.info(
+            "pending close %d for opening %d (%s): limit %.2f -> %.2f "
+            "(mid %.2f, %s)",
+            closing_order_id, position.tradier_order_id, position.symbol,
+            current_price, target, close_mid, order_type,
+        )
+        return OrderResult(
+            signal=None, status="pending_close_repriced", order_id=closing_order_id,
+            submitted_price=target, fill_price=None, error=None,
+        )
+
     async def reconcile_pending_closes(self, now: datetime) -> dict[str, int]:
-        """Walk every pending close attempt: cancel ones older than the stale
-        threshold, reconcile any that filled between cycles. Should run on
-        every MainLoop cycle before signal generation.
+        """Walk every pending close attempt: cancel ones whose limit has not
+        been refreshed within the stale threshold, reconcile any that filled
+        between cycles. Should run on every MainLoop cycle before signal
+        generation.
 
         Returns counts: {"canceled", "filled", "failed_terminal"}.
 
@@ -986,20 +1073,27 @@ class OrderManager:
             return {"canceled": 0, "filled": 0, "failed_terminal": 0}
 
         threshold = timedelta(minutes=self._stale_threshold_minutes)
+        max_age = threshold * PENDING_CLOSE_MAX_AGE_MULTIPLE
         canceled = filled = failed_terminal = 0
 
         for row in pending:
             closing_order_id = row["closing_order_id"]
             opening_order_id = row["opening_order_id"]
             try:
-                submitted_at = datetime.fromisoformat(row["submitted_at"])
+                submitted_at = self._as_utc(
+                    datetime.fromisoformat(row["submitted_at"])
+                )
+                priced_at = self._as_utc(datetime.fromisoformat(
+                    row.get("last_priced_at") or row["submitted_at"]
+                ))
+                age = now - priced_at          # since the limit was last set
+                lifetime = now - submitted_at  # since the order was placed
             except (TypeError, ValueError):
                 logger.warning(
-                    "bad submitted_at on close attempt %s — skipping",
+                    "bad last_priced_at/submitted_at on close attempt %s — skipping",
                     closing_order_id,
                 )
                 continue
-            age = now - submitted_at
 
             try:
                 resp = await self._client.get_order_status(
@@ -1080,8 +1174,11 @@ class OrderManager:
                 failed_terminal += 1
                 continue
 
-            # Still non-terminal at Tradier — check age
-            if age <= threshold:
+            # Still non-terminal at Tradier — cancel if the limit has gone
+            # stale, or if the order has been working past the lifetime cap
+            # (the reprice keeps the first clock fresh; the second is what
+            # gets an unfillable close to the retry/alert path).
+            if age <= threshold and lifetime <= max_age:
                 continue
 
             try:
@@ -1148,10 +1245,12 @@ class OrderManager:
                 terminal_at=now, fill_price=None,
             )
             logger.info(
-                "canceled stale close %s for opening %s (age=%.0fs threshold=%dmin) "
-                "— exit_manager will retry next cycle",
+                "canceled stale close %s for opening %s (since last price=%.0fs "
+                "threshold=%dmin, working=%.0fs cap=%.0fmin) — exit_manager "
+                "will retry next cycle",
                 closing_order_id, opening_order_id, age.total_seconds(),
-                self._stale_threshold_minutes,
+                self._stale_threshold_minutes, lifetime.total_seconds(),
+                max_age.total_seconds() / 60,
             )
             canceled += 1
 

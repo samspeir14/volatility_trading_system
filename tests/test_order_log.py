@@ -1,3 +1,4 @@
+import sqlite3
 import sys
 import tempfile
 from datetime import date, datetime, timedelta, timezone
@@ -24,6 +25,34 @@ def _fake_signal(symbol: str = "AAPL", strikes=(100.0,)) -> TradeSignal:
         cross_sectional_z=2.0, time_series_z=None,
         liquidity_score=12345.0, legs=legs, is_actionable=True,
     )
+
+
+def test_close_attempts_migration_adds_last_priced_at():
+    """An order_log.db from before the in-place reprice (no last_priced_at
+    column) must open cleanly and gain the column."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "log.db"
+        conn = sqlite3.connect(str(path))
+        conn.execute(
+            "CREATE TABLE close_attempts (closing_order_id INTEGER PRIMARY KEY, "
+            "opening_order_id INTEGER NOT NULL, submitted_at TEXT NOT NULL, "
+            "exit_trigger TEXT NOT NULL, order_type TEXT NOT NULL, "
+            "submitted_price REAL NOT NULL, status TEXT NOT NULL, "
+            "terminal_at TEXT, fill_price REAL)"
+        )
+        conn.execute(
+            "INSERT INTO close_attempts VALUES (1, 2, '2026-09-03T13:33:20+00:00', "
+            "'assignment_risk', 'debit', 5.15, 'pending', NULL, NULL)"
+        )
+        conn.commit(); conn.close()
+
+        log = OrderLog(path)
+        cols = {r[1] for r in log._conn.execute("PRAGMA table_info(close_attempts)")}
+        assert {"arrival_mid", "last_priced_at"} <= cols
+        row = log.pending_close_attempt(2)
+        assert row["closing_order_id"] == 1 and row["last_priced_at"] is None
+        log.close()
+    print("order_log: close_attempts migration adds last_priced_at ✓")
 
 
 def test_record_and_retrieve():
@@ -130,6 +159,7 @@ def test_persistence_across_reopen():
 
 
 def main() -> int:
+    test_close_attempts_migration_adds_last_priced_at()
     test_record_and_retrieve()
     test_dedup_within_window()
     test_dedup_window_expires()

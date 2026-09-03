@@ -139,6 +139,11 @@ CLOSE_COLUMNS_MIGRATIONS = [
 
 CLOSE_ATTEMPT_COLUMNS_MIGRATIONS = [
     ("arrival_mid", "ALTER TABLE close_attempts ADD COLUMN arrival_mid REAL"),
+    # When the working limit was last set: submission, then every in-place
+    # reprice. The stale-close reconciler ages a pending close from here,
+    # not from submitted_at, so a close being repriced each cycle is never
+    # treated as stale. NULL on rows older than this column = submitted_at.
+    ("last_priced_at", "ALTER TABLE close_attempts ADD COLUMN last_priced_at TEXT"),
 ]
 
 
@@ -514,10 +519,26 @@ class OrderLog:
         self._conn.execute(
             "INSERT INTO close_attempts ("
             "closing_order_id, opening_order_id, submitted_at, exit_trigger, "
-            "order_type, submitted_price, status, arrival_mid"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "order_type, submitted_price, status, arrival_mid, last_priced_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (closing_order_id, opening_order_id, submitted_at.isoformat(),
-             exit_trigger, order_type, submitted_price, status, arrival_mid),
+             exit_trigger, order_type, submitted_price, status, arrival_mid,
+             submitted_at.isoformat()),
+        )
+        self._conn.commit()
+
+    def record_close_reprice(
+        self, closing_order_id: int, price: float, exit_trigger: str,
+        at: datetime,
+    ) -> None:
+        """The broker accepted a new limit for a pending close: store the
+        price, the exit trigger that asked for it (so a later fill is booked
+        under the current reason, not the one from the original submit), and
+        restart its stale clock."""
+        self._conn.execute(
+            "UPDATE close_attempts SET submitted_price = ?, exit_trigger = ?, "
+            "last_priced_at = ? WHERE closing_order_id = ?",
+            (price, exit_trigger, at.isoformat(), closing_order_id),
         )
         self._conn.commit()
 
@@ -536,6 +557,19 @@ class OrderLog:
         )
         self._conn.commit()
 
+    def pending_close_attempt(self, opening_order_id: int) -> dict | None:
+        """The in-flight close for an opening order, or None."""
+        cur = self._conn.execute(
+            "SELECT closing_order_id, order_type, submitted_price, "
+            "exit_trigger, last_priced_at FROM close_attempts "
+            "WHERE opening_order_id = ? AND status = ? LIMIT 1",
+            (opening_order_id, PENDING_CLOSE_STATUS),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return dict(zip([d[0] for d in cur.description], row))
+
     def has_pending_close(self, opening_order_id: int) -> bool:
         cur = self._conn.execute(
             "SELECT 1 FROM close_attempts WHERE opening_order_id = ? "
@@ -550,6 +584,7 @@ class OrderLog:
         cur = self._conn.execute(
             "SELECT ca.closing_order_id, ca.opening_order_id, ca.submitted_at, "
             "ca.exit_trigger, ca.order_type, ca.submitted_price, ca.status, "
+            "ca.last_priced_at, "
             "so.symbol, so.expiration, so.structure, so.direction "
             "FROM close_attempts ca "
             "JOIN submitted_orders so ON so.tradier_order_id = ca.opening_order_id "
