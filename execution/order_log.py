@@ -113,6 +113,9 @@ CREATE_INDEXES_SQL = [
 
 PENDING_CLOSE_STATUS = "pending"
 STALE_CANCELED_STATUS = "stale_canceled"
+# A pending close whose opening was closed by something else (expiry
+# settlement, a different fill): retired, never retried, not a failed close.
+ORPHANED_CLOSE_STATUS = "orphaned"
 # partially_filled counts as failed: the executed chunk is booked by shrinking
 # the opening order's leg quantities to the remainder, and the attempt must
 # burn retry budget so a repeatedly-partial close still escalates to the
@@ -135,6 +138,10 @@ CLOSE_COLUMNS_MIGRATIONS = [
     ("next_earnings_date", "ALTER TABLE submitted_orders ADD COLUMN next_earnings_date TEXT"),
     # VRP calibration z at entry (h=1 pipeline) — every signal record logs it.
     ("vrp_z", "ALTER TABLE submitted_orders ADD COLUMN vrp_z REAL"),
+    # Which exit rule closed it, verbatim from ExitDecision.rationale. The
+    # trigger label alone cannot separate assignment_risk (a)/(b)/(c), which
+    # the exit-policy counterfactual needs.
+    ("exit_rationale", "ALTER TABLE submitted_orders ADD COLUMN exit_rationale TEXT"),
 ]
 
 CLOSE_ATTEMPT_COLUMNS_MIGRATIONS = [
@@ -144,6 +151,7 @@ CLOSE_ATTEMPT_COLUMNS_MIGRATIONS = [
     # not from submitted_at, so a close being repriced each cycle is never
     # treated as stale. NULL on rows older than this column = submitted_at.
     ("last_priced_at", "ALTER TABLE close_attempts ADD COLUMN last_priced_at TEXT"),
+    ("exit_rationale", "ALTER TABLE close_attempts ADD COLUMN exit_rationale TEXT"),
 ]
 
 
@@ -311,11 +319,14 @@ class OrderLog:
         closed_at: datetime,
         exit_trigger: str,
         realized_pnl: float,
+        exit_rationale: str | None = None,
     ) -> None:
         self._conn.execute(
             "UPDATE submitted_orders SET closing_order_id = ?, closed_at = ?, "
-            "exit_trigger = ?, realized_pnl = ? WHERE tradier_order_id = ?",
-            (closing_order_id, closed_at.isoformat(), exit_trigger, realized_pnl, opening_order_id),
+            "exit_trigger = ?, realized_pnl = ?, exit_rationale = ? "
+            "WHERE tradier_order_id = ?",
+            (closing_order_id, closed_at.isoformat(), exit_trigger, realized_pnl,
+             exit_rationale, opening_order_id),
         )
         self._conn.commit()
 
@@ -405,6 +416,19 @@ class OrderLog:
             (today.isoformat(),),
         )
         return float(cur.fetchone()[0])
+
+    def fills_since(self, since: datetime) -> int:
+        """Entries filled or positions closed at/after `since`. An activity
+        signal for the balance-feed guard: broker equity that does not move
+        across fills is a frozen feed, not a quiet market."""
+        iso = since.isoformat()
+        cur = self._conn.execute(
+            "SELECT COUNT(*) FROM submitted_orders "
+            "WHERE (filled_at IS NOT NULL AND filled_at >= ?) "
+            "OR (closed_at IS NOT NULL AND closed_at >= ?)",
+            (iso, iso),
+        )
+        return int(cur.fetchone()[0])
 
     def timeout_orders(self) -> list[dict]:
         """Rows with final_status='timeout' — submitted to Tradier but the
@@ -515,21 +539,23 @@ class OrderLog:
         submitted_price: float,
         status: str = PENDING_CLOSE_STATUS,
         arrival_mid: float | None = None,
+        exit_rationale: str | None = None,
     ) -> None:
         self._conn.execute(
             "INSERT INTO close_attempts ("
             "closing_order_id, opening_order_id, submitted_at, exit_trigger, "
-            "order_type, submitted_price, status, arrival_mid, last_priced_at"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "order_type, submitted_price, status, arrival_mid, last_priced_at, "
+            "exit_rationale"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (closing_order_id, opening_order_id, submitted_at.isoformat(),
              exit_trigger, order_type, submitted_price, status, arrival_mid,
-             submitted_at.isoformat()),
+             submitted_at.isoformat(), exit_rationale),
         )
         self._conn.commit()
 
     def record_close_reprice(
         self, closing_order_id: int, price: float, exit_trigger: str,
-        at: datetime,
+        at: datetime, exit_rationale: str | None = None,
     ) -> None:
         """The broker accepted a new limit for a pending close: store the
         price, the exit trigger that asked for it (so a later fill is booked
@@ -537,8 +563,9 @@ class OrderLog:
         restart its stale clock."""
         self._conn.execute(
             "UPDATE close_attempts SET submitted_price = ?, exit_trigger = ?, "
-            "last_priced_at = ? WHERE closing_order_id = ?",
-            (price, exit_trigger, at.isoformat(), closing_order_id),
+            "last_priced_at = ?, exit_rationale = COALESCE(?, exit_rationale) "
+            "WHERE closing_order_id = ?",
+            (price, exit_trigger, at.isoformat(), exit_rationale, closing_order_id),
         )
         self._conn.commit()
 
@@ -561,7 +588,7 @@ class OrderLog:
         """The in-flight close for an opening order, or None."""
         cur = self._conn.execute(
             "SELECT closing_order_id, order_type, submitted_price, "
-            "exit_trigger, last_priced_at FROM close_attempts "
+            "exit_trigger, exit_rationale, last_priced_at FROM close_attempts "
             "WHERE opening_order_id = ? AND status = ? LIMIT 1",
             (opening_order_id, PENDING_CLOSE_STATUS),
         )
@@ -583,9 +610,11 @@ class OrderLog:
         walks this list each cycle."""
         cur = self._conn.execute(
             "SELECT ca.closing_order_id, ca.opening_order_id, ca.submitted_at, "
-            "ca.exit_trigger, ca.order_type, ca.submitted_price, ca.status, "
-            "ca.last_priced_at, "
-            "so.symbol, so.expiration, so.structure, so.direction "
+            "ca.exit_trigger, ca.exit_rationale, ca.order_type, ca.submitted_price, "
+            "ca.status, ca.last_priced_at, "
+            "so.symbol, so.expiration, so.structure, so.direction, "
+            "so.closed_at, so.closing_order_id AS opening_closing_order_id, "
+            "so.exit_trigger AS opening_exit_trigger "
             "FROM close_attempts ca "
             "JOIN submitted_orders so ON so.tradier_order_id = ca.opening_order_id "
             "WHERE ca.status = ? "

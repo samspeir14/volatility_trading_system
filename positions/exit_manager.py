@@ -580,6 +580,7 @@ class ExitManager:
                 position=decision.position,
                 mark=decision.mark,
                 exit_trigger=decision.trigger,
+                exit_rationale=decision.rationale,
             )
             results.append((decision, order_result))
         return results

@@ -483,3 +483,27 @@ def test_sleep_until_open_same_day_and_fallback():
     assert loop._sleep_seconds_until_open({"date": "2026-09-17", "next_change": "soon"}, now=now) == 300.0
     assert loop._sleep_seconds_until_open({}, now=now) == 300.0
     print("sleep: same-day bare time and garbage fallback")
+
+
+def test_frozen_balance_feed_blocks_new_entries_but_not_exits():
+    """A snapshot flagged by BalanceFeedGuard must land in entry_blocks (no
+    new signals) while exits still run — the kill switch's contract."""
+    fake_position_mark = mock.MagicMock()
+    snapshot = mock.MagicMock()
+    snapshot.equity = 109656.20
+    snapshot.starting_equity_today = 109656.20
+    snapshot.today_total_pnl = -1000.0
+    snapshot.today_realized_pnl = 0.0
+    snapshot.today_unrealized_pnl = -1000.0
+    snapshot.open_marks = [fake_position_mark]
+    snapshot.open_positions = [mock.MagicMock()]
+    reason = "balances feed frozen: total_equity $109,656.20 unchanged across 3+ cycles"
+    snapshot.balance_feed_reason = reason
+    fake_exit_decision = mock.MagicMock(action="close", trigger="stop_loss")
+    loop, mocks = _mk_loop(snapshot=snapshot, exit_decisions=[fake_exit_decision])
+    with mock.patch("main._exits_allowed", return_value=True):
+        result = asyncio.run(loop.run_once())
+    assert reason in result.entry_blocks
+    mocks["sig_gen"].generate.assert_not_called()
+    mocks["exit_manager"].execute.assert_called_once()
+    print("run_once: frozen balance feed blocks entries, exits still run")

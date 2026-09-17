@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any
 
 from config import Ticker
@@ -12,6 +12,7 @@ from data.market_data import ScanResult
 from execution.order_log import OrderLog
 from positions.position_tracker import OpenPosition, PositionMark, PositionTracker
 from risk.kill_switch import DailyKillSwitch
+from risk.trading_guards import BalanceFeedGuard
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,13 @@ class PortfolioSnapshot:
     portfolio_greeks: dict[str, float]
     positions_by_sector: dict[str, int]
     exposure_by_symbol: dict[str, float]   # max-loss $ per symbol
+    # Set while the broker's equity feed is frozen (BalanceFeedGuard). While
+    # set, today_unrealized_pnl comes from our own marks, not from equity.
+    balance_feed_reason: str | None = None
+
+    @property
+    def balance_feed_stale(self) -> bool:
+        return self.balance_feed_reason is not None
 
     @property
     def today_total_pnl(self) -> float:
@@ -91,12 +99,15 @@ class PortfolioStateBuilder:
         position_tracker: PositionTracker,
         watchlist: list[Ticker],
         kill_switch: DailyKillSwitch,
+        balance_guard: BalanceFeedGuard | None = None,
     ):
         self._client = client
         self._log = order_log
         self._tracker = position_tracker
         self._sector_map = {t.symbol: t.sector for t in watchlist}
         self._kill_switch = kill_switch
+        self._balance_guard = balance_guard
+        self._last_snapshot_at: datetime | None = None
 
     async def snapshot(self, scan: ScanResult) -> PortfolioSnapshot:
         balances_resp = await self._client.get_balances()
@@ -119,6 +130,29 @@ class PortfolioStateBuilder:
         # intraday mark moves.
         today_unrealized = (equity - starting_equity) - today_realized
 
+        # ...unless the equity feed is frozen (2026-08-31..09-03, 09-15: same
+        # total_equity to the cent all session while fills happened). Then
+        # the delta above is exactly -today_realized and total P&L reads $0
+        # for the kill switch. Fall back to our own marks.
+        feed_reason: str | None = None
+        now = datetime.now(timezone.utc)
+        if self._balance_guard is not None:
+            fills = (
+                self._log.fills_since(self._last_snapshot_at)
+                if self._last_snapshot_at is not None else 0
+            )
+            report = self._balance_guard.observe(
+                equity, open_positions=len(positions), fills_since_last=fills,
+            )
+            if report.stale:
+                feed_reason = report.block_reason
+                today_unrealized = self._ledger_unrealized_today(marks, today)
+                logger.warning(
+                    "%s (ledger: realized today $%+.2f, unrealized today $%+.2f)",
+                    feed_reason, today_realized, today_unrealized,
+                )
+        self._last_snapshot_at = now
+
         exposure: dict[str, float] = defaultdict(float)
         sector_count: dict[str, int] = defaultdict(int)
         for pos in positions:
@@ -140,4 +174,20 @@ class PortfolioStateBuilder:
             portfolio_greeks=PositionTracker.portfolio_greeks(marks),
             positions_by_sector=dict(sector_count),
             exposure_by_symbol=dict(exposure),
+            balance_feed_reason=feed_reason,
         )
+
+    def _ledger_unrealized_today(self, marks: list[PositionMark], today: date) -> float:
+        """Today's unrealized P&L from our own marks: per open position, the
+        lifetime mark P&L minus the lifetime P&L recorded at the last EOD
+        snapshot (the daily summary's per-position breakdown writes those;
+        a position with no prior snapshot opened since, so its whole lifetime
+        P&L is today's). Only used while the broker's equity is frozen."""
+        total = 0.0
+        for mark in marks:
+            lifetime = mark.pnl_dollars
+            if lifetime != lifetime:  # NaN mark (missing legs)
+                continue
+            prior = self._log.previous_position_pnl(mark.position.tradier_order_id, today)
+            total += lifetime if prior is None else lifetime - prior
+        return total

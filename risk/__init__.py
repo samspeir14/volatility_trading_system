@@ -3,6 +3,7 @@ from risk.portfolio_state import PortfolioSnapshot, PortfolioStateBuilder
 from risk.risk_manager import RiskDecision, RiskManager
 from risk.risk_rejection_log import RiskRejectionLog, categorize_reason
 from risk.trading_guards import (
+    BalanceFeedGuard,
     BarsFreshnessGuard,
     DrawdownBreaker,
     FreshnessReport,
@@ -12,6 +13,7 @@ from risk.trading_guards import (
 )
 
 __all__ = [
+    "BalanceFeedGuard",
     "BarsFreshnessGuard",
     "DailyKillSwitch",
     "DrawdownBreaker",

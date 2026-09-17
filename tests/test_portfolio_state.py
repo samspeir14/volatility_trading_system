@@ -174,3 +174,88 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def test_snapshot_swaps_to_ledger_pnl_when_equity_feed_is_frozen():
+    """2026-09-15: total_equity read 109,656.20 on every cycle while fills
+    happened; unrealized = equity - start - realized made total P&L $0 all
+    day and the kill switch was blind. With the guard, a flat feed swaps
+    today's unrealized onto our own marks and flags the snapshot."""
+    import asyncio
+    import tempfile
+    from datetime import date, datetime, timezone
+    from pathlib import Path
+    from unittest import mock
+
+    from execution import OrderLog
+    from risk.portfolio_state import PortfolioStateBuilder
+    from risk.trading_guards import BalanceFeedGuard
+
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "orders.db")
+        client = mock.AsyncMock()
+        client.get_balances.return_value = dict(PDT_BALANCES, total_equity=109656.20)
+        pos = mock.MagicMock()
+        pos.symbol = "TSLA"
+        pos.tradier_order_id = 777
+        pos.max_loss_dollars = 500.0
+        mark = mock.MagicMock()
+        mark.position = pos
+        mark.pnl_dollars = -1200.0
+        mark.delta = mark.gamma = mark.theta = mark.vega = 0.0
+        tracker = mock.MagicMock()
+        tracker.list_open_positions = mock.AsyncMock(return_value=[pos])
+        tracker.mark_to_market.return_value = [mark]
+        kill = mock.MagicMock()
+        kill.get_starting_equity.return_value = 109656.20
+        scan = mock.MagicMock()
+        scan.fetched_at = datetime(2026, 9, 15, 14, 0, tzinfo=timezone.utc)
+        # Yesterday's EOD snapshot for the position: lifetime -200 -> today -1000.
+        log.record_position_pnl_snapshot(777, date(2026, 9, 14), -200.0)
+
+        builder = PortfolioStateBuilder(
+            client=client, order_log=log, position_tracker=tracker, watchlist=[],
+            kill_switch=kill, balance_guard=BalanceFeedGuard(min_flat_cycles=3),
+        )
+        snaps = [asyncio.run(builder.snapshot(scan)) for _ in range(4)]
+
+        # Before the guard trips the broker's number stands: the day reads flat.
+        assert snaps[0].balance_feed_reason is None
+        assert snaps[0].balance_feed_stale is False
+        assert snaps[0].today_total_pnl == 0.0
+        # Fourth identical reading with an open position: ledger P&L takes over.
+        assert snaps[3].balance_feed_stale is True
+        assert "109,656.20" in snaps[3].balance_feed_reason
+        assert abs(snaps[3].today_unrealized_pnl - (-1000.0)) < 1e-9
+        assert abs(snaps[3].today_total_pnl - (-1000.0)) < 1e-9
+        log.close()
+    print("portfolio_state: frozen equity feed -> ledger unrealized, snapshot flagged")
+
+
+def test_snapshot_without_guard_is_unchanged():
+    import asyncio
+    from datetime import datetime, timezone
+    from unittest import mock
+
+    from risk.portfolio_state import PortfolioStateBuilder
+
+    client = mock.AsyncMock()
+    client.get_balances.return_value = dict(PDT_BALANCES, total_equity=101000.0)
+    tracker = mock.MagicMock()
+    tracker.list_open_positions = mock.AsyncMock(return_value=[])
+    tracker.mark_to_market.return_value = []
+    log = mock.MagicMock()
+    log.closed_today_pnl.return_value = 250.0
+    kill = mock.MagicMock()
+    kill.get_starting_equity.return_value = 100000.0
+    scan = mock.MagicMock()
+    scan.fetched_at = datetime(2026, 9, 15, 14, 0, tzinfo=timezone.utc)
+    builder = PortfolioStateBuilder(
+        client=client, order_log=log, position_tracker=tracker, watchlist=[], kill_switch=kill,
+    )
+    snap = asyncio.run(builder.snapshot(scan))
+    assert snap.balance_feed_reason is None
+    assert snap.today_realized_pnl == 250.0
+    assert abs(snap.today_unrealized_pnl - 750.0) < 1e-9
+    log.fills_since.assert_not_called()
+    print("portfolio_state: no guard -> equity-delta P&L as before")
