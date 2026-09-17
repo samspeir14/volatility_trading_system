@@ -64,11 +64,41 @@ def _scan_window(settings: Settings) -> tuple[int, int]:
     return (settings.min_entry_dte, settings.max_entry_dte)
 
 
-def _parse_clock_timestamp(raw: str | None) -> datetime | None:
-    """Tradier clock timestamps ("2026-04-28T13:30:00Z" or offset-aware ISO)
-    as aware-UTC datetimes; None when absent/unparseable/naive."""
-    if not raw:
+def _parse_clock_timestamp(
+    raw: str | None, clock_date: str | None = None,
+) -> datetime | None:
+    """Tradier ``/markets/clock`` ``next_change`` as an aware-UTC datetime.
+
+    The live payload carries a bare Eastern wall-clock time — ``"16:00"``
+    while open (today's close), ``"07:00"`` after hours — next to a ``date``
+    field (``"2026-09-16"``, the current ET date). Anchor the time to that
+    date in America/New_York (falls back to today's ET date when ``date`` is
+    absent). Full offset-aware ISO timestamps (``"2026-04-28T13:30:00Z"``)
+    are still accepted. None when absent or unparseable, or when an ISO
+    timestamp is naive.
+
+    Until 2026-09-17 this understood only ISO and returned None on the real
+    payload, so ``_in_expiry_close_window`` failed safe and every expiry-day
+    short leg closed at 09:45 ET instead of in the final 2h.
+    """
+    if not raw or not isinstance(raw, str):
         return None
+    raw = raw.strip()
+    try:
+        wall = dt_time.fromisoformat(raw)
+    except ValueError:
+        wall = None
+    if wall is not None:
+        day = None
+        if clock_date:
+            try:
+                day = date.fromisoformat(clock_date)
+            except ValueError:
+                day = None
+        if day is None:
+            day = datetime.now(_EASTERN).date()
+        tz = wall.tzinfo or _EASTERN
+        return datetime.combine(day, wall.replace(tzinfo=None), tzinfo=tz).astimezone(timezone.utc)
     try:
         if raw.endswith("Z"):
             raw = raw[:-1] + "+00:00"
@@ -398,7 +428,13 @@ class MainLoop:
             return CycleResult(market_open=False, timestamp=now)
         # While open, next_change is today's close — the authority for the
         # exit manager's before-the-bell close window (handles half-days).
-        market_close_utc = _parse_clock_timestamp(clock.get("next_change"))
+        market_close_utc = _parse_clock_timestamp(
+            clock.get("next_change"), clock.get("date"))
+        if market_close_utc is None:
+            logger.warning(
+                "market open but close time unknown (next_change=%r date=%r) — "
+                "expiry-day short legs close on this cycle, not in the final 2h",
+                clock.get("next_change"), clock.get("date"))
 
         # 1b. Refresh daily bars through the last completed trading day.
         # ensure_data is incremental (latest cached date + 1 forward), so this
@@ -806,21 +842,23 @@ class MainLoop:
             list(result.entry_blocks) or "none",
         )
 
-    def _sleep_seconds_until_open(self, clock: dict) -> float:
-        """Use Tradier's next_change to sleep precisely. Falls back to 5min if absent."""
-        next_change_str = clock.get("next_change")
-        if not next_change_str:
-            return self._scan_interval
-        try:
-            # Tradier returns "2026-04-28T13:30:00Z" or similar
-            if next_change_str.endswith("Z"):
-                next_change_str = next_change_str[:-1] + "+00:00"
-            next_change = datetime.fromisoformat(next_change_str)
-            now = datetime.now(timezone.utc)
-            delta = (next_change - now).total_seconds() + 60  # +60s buffer
-            return max(60.0, delta)
-        except (ValueError, TypeError):
+    def _sleep_seconds_until_open(
+        self, clock: dict, now: datetime | None = None,
+    ) -> float:
+        """Seconds until Tradier's next_change (+60s buffer), floored at 60s.
+        Falls back to the scan interval when next_change is absent or
+        unparseable. After the bell the payload still says date=today with
+        next_change="07:00", so a bare time already behind `now` means
+        tomorrow's."""
+        next_change = _parse_clock_timestamp(
+            clock.get("next_change"), clock.get("date"))
+        if next_change is None:
             return float(self._scan_interval)
+        now = now or datetime.now(timezone.utc)
+        if next_change <= now:
+            next_change += timedelta(days=1)
+        delta = (next_change - now).total_seconds() + 60  # +60s buffer
+        return max(60.0, delta)
 
 
 def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, list]:

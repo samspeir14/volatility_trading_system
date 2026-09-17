@@ -446,8 +446,10 @@ class AsyncTradierClient:
         return (await self._get("/user/profile"))["profile"]
 
     async def get_clock(self) -> dict:
-        """Returns Tradier's market clock: state (open/closed/premarket/postmarket),
-        next_change (ISO timestamp), next_state, description."""
+        """Returns Tradier's market clock: date (current ET date), state
+        (open/closed/premarket/postmarket), next_change (bare ET wall-clock
+        time such as "16:00" — NOT an ISO timestamp), next_state,
+        description."""
         return (await self._get("/markets/clock"))["clock"]
 
     async def get_quotes(self, symbols: list[str]) -> dict[str, dict]:
