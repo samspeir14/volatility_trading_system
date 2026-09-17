@@ -14,7 +14,10 @@ def _mk_loop(*, market_state="open", kill_active_initial=False, snapshot=None,
              actionable_signals=None, risk_decisions=None, exit_decisions=None):
     """Build a MainLoop with mocked components."""
     client = mock.AsyncMock()
-    client.get_clock.return_value = {"state": market_state, "next_change": "2026-04-28T20:00:00Z"}
+    # Real payload shape: bare ET wall-clock next_change beside the ET date.
+    client.get_clock.return_value = {
+        "state": market_state, "date": "2026-04-28", "next_change": "16:00",
+    }
 
     market_data = mock.AsyncMock()
     scan = mock.MagicMock()
@@ -391,3 +394,92 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# --- Tradier clock parsing -------------------------------------------------
+# The live /markets/clock payload is {"date": "2026-09-16", "state": "open",
+# "next_change": "16:00", ...}: a bare Eastern wall-clock time, not an ISO
+# timestamp. Until 2026-09-17 the parser only understood ISO, returned None on
+# every real payload, and _in_expiry_close_window failed safe — every
+# expiry-day short leg closed at 09:45 ET instead of in the final 2h.
+
+def test_parse_clock_bare_time_anchors_to_clock_date_in_eastern():
+    parse = main_module._parse_clock_timestamp
+    # EDT (UTC-4): 16:00 ET -> 20:00Z
+    assert parse("16:00", "2026-09-16") == datetime(2026, 9, 16, 20, 0, tzinfo=timezone.utc)
+    # EST (UTC-5): 16:00 ET -> 21:00Z
+    assert parse("16:00", "2026-12-16") == datetime(2026, 12, 16, 21, 0, tzinfo=timezone.utc)
+    # Half day (day after Thanksgiving, EST): 13:00 ET -> 18:00Z
+    assert parse("13:00", "2026-11-27") == datetime(2026, 11, 27, 18, 0, tzinfo=timezone.utc)
+    # Pre-open payload
+    assert parse("09:30", "2026-09-17") == datetime(2026, 9, 17, 13, 30, tzinfo=timezone.utc)
+    print("clock parse: bare ET time + date -> correct UTC across DST and half-days")
+
+
+def test_parse_clock_bare_time_without_date_uses_today_eastern():
+    got = main_module._parse_clock_timestamp("16:00")
+    assert got is not None
+    local = got.astimezone(main_module._EASTERN)
+    assert local.date() == datetime.now(main_module._EASTERN).date()
+    assert (local.hour, local.minute) == (16, 0)
+    print("clock parse: bare time with no date anchors to today's ET date")
+
+
+def test_parse_clock_iso_timestamp_still_accepted():
+    parse = main_module._parse_clock_timestamp
+    assert parse("2026-04-28T20:00:00Z") == datetime(2026, 4, 28, 20, 0, tzinfo=timezone.utc)
+    assert parse("2026-04-28T16:00:00-04:00") == datetime(2026, 4, 28, 20, 0, tzinfo=timezone.utc)
+    # The date field is ignored when the timestamp carries its own date.
+    assert parse("2026-04-28T20:00:00Z", "2026-09-16") == datetime(2026, 4, 28, 20, 0, tzinfo=timezone.utc)
+    print("clock parse: offset-aware ISO still works")
+
+
+def test_parse_clock_rejects_absent_naive_and_garbage():
+    parse = main_module._parse_clock_timestamp
+    assert parse(None) is None
+    assert parse("") is None
+    assert parse("soon") is None
+    assert parse("2026-04-28T20:00:00") is None  # naive ISO
+    assert parse("16:00", "not-a-date") is not None  # bad date falls back to today, still parses
+    print("clock parse: None on absent/naive/garbage")
+
+
+def test_run_once_passes_parsed_market_close_to_exit_manager():
+    """The exit manager's final-2h window is only as good as the close time
+    main hands it. With the real payload shape it must be today's 16:00 ET
+    in UTC, never None (None = fail-safe close at the open)."""
+    fake_position_mark = mock.MagicMock()
+    snapshot = mock.MagicMock()
+    snapshot.equity = 100000.0
+    snapshot.starting_equity_today = 100000.0
+    snapshot.today_total_pnl = 0.0
+    snapshot.today_realized_pnl = 0.0
+    snapshot.today_unrealized_pnl = 0.0
+    snapshot.open_marks = [fake_position_mark]
+    snapshot.open_positions = [mock.MagicMock()]
+    loop, mocks = _mk_loop(snapshot=snapshot)
+    with mock.patch("main._exits_allowed", return_value=True):
+        asyncio.run(loop.run_once())
+    kwargs = mocks["exit_manager"].evaluate.call_args.kwargs
+    assert kwargs["market_close_utc"] == datetime(2026, 4, 28, 20, 0, tzinfo=timezone.utc)
+    print("run_once: exit manager receives 2026-04-28T20:00Z for next_change='16:00'")
+
+
+def test_sleep_until_open_rolls_past_bare_time_to_tomorrow():
+    """21:00 ET after the bell: payload is date=today, next_change='07:00'
+    (premarket). That 07:00 is tomorrow's, ~10h away, not 60s."""
+    loop, _ = _mk_loop(market_state="closed")
+    now = datetime(2026, 9, 17, 1, 0, tzinfo=timezone.utc)  # 21:00 ET Sep 16
+    secs = loop._sleep_seconds_until_open({"date": "2026-09-16", "next_change": "07:00"}, now=now)
+    assert secs == 10 * 3600 + 60
+    print("sleep: past bare time rolls to tomorrow (%.0fs)" % secs)
+
+
+def test_sleep_until_open_same_day_and_fallback():
+    loop, _ = _mk_loop(market_state="premarket")
+    now = datetime(2026, 9, 17, 10, 0, tzinfo=timezone.utc)  # 06:00 ET
+    secs = loop._sleep_seconds_until_open({"date": "2026-09-17", "next_change": "09:30"}, now=now)
+    assert secs == 3.5 * 3600 + 60
+    assert loop._sleep_seconds_until_open({"date": "2026-09-17", "next_change": "soon"}, now=now) == 300.0
+    assert loop._sleep_seconds_until_open({}, now=now) == 300.0
+    print("sleep: same-day bare time and garbage fallback")
