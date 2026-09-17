@@ -737,3 +737,129 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# ---------- Orphaned closes + exit rationale ----------
+
+def test_reconcile_retires_orphan_close_when_opening_already_closed():
+    """A pending close whose opening was since settled by expiry (or closed
+    by another fill) can never do anything useful. One cancel, mark it
+    orphaned, never look at it again — not a failed cancel every cycle
+    forever (~1.6k of them in the sandbox 2026-09-11..16)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "log.db")
+        pos = _mk_long_straddle_position(order_id=6901)
+        _seed_open_order(log, pos)
+        mark = _mk_mark(pos, close_cash_flow=200.0)
+        mgr, fake = _mk_manager_pending_poll(log, closing_order_id=9901)
+        asyncio.run(mgr.submit_close(
+            pos, mark, "expiration_proximity", exit_rationale="dte=0 final-2h close",
+        ))
+        assert log.has_pending_close(6901) is True
+
+        # The reconciler settles the opening at expiry; the sandbox order
+        # lives on and answers every cancel with an error.
+        log.record_expiration(6901, datetime.now(timezone.utc), realized_pnl=-408.0,
+                              exit_trigger="expired")
+        fake.cancel_order.reset_mock()
+        fake.cancel_order.return_value = {
+            "errors": {"error": "order not available to be canceled"},
+        }
+        now = datetime.now(timezone.utc) + timedelta(minutes=1)  # not even stale
+        result = asyncio.run(mgr.reconcile_pending_closes(now))
+
+        assert result["orphaned"] == 1, result
+        assert result["canceled"] == 0 and result["failed_terminal"] == 0
+        fake.cancel_order.assert_called_once_with("VA00000000", 9901)
+        assert log.pending_close_attempts() == []
+        status = log._conn.execute(
+            "SELECT status FROM close_attempts WHERE closing_order_id = 9901"
+        ).fetchone()[0]
+        assert status == "orphaned"
+        # Not a failed close of a live position: no retry budget burned.
+        assert log.failed_close_attempt_count(6901) == 0
+
+        # Later passes: nothing to do, no more cancels, no status polls.
+        fake.cancel_order.reset_mock()
+        fake.get_order_status.reset_mock()
+        asyncio.run(mgr.reconcile_pending_closes(now + timedelta(minutes=30)))
+        fake.cancel_order.assert_not_called()
+        fake.get_order_status.assert_not_called()
+        log.close()
+    print("reconcile_pending_closes: orphan close retired once, never retried ✓")
+
+
+def test_reconcile_orphan_cancel_exception_still_retires():
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "log.db")
+        pos = _mk_long_straddle_position(order_id=6903)
+        _seed_open_order(log, pos)
+        mark = _mk_mark(pos, close_cash_flow=200.0)
+        mgr, fake = _mk_manager_pending_poll(log, closing_order_id=9903)
+        asyncio.run(mgr.submit_close(pos, mark, "thesis_reversed"))
+        log.record_expiration(6903, datetime.now(timezone.utc), realized_pnl=0.0)
+        fake.cancel_order.side_effect = RuntimeError("boom")
+        result = asyncio.run(mgr.reconcile_pending_closes(datetime.now(timezone.utc)))
+        assert result["orphaned"] == 1
+        assert log.pending_close_attempts() == []
+        log.close()
+    print("reconcile_pending_closes: orphan retired even when cancel raises ✓")
+
+
+def test_exit_rationale_recorded_on_attempt_and_on_fill():
+    """The trigger label alone cannot tell assignment_risk (a) from (b)
+    from (c); the rationale string can. It must survive submit -> pending
+    -> between-cycle fill onto the opening row."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "log.db")
+        pos = _mk_long_straddle_position(order_id=6902)
+        _seed_open_order(log, pos)
+        mark = _mk_mark(pos, close_cash_flow=200.0)
+        mgr, fake = _mk_manager_pending_poll(log, closing_order_id=9902)
+        why = ("short call K=360.0 in/near the money (underlying 358.10, "
+               "buffer 1.5%) with 1 trading day(s) left")
+        asyncio.run(mgr.submit_close(pos, mark, "assignment_risk", exit_rationale=why))
+        assert log.pending_close_attempt(6902)["exit_rationale"] == why
+
+        fake.get_order_status.return_value = {
+            "order": {"id": 9902, "status": "filled", "avg_fill_price": 2.00,
+                      "exec_quantity": 2},
+        }
+        asyncio.run(mgr.reconcile_pending_closes(
+            datetime.now(timezone.utc) + timedelta(minutes=1)))
+        row = log._conn.execute(
+            "SELECT exit_trigger, exit_rationale FROM submitted_orders "
+            "WHERE tradier_order_id = 6902"
+        ).fetchone()
+        assert row == ("assignment_risk", why), row
+        log.close()
+    print("exit rationale: on close_attempts at submit, on submitted_orders at fill ✓")
+
+
+def test_exit_rationale_follows_a_reprice():
+    """A reprice under a new trigger must carry the new rationale, and a
+    reprice without one must not blank the stored rationale."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "log.db")
+        _seed_pending_close(log, opening_id=6904, closing_id=9904, price=1.10)
+        log.record_close_reprice(9904, 1.11, "profit_target", datetime.now(timezone.utc),
+                                 exit_rationale="pnl 80% of max >= 75% target")
+        assert log.pending_close_attempt(6904)["exit_rationale"] == "pnl 80% of max >= 75% target"
+        log.record_close_reprice(9904, 1.12, "profit_target", datetime.now(timezone.utc))
+        assert log.pending_close_attempt(6904)["exit_rationale"] == "pnl 80% of max >= 75% target"
+        log.close()
+    print("exit rationale: reprice keeps/updates rationale ✓")
+
+
+def test_fills_since_counts_entries_and_closes():
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "log.db")
+        pos = _mk_long_straddle_position(order_id=6905)
+        _seed_open_order(log, pos)  # filled_at NULL, closed_at NULL
+        t0 = datetime.now(timezone.utc)
+        assert log.fills_since(t0 - timedelta(hours=1)) == 0
+        log.record_expiration(6905, t0, realized_pnl=0.0)
+        assert log.fills_since(t0 - timedelta(minutes=1)) == 1
+        assert log.fills_since(t0 + timedelta(minutes=1)) == 0
+        log.close()
+    print("fills_since: counts closes at/after the cutoff ✓")

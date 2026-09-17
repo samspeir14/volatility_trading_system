@@ -38,6 +38,7 @@ from logs import DailySummary, DailySummaryBuilder, post_text, post_to_slack, se
 from model import LightGBMVolPredictor
 from positions import ExitManager, PositionReconciler, PositionTracker
 from risk import (
+    BalanceFeedGuard,
     BarsFreshnessGuard,
     DailyKillSwitch,
     DrawdownBreaker,
@@ -540,6 +541,11 @@ class MainLoop:
             stale_symbols = freshness.stale_symbols
             if freshness.block_reason is not None:
                 entry_blocks.append(freshness.block_reason)
+        # Frozen broker equity: the snapshot already moved the kill switch
+        # onto ledger P&L; also refuse new entries until the feed moves.
+        feed_reason = getattr(snapshot, "balance_feed_reason", None)
+        if isinstance(feed_reason, str) and feed_reason:
+            entry_blocks.append(feed_reason)
         self._alert_new_blocks(entry_blocks)
 
         # 5. Always manage existing positions (even with kill switch active)
@@ -925,6 +931,7 @@ def build_main_loop(settings, client: AsyncTradierClient) -> tuple[MainLoop, lis
         client=client, order_log=order_log,
         position_tracker=position_tracker, watchlist=watchlist,
         kill_switch=kill_switch,
+        balance_guard=BalanceFeedGuard(),
     )
 
     # Index ETFs carry a variance-risk premium (realized < implied), so buying

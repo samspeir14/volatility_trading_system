@@ -6,6 +6,7 @@ positions right now?" — or proves the process is alive:
   * HaltFlag          — manual master off-switch (a file the operator creates)
   * DrawdownBreaker   — weekly/monthly drawdown circuit breakers, persistent
   * BarsFreshnessGuard— refuses to trade on a frozen daily-bars cache
+  * BalanceFeedGuard  — detects a frozen broker equity feed (kill switch blind)
   * write_heartbeat / read_heartbeat — dead-man switch consumed by
     scripts/heartbeat_check.py from cron
 
@@ -261,6 +262,61 @@ class BarsFreshnessGuard:
                 f"(tolerance {self._tolerance.days}d) — blocking new entries"
             )
         return FreshnessReport(stale_symbols=stale, block_reason=block_reason)
+
+
+@dataclass(frozen=True)
+class BalanceFeedReport:
+    stale: bool
+    flat_cycles: int          # consecutive cycles equity was unchanged
+    block_reason: str | None  # set while stale; stable string per freeze
+
+
+class BalanceFeedGuard:
+    """Detects a frozen /balances feed.
+
+    Tradier's sandbox has served the same total_equity to the cent on every
+    call for a whole session (2026-08-31..09-03, again 2026-09-15) while
+    orders kept filling. PortfolioStateBuilder derives today's unrealized
+    P&L as equity - starting_equity - realized, so a frozen equity makes
+    total P&L read exactly $0 no matter what the book does: the daily kill
+    switch and the drawdown breaker are blind for the day.
+
+    Equity identical across min_flat_cycles consecutive cycles while
+    positions are open (option marks move every cycle) or fills have
+    happened is not a quiet market, it is a dead feed. The report's
+    block_reason names the frozen value, not the cycle count, so it is a
+    stable string and MainLoop's transition alert fires once per freeze.
+    Clears itself the moment equity moves.
+    """
+
+    def __init__(self, min_flat_cycles: int = 3):
+        self._min_flat = max(1, int(min_flat_cycles))
+        self._last_equity: float | None = None
+        self._flat_cycles = 0
+        self._activity_while_flat = False
+
+    def observe(
+        self, equity: float, *, open_positions: int, fills_since_last: int,
+    ) -> BalanceFeedReport:
+        if self._last_equity is not None and equity == self._last_equity:
+            self._flat_cycles += 1
+        else:
+            self._flat_cycles = 0
+            self._activity_while_flat = False
+        self._last_equity = equity
+        if open_positions > 0 or fills_since_last > 0:
+            self._activity_while_flat = True
+        stale = self._flat_cycles >= self._min_flat and self._activity_while_flat
+        reason = None
+        if stale:
+            reason = (
+                f"balances feed frozen: total_equity ${equity:,.2f} unchanged "
+                f"across {self._min_flat}+ cycles with open positions or fills "
+                "— kill switch running on ledger P&L, blocking new entries"
+            )
+        return BalanceFeedReport(
+            stale=stale, flat_cycles=self._flat_cycles, block_reason=reason,
+        )
 
 
 def write_heartbeat(path: Path, market_state: str) -> None:

@@ -7,12 +7,14 @@ mark-to-market (NaN marks for missing legs), exit_manager (evaluating phantoms),
 and the per-day P&L (cumulative position value frozen at last seen mark).
 
 This module pulls Tradier's positions each cycle and:
-  - For log entries with all legs missing AND today >= expiration:
+  - For log entries with all legs missing AND today > expiration:
     mark the order as expired with realized P&L derived from intrinsic value
     of each leg at the underlying's closing price on expiration day.
-  - For log entries with all legs missing AND today < expiration:
-    log a warning and leave alone — likely a stale-cache race; safer to
-    do nothing than to mark closed prematurely.
+  - For log entries with all legs missing AND today <= expiration:
+    log a warning and leave alone — a close fill still being booked or a
+    stale-cache race; safer to do nothing than to mark closed prematurely.
+    reconcile() only runs while the market is open, so on expiration day
+    itself nothing has expired yet; settlement is the next session's job.
   - For log entries whose underlying appears as a stock position in Tradier:
     record a persistent assignment alert. Assignment can cash out a covered
     short into shares that the bot doesn't know how to manage; flagging for
@@ -295,12 +297,21 @@ class PositionReconciler:
                 # At least one leg still alive in Tradier → position is live.
                 continue
 
-            # All legs missing. Was this past expiration?
-            if today < expiration:
+            # All legs missing. Settle only once expiration is behind us.
+            # reconcile() runs inside run_once, i.e. only while the market is
+            # open, so on expiration day itself the legs cannot have expired:
+            # they vanished because a close filled between cycles (the
+            # pending-close reconciler books that right after this pass) or
+            # because of an API race. Settling here priced 0DTE condors at a
+            # mid-session quote and wrote the wrong realized P&L (2026-09-15,
+            # five SPY/QQQ condors; the fill overwrote it seconds later by
+            # ordering luck). Expiry-day settlement happens on the next
+            # session's first cycle.
+            if today <= expiration:
                 logger.warning(
                     "reconciler: order %s (%s exp=%s) has no legs in Tradier "
-                    "but expiration is in the future — possible API/cache "
-                    "race, leaving log entry untouched",
+                    "but expiration is not past — close fill in flight or "
+                    "API/cache race, leaving log entry untouched",
                     order_id, underlying, expiration.isoformat(),
                 )
                 skipped_premature.append(order_id)

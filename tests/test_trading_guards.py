@@ -7,6 +7,7 @@ from pathlib import Path
 
 from risk.kill_switch import DailyKillSwitch
 from risk.trading_guards import (
+    BalanceFeedGuard,
     BarsFreshnessGuard,
     DrawdownBreaker,
     HaltFlag,
@@ -203,3 +204,44 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# ---------- BalanceFeedGuard ----------
+# 2026-09-15: /balances returned total_equity=109,656.20 on every cycle from
+# 09:31 to 16:00 ET while 10 fills happened. Unrealized = equity - start -
+# realized made the kill switch read $0 all day.
+
+def test_balance_feed_guard_flags_flat_equity_with_open_positions():
+    g = BalanceFeedGuard(min_flat_cycles=3)
+    reports = [g.observe(109656.20, open_positions=5, fills_since_last=0) for _ in range(4)]
+    assert [r.stale for r in reports] == [False, False, False, True]
+    assert "109,656.20" in reports[3].block_reason
+    # Stable string across cycles -> MainLoop's transition alert fires once.
+    again = g.observe(109656.20, open_positions=5, fills_since_last=0)
+    assert again.block_reason == reports[3].block_reason
+    print("balance guard: flat equity + open book -> stale after 3 flat cycles")
+
+
+def test_balance_feed_guard_ignores_flat_equity_on_an_empty_book():
+    g = BalanceFeedGuard(min_flat_cycles=3)
+    for _ in range(10):
+        assert g.observe(100000.0, open_positions=0, fills_since_last=0).stale is False
+    print("balance guard: flat cash-only account is not stale")
+
+
+def test_balance_feed_guard_fill_on_empty_book_counts_as_activity():
+    g = BalanceFeedGuard(min_flat_cycles=2)
+    g.observe(100000.0, open_positions=0, fills_since_last=0)
+    g.observe(100000.0, open_positions=0, fills_since_last=1)   # flat 1, a fill happened
+    assert g.observe(100000.0, open_positions=0, fills_since_last=0).stale is True
+    print("balance guard: a fill during a flat run is activity")
+
+
+def test_balance_feed_guard_resets_when_equity_moves():
+    g = BalanceFeedGuard(min_flat_cycles=2)
+    for _ in range(3):
+        g.observe(100000.0, open_positions=1, fills_since_last=0)
+    assert g.observe(100000.0, open_positions=1, fills_since_last=0).stale is True
+    r = g.observe(100012.5, open_positions=1, fills_since_last=0)
+    assert r.stale is False and r.flat_cycles == 0 and r.block_reason is None
+    print("balance guard: clears as soon as equity moves")

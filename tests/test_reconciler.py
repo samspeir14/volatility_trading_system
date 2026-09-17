@@ -995,3 +995,36 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def test_reconciler_does_not_settle_on_expiration_day_itself():
+    """reconcile() only runs while the market is open, so legs missing ON
+    expiration day are a close fill in flight or an API race, never an
+    expiry. 2026-09-15: five 0DTE condors were 'expired' at 11:23 ET at a
+    mid-session quote with the wrong P&L (the fill overwrote it by luck)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "orders.db")
+        expiration = date(2026, 5, 15)
+        _seed_open_order(
+            log, order_id=9008, symbol="AAPL", expiration=expiration,
+            direction="SELL", structure="iron_condor", entry_premium=1.20,
+            legs=_ic_legs(),
+            submitted_at=datetime(2026, 5, 14, 16, 0, tzinfo=timezone.utc),
+        )
+        client = mock.AsyncMock()
+        client.get_positions.return_value = []
+        _mock_close(client, {"AAPL": 145.0}, expiration)
+        reconciler = PositionReconciler(client=client, order_log=log, account_id="VA1")
+
+        result = asyncio.run(reconciler.reconcile(expiration))
+        assert result.expired_closed == []
+        assert result.skipped_premature == [9008]
+        assert len(log.open_unclosed_positions()) == 1
+        client.get_history.assert_not_called()
+
+        # Next session: settles normally.
+        result2 = asyncio.run(reconciler.reconcile(expiration + timedelta(days=1)))
+        assert result2.expired_closed == [9008]
+        assert len(log.open_unclosed_positions()) == 0
+        log.close()
+    print("reconciler: missing legs on expiration day -> hold; next session -> settle ✓")

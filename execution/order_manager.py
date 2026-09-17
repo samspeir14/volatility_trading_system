@@ -15,6 +15,7 @@ from data.async_client import AsyncTradierClient, OptionContract
 from data.market_data import TickerSnapshot
 from execution.order_log import (
     OrderLog,
+    ORPHANED_CLOSE_STATUS,
     PENDING_CLOSE_STATUS,
     STALE_CANCELED_STATUS,
 )
@@ -723,6 +724,7 @@ class OrderManager:
         position: "OpenPosition",
         mark: "PositionMark",
         exit_trigger: str,
+        exit_rationale: str | None = None,
     ) -> OrderResult:
         """Build closing leg list with sides inverted, price at current mid +/-
         slippage, submit via the same multileg endpoint, poll for fill, update
@@ -760,6 +762,7 @@ class OrderManager:
         if pending is not None:
             return await self._reprice_pending_close(
                 pending, position, close_mid, order_type, exit_trigger, now,
+                exit_rationale=exit_rationale,
             )
 
         # Max retries: refuse and raise a CRITICAL alert (idempotent — the
@@ -876,6 +879,7 @@ class OrderManager:
             order_type=order_type,
             submitted_price=price,
             arrival_mid=close_mid,
+            exit_rationale=exit_rationale,
         )
         logger.info("submitted CLOSE %d for opening %d (%s) trigger=%s mid=%.2f type=%s (ladder %s)",
                     closing_order_id, position.tradier_order_id,
@@ -959,6 +963,7 @@ class OrderManager:
                 closed_at=terminal_at,
                 exit_trigger=exit_trigger,
                 realized_pnl=realized_pnl,
+                exit_rationale=exit_rationale,
             )
             self._log_fill_tca(
                 "close", closing_order_id, order_type, close_mid, fill_price,
@@ -988,6 +993,7 @@ class OrderManager:
         order_type: str,
         exit_trigger: str,
         now: datetime,
+        exit_rationale: str | None = None,
     ) -> OrderResult:
         """Move a working close's limit to the current mid at the top ladder
         step — the price the original walk ended at, re-anchored to this
@@ -1041,7 +1047,9 @@ class OrderManager:
                 modify_error, current_price,
             )
             return held
-        self._log.record_close_reprice(closing_order_id, target, exit_trigger, now)
+        self._log.record_close_reprice(
+            closing_order_id, target, exit_trigger, now, exit_rationale=exit_rationale,
+        )
         logger.info(
             "pending close %d for opening %d (%s): limit %.2f -> %.2f "
             "(mid %.2f, %s)",
@@ -1059,7 +1067,11 @@ class OrderManager:
         between cycles. Should run on every MainLoop cycle before signal
         generation.
 
-        Returns counts: {"canceled", "filled", "failed_terminal"}.
+        Returns counts: {"canceled", "filled", "failed_terminal", "orphaned"}.
+
+        - Pending but the opening is already closed in our books by something
+          else (expiry settlement, another fill): one best-effort cancel, then
+          mark the attempt orphaned and never touch it again.
 
         - Pending older than threshold + still non-terminal at Tradier:
           DELETE the order, mark attempt as stale_canceled. exit_manager will
@@ -1074,7 +1086,7 @@ class OrderManager:
 
         threshold = timedelta(minutes=self._stale_threshold_minutes)
         max_age = threshold * PENDING_CLOSE_MAX_AGE_MULTIPLE
-        canceled = filled = failed_terminal = 0
+        canceled = filled = failed_terminal = orphaned = 0
 
         for row in pending:
             closing_order_id = row["closing_order_id"]
@@ -1093,6 +1105,41 @@ class OrderManager:
                     "bad last_priced_at/submitted_at on close attempt %s — skipping",
                     closing_order_id,
                 )
+                continue
+
+            # The opening is already closed in our books by something other
+            # than this order (expiry settlement, a different fill): the
+            # working order is an orphan. Nothing it could do now is wanted,
+            # so one best-effort cancel and retire the attempt, instead of
+            # re-querying and re-canceling it every cycle for the rest of
+            # time (six such rows produced ~1.6k failed cancels in the
+            # sandbox 2026-09-11..16; its dead orders answer "not available
+            # to be canceled" forever).
+            if (row.get("closed_at") is not None
+                    and row.get("opening_closing_order_id") != closing_order_id):
+                try:
+                    await self._client.cancel_order(
+                        self._settings.account_id, closing_order_id,
+                    )
+                except Exception as e:
+                    logger.info(
+                        "orphan close %s: cancel failed (%r) — retiring anyway",
+                        closing_order_id, e,
+                    )
+                self._log.update_close_attempt(
+                    closing_order_id=closing_order_id,
+                    status=ORPHANED_CLOSE_STATUS,
+                    terminal_at=now, fill_price=None,
+                )
+                closer = row.get("opening_closing_order_id")
+                logger.info(
+                    "orphan close %s for opening %s retired: opening already "
+                    "closed (%s) by %s",
+                    closing_order_id, opening_order_id,
+                    row.get("opening_exit_trigger") or "?",
+                    "expiry settlement" if closer == 0 else f"order {closer}",
+                )
+                orphaned += 1
                 continue
 
             try:
@@ -1254,12 +1301,14 @@ class OrderManager:
             )
             canceled += 1
 
-        if canceled or filled or failed_terminal:
+        if canceled or filled or failed_terminal or orphaned:
             logger.info(
-                "stale-close reconcile: canceled=%d filled=%d failed_terminal=%d",
-                canceled, filled, failed_terminal,
+                "stale-close reconcile: canceled=%d filled=%d failed_terminal=%d "
+                "orphaned=%d",
+                canceled, filled, failed_terminal, orphaned,
             )
-        return {"canceled": canceled, "filled": filled, "failed_terminal": failed_terminal}
+        return {"canceled": canceled, "filled": filled,
+                "failed_terminal": failed_terminal, "orphaned": orphaned}
 
     async def _handle_partial_close(
         self,
@@ -1410,6 +1459,7 @@ class OrderManager:
         opening_order_id = attempt_row["opening_order_id"]
         order_type = attempt_row["order_type"]
         exit_trigger = attempt_row["exit_trigger"]
+        exit_rationale = attempt_row.get("exit_rationale")
 
         opening = self._log.get_submitted_order(opening_order_id)
         if opening is None:
@@ -1456,6 +1506,7 @@ class OrderManager:
             closed_at=now,
             exit_trigger=exit_trigger,
             realized_pnl=realized_pnl,
+            exit_rationale=exit_rationale,
         )
         logger.info(
             "reconciled between-cycle close fill: closing=%s opening=%s "
