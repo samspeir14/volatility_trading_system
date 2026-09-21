@@ -293,20 +293,7 @@ class ExitManager:
         # pipeline direction comes from the VRP z-gate, so entry_divergence's
         # sign no longer encodes the thesis — keying off it could close a
         # position exactly when the model turned favorable.)
-        #
-        # NOT for a long straddle on expiry day. The divergence there sets
-        # the prior close's 1-day forecast against a 0DTE ATM IV read at
-        # the CURRENT spot, so the move the straddle was bought for shows up
-        # as "IV above the model" and closes it — AMD 2026-09-21 gapped +9%,
-        # 0DTE IV went 0.32 -> ~0.82 and three straddles at ~+300% (all
-        # intrinsic, no vega left to sell) were closed at 10:11 ET. The
-        # stop and the final-2h close still bound the day. Before expiry
-        # day the rule stays: over 15 such closes it realized -$1.1k
-        # against -$8.3k held, and even the 6 winners gave back
-        # +$1.9k -> -$4.5k.
-        thesis_applies = not (pos.direction == "BUY" and mark.dte <= 0)
-        if (self._thesis_enabled and thesis_applies
-                and current_divergence is not None):
+        if self._thesis_enabled and current_divergence is not None:
             reversed_now = (
                 current_divergence >= self._thesis_min
                 if pos.direction == "SELL"
