@@ -216,7 +216,29 @@ class ExitManager:
                 rationale=rationale,
                 current_divergence=current_div,
             ))
+        self._record_evaluations(decisions, scan.fetched_at)
         return decisions
+
+    def _record_evaluations(
+        self, decisions: list[ExitDecision], evaluated_at: datetime,
+    ) -> None:
+        """Log every evaluation, holds included, so exit rules can be checked
+        against the cycles they did not fire on. Never blocks an exit."""
+        if self._order_log is None or not decisions:
+            return
+        rows = []
+        for d in decisions:
+            spot = d.mark.underlying_price
+            rows.append((
+                d.position.tradier_order_id, evaluated_at.isoformat(), d.mark.dte,
+                spot if math.isfinite(spot) else None,
+                d.mark.close_cash_flow, d.mark.pnl_dollars,
+                d.current_divergence, d.trigger,
+            ))
+        try:
+            self._order_log.record_exit_evaluations(rows)
+        except Exception as e:
+            logger.warning("could not record exit evaluations: %s", e)
 
     def _compute_current_divergence(
         self,

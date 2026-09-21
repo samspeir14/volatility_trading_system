@@ -640,6 +640,53 @@ def test_current_divergence_none_skips_thesis_check():
     print("current_divergence None: thesis check skipped, P&L triggers still fire")
 
 
+def test_evaluate_records_every_evaluation_holds_included():
+    """Each cycle's evaluation lands in exit_evaluations — holds too, so a
+    rule can later be checked against the cycles it did not fire on. A
+    failing log must never block the exit decisions."""
+    import sqlite3
+    import tempfile
+    from pathlib import Path
+
+    from execution.order_log import OrderLog
+
+    scan = mock.MagicMock()
+    scan.fetched_at = datetime(2026, 5, 12, 15, 0, tzinfo=timezone.utc)
+    scan.snapshots = {}  # no chain → divergence None, P&L triggers still run
+    straddle = _mk_long_straddle_position(entry_debit=4.08)
+    marks = [
+        _mark(_mk_iron_condor_position(), pnl_dollars=0.0, underlying_price=210.0),
+        _mark(straddle, pnl_dollars=-205.0),  # NaN underlying, past the stop
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "log.db")
+        mgr = ExitManager(
+            position_tracker=mock.MagicMock(), order_manager=mock.MagicMock(),
+            order_log=log,
+        )
+        decisions = mgr.evaluate(marks, scan, feature_rows={})
+        assert [d.trigger for d in decisions] == [None, "stop_loss"]
+        rows = sqlite3.connect(Path(tmp) / "log.db").execute(
+            "SELECT opening_order_id, evaluated_at, dte, underlying_price, "
+            "pnl_dollars, current_divergence, exit_trigger "
+            "FROM exit_evaluations ORDER BY opening_order_id"
+        ).fetchall()
+    assert rows == [
+        (1, "2026-05-12T15:00:00+00:00", 20, 210.0, 0.0, None, None),
+        (2, "2026-05-12T15:00:00+00:00", 20, None, -205.0, None, "stop_loss"),
+    ], rows
+
+    broken = mock.MagicMock()
+    broken.record_exit_evaluations.side_effect = RuntimeError("disk full")
+    mgr = ExitManager(
+        position_tracker=mock.MagicMock(), order_manager=mock.MagicMock(),
+        order_log=broken,
+    )
+    decisions = mgr.evaluate(marks, scan, feature_rows={})
+    assert [d.trigger for d in decisions] == [None, "stop_loss"]
+    print("exit_evaluations: holds + closes recorded, log failure never blocks ✓")
+
+
 def main() -> int:
     test_iron_condor_profit_target_at_75pct()
     test_long_straddle_has_no_profit_target()
@@ -670,6 +717,7 @@ def main() -> int:
     test_priority_constant_matches_evaluation_order()
     test_no_trigger_returns_hold()
     test_current_divergence_none_skips_thesis_check()
+    test_evaluate_records_every_evaluation_holds_included()
     print("all exit_manager tests passed")
     return 0
 
