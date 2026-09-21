@@ -100,6 +100,24 @@ CREATE TABLE IF NOT EXISTS position_pnl_snapshots (
 );
 """
 
+# One row per (open position, cycle): what the exit manager saw and decided,
+# holds included. The ledger alone only shows the cycle a position closed on,
+# so a rule can't be checked against the cycles where it did NOT fire (nor
+# on expiry day, which divergence_log never covers).
+CREATE_EXIT_EVALUATIONS_SQL = """
+CREATE TABLE IF NOT EXISTS exit_evaluations (
+    opening_order_id INTEGER NOT NULL,
+    evaluated_at TEXT NOT NULL,
+    dte INTEGER NOT NULL,
+    underlying_price REAL,
+    close_cash_flow REAL NOT NULL,
+    pnl_dollars REAL NOT NULL,
+    current_divergence REAL,
+    exit_trigger TEXT,
+    PRIMARY KEY (opening_order_id, evaluated_at)
+);
+"""
+
 EXPIRATION_SENTINEL_ORDER_ID = 0  # closing_order_id used for auto-expired positions
 
 CREATE_INDEXES_SQL = [
@@ -165,6 +183,7 @@ class OrderLog:
         self._conn.execute(CREATE_CLOSE_ATTEMPTS_SQL)
         self._conn.execute(CREATE_STALE_CLOSE_ALERTS_SQL)
         self._conn.execute(CREATE_POSITION_PNL_SNAPSHOTS_SQL)
+        self._conn.execute(CREATE_EXIT_EVALUATIONS_SQL)
         self._migrate_close_columns()
         for sql in CREATE_INDEXES_SQL:
             self._conn.execute(sql)
@@ -690,6 +709,20 @@ class OrderLog:
             "INSERT OR REPLACE INTO position_pnl_snapshots "
             "(opening_order_id, as_of_date, lifetime_pnl) VALUES (?, ?, ?)",
             (opening_order_id, as_of_date.isoformat(), lifetime_pnl),
+        )
+        self._conn.commit()
+
+    def record_exit_evaluations(self, rows: list[tuple]) -> None:
+        """Persist one cycle's exit evaluations. Each row is
+        (opening_order_id, evaluated_at_iso, dte, underlying_price,
+        close_cash_flow, pnl_dollars, current_divergence, exit_trigger);
+        underlying_price / current_divergence / exit_trigger may be None."""
+        self._conn.executemany(
+            "INSERT OR REPLACE INTO exit_evaluations "
+            "(opening_order_id, evaluated_at, dte, underlying_price, "
+            "close_cash_flow, pnl_dollars, current_divergence, exit_trigger) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
         )
         self._conn.commit()
 

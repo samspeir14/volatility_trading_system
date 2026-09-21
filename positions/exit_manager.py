@@ -216,7 +216,29 @@ class ExitManager:
                 rationale=rationale,
                 current_divergence=current_div,
             ))
+        self._record_evaluations(decisions, scan.fetched_at)
         return decisions
+
+    def _record_evaluations(
+        self, decisions: list[ExitDecision], evaluated_at: datetime,
+    ) -> None:
+        """Log every evaluation, holds included, so exit rules can be checked
+        against the cycles they did not fire on. Never blocks an exit."""
+        if self._order_log is None or not decisions:
+            return
+        rows = []
+        for d in decisions:
+            spot = d.mark.underlying_price
+            rows.append((
+                d.position.tradier_order_id, evaluated_at.isoformat(), d.mark.dte,
+                spot if math.isfinite(spot) else None,
+                d.mark.close_cash_flow, d.mark.pnl_dollars,
+                d.current_divergence, d.trigger,
+            ))
+        try:
+            self._order_log.record_exit_evaluations(rows)
+        except Exception as e:
+            logger.warning("could not record exit evaluations: %s", e)
 
     def _compute_current_divergence(
         self,
@@ -293,20 +315,7 @@ class ExitManager:
         # pipeline direction comes from the VRP z-gate, so entry_divergence's
         # sign no longer encodes the thesis — keying off it could close a
         # position exactly when the model turned favorable.)
-        #
-        # NOT for a long straddle on expiry day. The divergence there sets
-        # the prior close's 1-day forecast against a 0DTE ATM IV read at
-        # the CURRENT spot, so the move the straddle was bought for shows up
-        # as "IV above the model" and closes it — AMD 2026-09-21 gapped +9%,
-        # 0DTE IV went 0.32 -> ~0.82 and three straddles at ~+300% (all
-        # intrinsic, no vega left to sell) were closed at 10:11 ET. The
-        # stop and the final-2h close still bound the day. Before expiry
-        # day the rule stays: over 15 such closes it realized -$1.1k
-        # against -$8.3k held, and even the 6 winners gave back
-        # +$1.9k -> -$4.5k.
-        thesis_applies = not (pos.direction == "BUY" and mark.dte <= 0)
-        if (self._thesis_enabled and thesis_applies
-                and current_divergence is not None):
+        if self._thesis_enabled and current_divergence is not None:
             reversed_now = (
                 current_divergence >= self._thesis_min
                 if pos.direction == "SELL"

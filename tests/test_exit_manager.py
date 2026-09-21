@@ -607,45 +607,6 @@ def test_thesis_keyed_to_direction_not_entry_divergence_sign():
     print("thesis_direction: SELL closes on +div only, regardless of entry sign")
 
 
-def test_thesis_exit_skipped_for_long_straddle_on_expiry_day():
-    """AMD 2026-09-21: a +9% gap on expiry day sent the 0DTE ATM IV far above
-    the prior close's forecast, and thesis_reversed closed three ~+300%
-    straddles at 10:11 ET. On expiry day a long straddle ignores the thesis
-    exit and rides to the final-2h close; the stop still guards it, and the
-    rule is unchanged before expiry day and for short structures."""
-    pos = _mk_long_straddle_position(entry_debit=4.08)  # expires 2026-05-15
-    expiry = date(2026, 5, 15)
-    close_utc = datetime(2026, 5, 15, 20, 0, tzinfo=timezone.utc)  # 16:00 ET
-    morning = close_utc - timedelta(hours=6)
-    winner = _mark(pos, pnl_dollars=1200.0, dte=0)
-    trigger, _ = _exit_mgr()._evaluate_one(
-        winner, today=expiry, current_divergence=-0.27,
-        market_close_utc=close_utc, now_utc=morning)
-    assert trigger is None, f"expiry-day winner closed by the thesis exit: {trigger}"
-    trigger, _ = _exit_mgr()._evaluate_one(
-        winner, today=expiry, current_divergence=-0.27,
-        market_close_utc=close_utc, now_utc=close_utc - timedelta(hours=1))
-    assert trigger == "expiration_proximity"
-    # The stop still works on expiry day
-    trigger, _ = _exit_mgr()._evaluate_one(
-        _mark(pos, pnl_dollars=-205.0, dte=0), today=expiry, current_divergence=-0.27,
-        market_close_utc=close_utc, now_utc=morning)
-    assert trigger == "stop_loss"
-    # The day before expiry the thesis exit still fires
-    trigger, _ = _exit_mgr()._evaluate_one(
-        _mark(pos, pnl_dollars=1200.0, dte=1), today=date(2026, 5, 14),
-        current_divergence=-0.27)
-    assert trigger == "thesis_reversed"
-    # Short structures keep the thesis exit on expiry day
-    condor = _mk_iron_condor_position()
-    trigger, _ = _exit_mgr()._evaluate_one(
-        _mark(condor, pnl_dollars=0.0, dte=0, underlying_price=210.0),
-        today=date(2026, 5, 22), current_divergence=+0.10,
-        market_close_utc=close_utc, now_utc=morning)
-    assert trigger == "thesis_reversed"
-    print("thesis_expiry_day: long straddle rides to the final 2h, stop intact ✓")
-
-
 def test_priority_constant_matches_evaluation_order():
     """Sanity check: the EXIT_TRIGGER_PRIORITY tuple matches the order in the
     actual logic. If someone reorders one without the other, this catches it."""
@@ -679,6 +640,53 @@ def test_current_divergence_none_skips_thesis_check():
     print("current_divergence None: thesis check skipped, P&L triggers still fire")
 
 
+def test_evaluate_records_every_evaluation_holds_included():
+    """Each cycle's evaluation lands in exit_evaluations — holds too, so a
+    rule can later be checked against the cycles it did not fire on. A
+    failing log must never block the exit decisions."""
+    import sqlite3
+    import tempfile
+    from pathlib import Path
+
+    from execution.order_log import OrderLog
+
+    scan = mock.MagicMock()
+    scan.fetched_at = datetime(2026, 5, 12, 15, 0, tzinfo=timezone.utc)
+    scan.snapshots = {}  # no chain → divergence None, P&L triggers still run
+    straddle = _mk_long_straddle_position(entry_debit=4.08)
+    marks = [
+        _mark(_mk_iron_condor_position(), pnl_dollars=0.0, underlying_price=210.0),
+        _mark(straddle, pnl_dollars=-205.0),  # NaN underlying, past the stop
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        log = OrderLog(Path(tmp) / "log.db")
+        mgr = ExitManager(
+            position_tracker=mock.MagicMock(), order_manager=mock.MagicMock(),
+            order_log=log,
+        )
+        decisions = mgr.evaluate(marks, scan, feature_rows={})
+        assert [d.trigger for d in decisions] == [None, "stop_loss"]
+        rows = sqlite3.connect(Path(tmp) / "log.db").execute(
+            "SELECT opening_order_id, evaluated_at, dte, underlying_price, "
+            "pnl_dollars, current_divergence, exit_trigger "
+            "FROM exit_evaluations ORDER BY opening_order_id"
+        ).fetchall()
+    assert rows == [
+        (1, "2026-05-12T15:00:00+00:00", 20, 210.0, 0.0, None, None),
+        (2, "2026-05-12T15:00:00+00:00", 20, None, -205.0, None, "stop_loss"),
+    ], rows
+
+    broken = mock.MagicMock()
+    broken.record_exit_evaluations.side_effect = RuntimeError("disk full")
+    mgr = ExitManager(
+        position_tracker=mock.MagicMock(), order_manager=mock.MagicMock(),
+        order_log=broken,
+    )
+    decisions = mgr.evaluate(marks, scan, feature_rows={})
+    assert [d.trigger for d in decisions] == [None, "stop_loss"]
+    print("exit_evaluations: holds + closes recorded, log failure never blocks ✓")
+
+
 def main() -> int:
     test_iron_condor_profit_target_at_75pct()
     test_long_straddle_has_no_profit_target()
@@ -706,10 +714,10 @@ def main() -> int:
     test_thesis_overrides_stop_loss()
     test_thesis_overrides_profit_target()
     test_thesis_keyed_to_direction_not_entry_divergence_sign()
-    test_thesis_exit_skipped_for_long_straddle_on_expiry_day()
     test_priority_constant_matches_evaluation_order()
     test_no_trigger_returns_hold()
     test_current_divergence_none_skips_thesis_check()
+    test_evaluate_records_every_evaluation_holds_included()
     print("all exit_manager tests passed")
     return 0
 
